@@ -153,7 +153,8 @@ def _runners(args, info, disk_dir) -> dict:
         "compression": lambda: wl.bench_compression(s, r),
         "hashing": lambda: wl.bench_hashing(s, r),
         "json": lambda: wl.bench_json(s, r),
-        "memory": lambda: wl.bench_memory(s, r, args.mem_mb),
+        "memory": lambda: wl.bench_memory(s, r, args.mem_mb,
+                                          info.get("ram_total_bytes", 0)),
         "cache_sweep": lambda: wl.bench_cache_sweep(
             s, info.get("ram_total_bytes", 0)),
         "disk": lambda: wl.bench_disk(s, r, args.disk_mb, disk_dir),

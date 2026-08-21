@@ -18,7 +18,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, cli, compare, core, coreml_model,  # noqa: E402
-                     mlframework, network, power, regression, report,
+                     limits, mlframework, network, power, regression, report,
                      scoring, system, workloads)
 
 
@@ -216,9 +216,30 @@ class TestWorkloadsRun(unittest.TestCase):
                 self.assertIn("cache_bypassed", r)
 
     def test_disk_skips_when_space_insufficient(self):
+        # Simulate a nearly-full filesystem rather than actually filling one.
+        import shutil as _sh
+        real = _sh.disk_usage
+
+        class Tiny:
+            total = free = used = 1024 * 1024      # 1 MB free
+
         with tempfile.TemporaryDirectory() as d:
-            r = workloads.bench_disk(0.05, 1, file_mb=10 ** 9, out_dir=d)
+            workloads.shutil.disk_usage = lambda p: Tiny
+            try:
+                r = workloads.bench_disk(0.05, 1, file_mb=4096, out_dir=d)
+            finally:
+                workloads.shutil.disk_usage = real
             self.assertTrue(r.get("skipped"))
+
+    def test_disk_request_is_clamped_not_unbounded(self):
+        # An absurd request must be reduced to a safe size, never honoured.
+        # Tested on the pure function so no gigabytes are written.
+        mb, notice = limits.safe_disk_mb(10 ** 9, free_bytes=500 * 1024 ** 3,
+                                         repeats=3)
+        self.assertLess(mb, 10 ** 9)
+        self.assertIsNotNone(notice)
+        self.assertLessEqual(limits.total_write_mb(mb, 3),
+                             limits.DISK_MAX_TOTAL_WRITE_MB)
 
 
 # --------------------------------------------------------------------------- #
@@ -717,3 +738,119 @@ class TestAIScoring(unittest.TestCase):
         self.assertAlmostEqual(s["subscores"]["ml_train"], 200.0, places=3)
         cats = scoring.category_scores(s["subscores"])
         self.assertIn("ai", cats)
+
+
+# --------------------------------------------------------------------------- #
+class TestSafetyLimits(unittest.TestCase):
+    """Guards that stop the tool harming the machine it is measuring.
+
+    A benchmark may load hardware to 100% — that is the point — but it must
+    never exhaust RAM (forcing swap thrash), fill the disk, or burn through
+    flash endurance.
+    """
+
+    GB = 1024 ** 3
+
+    # ---- memory ----
+    def test_memory_clamped_to_fraction_of_ram(self):
+        mb, notice = limits.safe_mem_mb(999_999, 16 * self.GB)
+        self.assertIsNotNone(notice)
+        # Two buffers are allocated, so the total must stay well under RAM.
+        self.assertLess(mb * 2 * limits.MB, 16 * self.GB / 2)
+
+    def test_memory_reasonable_request_untouched(self):
+        mb, notice = limits.safe_mem_mb(64, 16 * self.GB)
+        self.assertEqual(mb, 64)
+        self.assertIsNone(notice)
+
+    def test_memory_tiny_ram_machine_still_gets_usable_buffer(self):
+        mb, _ = limits.safe_mem_mb(512, 512 * 1024 * 1024)   # 512 MB device
+        self.assertGreaterEqual(mb, limits.MEM_MIN_MB)
+        self.assertLessEqual(mb * 2 * limits.MB, 512 * 1024 * 1024)
+
+    def test_memory_unknown_ram_falls_back_to_cap(self):
+        mb, _ = limits.safe_mem_mb(999_999, 0)
+        self.assertEqual(mb, limits.MEM_DEFAULT_CAP_MB)
+
+    def test_memory_never_returns_zero_or_negative(self):
+        for req in (-100, 0, 1):
+            mb, _ = limits.safe_mem_mb(req, 16 * self.GB)
+            self.assertGreaterEqual(mb, limits.MEM_MIN_MB)
+
+    # ---- disk ----
+    def test_disk_cumulative_writes_capped_for_flash_endurance(self):
+        for repeats in (1, 3, 10):
+            mb, _ = limits.safe_disk_mb(10 ** 9, 500 * self.GB, repeats)
+            self.assertLessEqual(limits.total_write_mb(mb, repeats),
+                                 limits.DISK_MAX_TOTAL_WRITE_MB)
+
+    def test_disk_leaves_free_space_headroom(self):
+        free = 10 * self.GB
+        mb, notice = limits.safe_disk_mb(10 ** 9, free, 1)
+        self.assertIsNotNone(notice)
+        self.assertLess(mb * limits.MB * limits.DISK_FREE_HEADROOM, free * 1.01)
+
+    def test_disk_reasonable_request_untouched(self):
+        mb, notice = limits.safe_disk_mb(256, 500 * self.GB, 3)
+        self.assertEqual(mb, 256)
+        self.assertIsNone(notice)
+
+    def test_disk_never_returns_zero(self):
+        mb, _ = limits.safe_disk_mb(10 ** 9, 1024, 1)   # 1 KB free
+        self.assertGreaterEqual(mb, limits.DISK_MIN_MB)
+
+    def test_total_write_mb(self):
+        self.assertEqual(limits.total_write_mb(256, 3), 768)
+
+    # ---- thermal ----
+    def test_thermal_abort_on_severe_throttle(self):
+        should, reason = limits.thermal_should_abort("throttled (25%)")
+        self.assertTrue(should)
+        self.assertIn("throttled", reason)
+
+    def test_thermal_no_abort_on_mild_throttle(self):
+        self.assertFalse(limits.thermal_should_abort("throttled (85%)")[0])
+
+    def test_thermal_abort_on_critical_temperature(self):
+        self.assertTrue(limits.thermal_should_abort("max 102C")[0])
+
+    def test_thermal_no_abort_when_normal(self):
+        for t in ("nominal", "max 65C", None, ""):
+            self.assertFalse(limits.thermal_should_abort(t)[0])
+
+
+class TestDestructiveOperationSafety(unittest.TestCase):
+    """The tool must only ever delete files it created itself."""
+
+    def test_stale_cleanup_ignores_files_it_did_not_create(self):
+        import time as _t
+        with tempfile.TemporaryDirectory() as d:
+            ours = os.path.join(d, "pcbench_old.bin")
+            theirs = os.path.join(d, "my_important_data.bin")
+            also_theirs = os.path.join(d, "pcbench_notes.txt")  # wrong suffix
+            for f in (ours, theirs, also_theirs):
+                with open(f, "wb") as fh:
+                    fh.write(b"x")
+                os.utime(f, (_t.time() - 7200,) * 2)
+
+            workloads._clean_stale_files(d)
+
+            self.assertFalse(os.path.exists(ours), "own scratch file removed")
+            self.assertTrue(os.path.exists(theirs), "user data untouched")
+            self.assertTrue(os.path.exists(also_theirs), "non-.bin untouched")
+
+    def test_stale_cleanup_keeps_recent_files(self):
+        # A concurrent run's in-flight scratch file must survive.
+        with tempfile.TemporaryDirectory() as d:
+            fresh = os.path.join(d, "pcbench_active.bin")
+            with open(fresh, "wb") as fh:
+                fh.write(b"x")
+            workloads._clean_stale_files(d)
+            self.assertTrue(os.path.exists(fresh))
+
+    def test_disk_bench_cleans_up_after_itself(self):
+        import glob
+        with tempfile.TemporaryDirectory() as d:
+            workloads.bench_disk(0.05, 1, file_mb=8, out_dir=d)
+            self.assertEqual(glob.glob(os.path.join(d, "pcbench_*.bin")), [],
+                             "scratch files must not be left behind")

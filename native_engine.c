@@ -59,6 +59,45 @@
   }
 #endif
 
+/* --------------------------- Resource probes ---------------------------
+ * The engine must not allocate more than the machine has, nor fill its disk.
+ * Over-allocating drives the OS into swap (stalling the machine and writing
+ * heavily to the SSD); filling the disk can corrupt other programs' writes.
+ * On many Linux systems /tmp is tmpfs — RAM — so the disk test must check
+ * free space there rather than assume it is backed by storage. */
+#if defined(_WIN32)
+static unsigned long long total_ram_bytes(void) {
+    MEMORYSTATUSEX st; st.dwLength = sizeof(st);
+    return GlobalMemoryStatusEx(&st) ? (unsigned long long)st.ullTotalPhys : 0;
+}
+static unsigned long long free_disk_bytes(const char *path) {
+    ULARGE_INTEGER avail;
+    if (GetDiskFreeSpaceExA(path, &avail, NULL, NULL))
+        return (unsigned long long)avail.QuadPart;
+    return 0;
+}
+#else
+  #include <sys/statvfs.h>
+static unsigned long long total_ram_bytes(void) {
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page > 0)
+        return (unsigned long long)pages * (unsigned long long)page;
+    return 0;
+}
+static unsigned long long free_disk_bytes(const char *path) {
+    struct statvfs vfs;
+    if (statvfs(path, &vfs) == 0)
+        return (unsigned long long)vfs.f_bavail *
+               (unsigned long long)vfs.f_frsize;
+    return 0;
+}
+#endif
+
+/* Never let a single allocation exceed this share of physical RAM. */
+#define RAM_SAFE_FRACTION 8          /* i.e. 1/8 of total RAM */
+/* Require this much more free space than the file we intend to write. */
+#define DISK_HEADROOM 1.5
+
 #define MB (1024 * 1024)
 #define KB 1024
 #define PRIME_LO 50000
@@ -138,6 +177,14 @@ static double run_rate(double seconds, long units_per_chunk, int is_float) {
 
 static double run_memory(double seconds, int buf_mb) {
     size_t n = (size_t)buf_mb * MB;
+    /* Two buffers are allocated, so cap each at 1/16 of RAM to keep the
+     * combined footprint under 1/8 — far clear of swap. */
+    unsigned long long ram = total_ram_bytes();
+    if (ram) {
+        size_t cap = (size_t)(ram / (RAM_SAFE_FRACTION * 2));
+        if (n > cap) n = cap;
+    }
+    if (n < (size_t)MB) n = MB;
     char *src = (char *)malloc(n), *dst = (char *)malloc(n);
     if (!src || !dst) { free(src); free(dst); return 0.0; }
     memset(src, 'A', n);
@@ -234,6 +281,11 @@ static void build_cycle(size_t *arr, size_t n, unsigned seed) {
 
 /* Average nanoseconds per dependent load for a given working-set size. */
 static double pointer_chase_ns(size_t bytes, double seconds) {
+    /* Skip working sets this machine cannot hold comfortably: a 256 MB chase
+     * on a 512 MB board would thrash swap and measure the disk, not the cache. */
+    unsigned long long ram = total_ram_bytes();
+    if (ram && bytes > (size_t)(ram / RAM_SAFE_FRACTION)) return 0.0;
+
     size_t n = bytes / sizeof(size_t);
     if (n < 2) return 0.0;
     size_t *arr = (size_t *)malloc(n * sizeof(size_t));
@@ -263,6 +315,22 @@ static void run_disk(int file_mb, double *out_write, double *out_read) {
     long n_chunks = (long)(((size_t)file_mb * MB) / chunk);
     if (n_chunks < 1) n_chunks = 1;
     size_t total = (size_t)n_chunks * chunk;
+
+    /* Refuse to write if the target filesystem lacks headroom. This matters
+     * most on Linux, where /tmp is frequently tmpfs — writing there consumes
+     * RAM, not storage, and filling it can destabilize the whole system. */
+#if defined(_WIN32)
+    char probe[MAX_PATH];
+    GetTempPathA(MAX_PATH, probe);
+#else
+    const char *probe = "/tmp";
+#endif
+    unsigned long long freeb = free_disk_bytes(probe);
+    if (freeb && (double)total * DISK_HEADROOM > (double)freeb) {
+        *out_write = *out_read = 0.0;
+        return;                      /* reported as 0; never fills the disk */
+    }
+
     char *buf = (char *)malloc(chunk);
     if (!buf) { *out_write = *out_read = 0.0; return; }
     memset(buf, 'X', chunk);

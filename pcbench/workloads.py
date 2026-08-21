@@ -24,6 +24,7 @@ import shutil
 import tempfile
 import zlib
 
+from . import limits
 from .core import (ValidationError, check_close, check_exact, clock,
                    summarize, timed_loop, warmup)
 
@@ -229,10 +230,25 @@ def bench_json(seconds: float, repeats: int) -> dict:
 # --------------------------------------------------------------------------- #
 # Memory
 # --------------------------------------------------------------------------- #
-def bench_memory(seconds: float, repeats: int, buf_mb: int = 64) -> dict:
-    """Sustained copy bandwidth on a buffer far larger than cache."""
+def bench_memory(seconds: float, repeats: int, buf_mb: int = 64,
+                 ram_bytes: int = 0) -> dict:
+    """Sustained copy bandwidth on a buffer far larger than cache.
+
+    The buffer size is clamped against physical RAM. Over-allocating would push
+    the machine into swap, which stalls the whole system and writes heavily to
+    the SSD — a benchmark must never do that to the machine it is measuring.
+    """
+    if not ram_bytes:
+        from .system import total_ram_bytes
+        ram_bytes = total_ram_bytes()
+    buf_mb, notice = limits.safe_mem_mb(buf_mb, ram_bytes)
+
     n = buf_mb * MB
-    src = bytearray(b"\xa5" * n)
+    # Fill without materializing a temporary bytes object of the same size:
+    # `bytearray(b"\xa5" * n)` would briefly hold 2n bytes for one buffer.
+    src = bytearray(n)
+    for i in range(0, n, MB):
+        src[i:i + MB] = b"\xa5" * min(MB, n - i)
     dst = bytearray(n)
 
     def chunk():
@@ -252,8 +268,11 @@ def bench_memory(seconds: float, repeats: int, buf_mb: int = 64) -> dict:
         raise ValidationError("memory: copied data does not match source — "
                               "possible failing RAM")
     s = summarize(rates)
-    return {"unit": "MB/s", "rate": s["median"], "buffer_mb": buf_mb,
-            "validated": True, **s}
+    out = {"unit": "MB/s", "rate": s["median"], "buffer_mb": buf_mb,
+           "validated": True, **s}
+    if notice:
+        out["safety_notice"] = notice
+    return out
 
 
 # Working-set sizes for the cache sweep. The sweep starts at 128 KB because
@@ -352,19 +371,24 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
     actually determines how responsive a machine feels, since real workloads
     are dominated by small scattered reads.
     """
-    block = 4 * MB
-    n_blocks = max(1, (file_mb * MB) // block)
-    total = n_blocks * block
-
     try:
         free = shutil.disk_usage(out_dir).free
     except OSError as e:
         return {"skipped": True, "error": f"cannot stat {out_dir}: {e}"}
-    if total * 1.2 > free:
-        return {"skipped": True,
-                "error": f"needs ~{total * 1.2 / MB:.0f} MB free, "
-                         f"has {free / MB:.0f} MB"}
 
+    # Clamp for free-space headroom and cumulative flash wear before sizing.
+    file_mb, notice = limits.safe_disk_mb(file_mb, free, repeats)
+
+    block = 4 * MB
+    n_blocks = max(1, (file_mb * MB) // block)
+    total = n_blocks * block
+
+    if total * limits.DISK_FREE_HEADROOM > free:
+        return {"skipped": True,
+                "error": f"needs ~{total * limits.DISK_FREE_HEADROOM / MB:.0f} "
+                         f"MB free, has {free / MB:.0f} MB"}
+
+    _clean_stale_files(out_dir)
     buf = b"\xc3" * block
     writes, reads, iops = [], [], []
     bypassed = False
@@ -408,9 +432,11 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
                 pass
 
     w, r, io = summarize(writes), summarize(reads), summarize(iops)
-    return {
+    result = {
         "unit": "MB/s",
         "file_mb": file_mb,
+        # Disclosed so flash wear over many runs is never invisible.
+        "total_written_mb": limits.total_write_mb(file_mb, repeats),
         "write_rate": w["median"],
         "read_rate": r["median"],
         "random_read_iops": io["median"],
@@ -423,6 +449,34 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
                  "page cache NOT bypassed on this platform; read numbers are "
                  "an optimistic upper bound"),
     }
+    if notice:
+        result["safety_notice"] = notice
+    return result
+
+
+def _clean_stale_files(out_dir: str) -> int:
+    """Remove scratch files orphaned by a previous interrupted run.
+
+    Only files matching this tool's own ``pcbench_*.bin`` prefix are touched,
+    and only ones older than a minute, so a concurrent run is never disturbed.
+    """
+    import glob
+    removed = 0
+    cutoff = clock_wall() - 60
+    for path in glob.glob(os.path.join(out_dir, "pcbench_*.bin")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def clock_wall() -> float:
+    """Wall-clock seconds (file mtimes are wall-clock, not perf_counter)."""
+    import time as _time
+    return _time.time()
 
 
 def _random_read_iops(fd: int, size: int, budget: float) -> float:

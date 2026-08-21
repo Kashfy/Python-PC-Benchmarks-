@@ -100,6 +100,8 @@ def print_results(results: dict) -> None:
         if "cv" in r:
             note = f"  ({stability_note(r['cv'])}, ±{r['cv'] * 100:.1f}%)"
         _row(label, fmt(r.get(field)), f" {unit}{note}")
+        if r.get("safety_notice"):
+            print(f"      safety: {r['safety_notice']}")
 
     r = results.get("cpu_multi")
     if isinstance(r, dict) and not r.get("error"):
@@ -116,6 +118,12 @@ def print_results(results: dict) -> None:
             _row("Disk sequential write", fmt(r["write_rate"]), " MB/s")
             _row("Disk sequential read", fmt(r["read_rate"]), " MB/s")
             _row("Disk random read (4K)", fmt(r["random_read_iops"]), " IOPS")
+            if r.get("total_written_mb"):
+                # Flash wear should never be invisible to the user.
+                print(f"      wrote {r['total_written_mb']:,} MB to storage "
+                      f"this run ({r['file_mb']} MB file)")
+            if r.get("safety_notice"):
+                print(f"      safety: {r['safety_notice']}")
             if not r.get("cache_bypassed"):
                 print(f"      note: {r['note']}")
 
@@ -288,6 +296,8 @@ def print_sustained(s: dict | None) -> None:
         print(f"\n  Throughput over time: {sparkline(rates)}")
         print(f"    (each mark = {s['window_s']:.0f}s; left = start, "
               f"right = end)")
+    if s.get("aborted_early"):
+        print(f"\n  !! STOPPED EARLY: {s['abort_reason']}")
     print(f"\n  Verdict: {s['verdict']}")
 
 

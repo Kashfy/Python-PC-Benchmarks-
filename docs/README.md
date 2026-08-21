@@ -9,6 +9,7 @@ project [README](../README.md) for a quick start, then dive in here.
 | [technical.md](technical.md) | Measurement methodology, warm-up, cache-bypass, validation, statistics, scoring, thermal droop, GPU/NPU. |
 | [functions.md](functions.md) | Per-function reference for every module and the C engine. |
 | [packages.md](packages.md) | Requirements, stdlib modules used, optional `psutil`, toolchain, full CLI, exit codes. |
+| [safety.md](safety.md) | **Hardware safety** — what the tool never does, and how memory/disk/wear/thermal are capped. |
 | [troubleshooting.md](troubleshooting.md) | Common problems and fixes — guard rails, validation failures, cache inflation, compilers, variance. |
 
 ## Quick answers
@@ -22,3 +23,4 @@ project [README](../README.md) for a quick start, then dive in here.
 - **Why no GPU benchmark on Windows/Linux?** → [technical: coverage](technical.md#what-is-and-isnt-covered)
 - **How do I get real AI training numbers?** → [technical: AI framework tier](technical.md#ai-training--inference-optional-framework-tier)
 - **Is the power number real or estimated?** → [technical: power](technical.md#power--perf-per-watt)
+- **Can this damage my SSD / RAM / laptop?** → [safety.md](safety.md) (short answer: no)

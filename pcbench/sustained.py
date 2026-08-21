@@ -13,8 +13,9 @@ reports peak vs. sustained plus the droop between them.
 
 from __future__ import annotations
 
+from . import limits
 from .core import clock
-from .system import machine_state
+from .system import machine_state, thermal_pressure
 from .workloads import PRIMES_PER_CHUNK, cpu_integer_chunk
 
 # Fraction of the run, taken from the end, that defines "sustained"
@@ -29,10 +30,11 @@ def run_sustained(duration: float, window: float = 5.0,
     ``workers`` > 1 runs the load on multiple processes to generate enough heat
     to provoke throttling on machines with capable cooling.
     """
+    aborted = ""
     if workers > 1:
-        samples = _run_parallel(duration, window, workers)
+        samples, aborted = _run_parallel(duration, window, workers)
     else:
-        samples = _run_single(duration, window)
+        samples, aborted = _run_single(duration, window)
 
     if not samples:
         return {"error": "no samples collected"}
@@ -55,6 +57,8 @@ def run_sustained(duration: float, window: float = 5.0,
         "droop_percent": round(droop, 1),
         "verdict": _verdict(droop),
         "state_after": machine_state(),
+        "aborted_early": bool(aborted),
+        "abort_reason": aborted,
     }
 
 
@@ -69,10 +73,25 @@ def _verdict(droop: float) -> str:
             "workloads")
 
 
-def _run_single(duration: float, window: float) -> list[dict]:
+def _check_thermal() -> str:
+    """Return an abort reason if the machine is in thermal distress.
+
+    Hitting a thermal limit is not damage — the hardware throttles and will
+    ultimately shut itself down to stay safe. But once a machine is deep into
+    throttling, further load measures nothing new, and on a system whose
+    cooling has already failed it only invites an abrupt shutdown.
+    """
+    should, reason = limits.thermal_should_abort(thermal_pressure())
+    return reason if should else ""
+
+
+def _run_single(duration: float, window: float) -> tuple[list[dict], str]:
     samples = []
     run_start = clock()
     while clock() - run_start < duration:
+        abort = _check_thermal()
+        if abort:
+            return samples, abort
         w_start = clock()
         chunks = 0
         while clock() - w_start < window:
@@ -88,7 +107,7 @@ def _run_single(duration: float, window: float) -> list[dict]:
             "window_s": round(elapsed, 2),
             "rate": chunks * PRIMES_PER_CHUNK / elapsed,
         })
-    return samples
+    return samples, ""
 
 
 def _window_worker(window: float) -> int:
@@ -101,7 +120,8 @@ def _window_worker(window: float) -> int:
     return chunks * PRIMES_PER_CHUNK
 
 
-def _run_parallel(duration: float, window: float, workers: int) -> list[dict]:
+def _run_parallel(duration: float, window: float,
+                  workers: int) -> tuple[list[dict], str]:
     """Sample aggregate throughput across ``workers`` processes.
 
     The pool is created once and reused for every window so process-spawn cost
@@ -115,6 +135,9 @@ def _run_parallel(duration: float, window: float, workers: int) -> list[dict]:
     with ctx.Pool(processes=workers) as pool:
         run_start = clock()
         while clock() - run_start < duration:
+            abort = _check_thermal()
+            if abort:
+                return samples, abort
             w_start = clock()
             primes = sum(pool.map(_window_worker, [window] * workers))
             elapsed = clock() - w_start
@@ -125,7 +148,7 @@ def _run_parallel(duration: float, window: float, workers: int) -> list[dict]:
                 "window_s": round(elapsed, 2),
                 "rate": primes / elapsed,
             })
-    return samples
+    return samples, ""
 
 
 def sparkline(values: list[float]) -> str:

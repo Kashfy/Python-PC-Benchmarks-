@@ -16,6 +16,23 @@ JSON/CSV/HTML so you can compare machines over time.
 - **Optional native C engine** — auto-compiled for compiler-optimized numbers
   and real memory-latency measurement.
 
+## Is it safe for my hardware?
+
+**Yes.** It never writes to raw devices, never formats anything, and never
+touches firmware, voltages, or clock multipliers — the only software routes to
+real physical damage. It writes one temporary file it deletes afterwards.
+
+Resource use is capped so it cannot harm a machine indirectly:
+
+| Risk | Guard |
+|------|-------|
+| RAM exhaustion / swap thrash | Buffers capped to 1/8 of physical RAM |
+| Filling the disk | 1.5× free-space headroom required |
+| SSD wear | ≤16 GB written per run (768 MB by default), always disclosed |
+| Overheating | Sustained test stops early on severe throttle or >100 °C |
+
+Full audit in [docs/safety.md](docs/safety.md).
+
 ## Quick start
 
 ```bash
@@ -293,7 +310,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-101 tests, standard library only.
+119 tests, standard library only.
 
 ## Documentation
 
@@ -303,6 +320,7 @@ Full reference docs in [`docs/`](docs/README.md):
 - [technical.md](docs/technical.md) — methodology, units, statistics, scoring
 - [functions.md](docs/functions.md) — per-function reference
 - [packages.md](docs/packages.md) — dependencies, toolchain, CLI
+- [safety.md](docs/safety.md) — hardware-safety audit and resource caps
 - [troubleshooting.md](docs/troubleshooting.md) — common problems and fixes
 
 ## Requirements

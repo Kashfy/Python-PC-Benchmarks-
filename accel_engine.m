@@ -101,6 +101,11 @@ static double run_matmul(id<MTLDevice> dev, id<MTLCommandQueue> queue,
             [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:N
                                                  rowBytes:N * elem
                                                  dataType:dtype];
+        /* Three NxN matrices must fit comfortably in the GPU's working set. */
+        NSUInteger need = (NSUInteger)N * N * elem * 3;
+        NSUInteger budget = (NSUInteger)dev.recommendedMaxWorkingSetSize;
+        if (budget > 0 && need > budget / 4) return 0.0;
+
         id<MTLBuffer> ba = [dev newBufferWithLength:(NSUInteger)N * N * elem
                                   options:MTLResourceStorageModePrivate];
         id<MTLBuffer> bb = [dev newBufferWithLength:(NSUInteger)N * N * elem
@@ -228,7 +233,15 @@ static NSDictionary *run_gpu(double seconds) { @autoreleasepool {
         id<MTLComputePipelineState> pipe =
             [dev newComputePipelineStateWithFunction:fn error:&err];
         if (pipe) {
-            const NSUInteger bytes = 256u * 1024u * 1024u;    /* 256 MB */
+            /* Clamp against what the device says it can hold. On Apple
+             * silicon the GPU shares system RAM, so an oversized pair of
+             * buffers would take memory from the OS and applications. */
+            NSUInteger bytes = 256u * 1024u * 1024u;          /* 256 MB */
+            NSUInteger budget = (NSUInteger)dev.recommendedMaxWorkingSetSize;
+            if (budget > 0 && bytes * 2 > budget / 4)
+                bytes = (budget / 4) / 2;
+            if (bytes < 16u * 1024u * 1024u) bytes = 16u * 1024u * 1024u;
+            bytes &= ~(NSUInteger)15;                  /* float4 alignment */
             const NSUInteger vecs = bytes / 16;               /* float4 */
             id<MTLBuffer> src = [dev newBufferWithLength:bytes
                                     options:MTLResourceStorageModePrivate];
