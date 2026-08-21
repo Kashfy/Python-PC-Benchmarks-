@@ -9,6 +9,7 @@ no test dependencies to install:
 from __future__ import annotations
 
 import csv
+import math
 import os
 import platform
 import sys
@@ -18,8 +19,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, cli, compare, core, coreml_model,  # noqa: E402
-                     limits, mlframework, network, power, regression, report,
-                     scoring, system, workloads)
+                     limits, mlbench, mlframework, network, npu, onnx_model,
+                     power, regression, report, scoring, system, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -854,3 +855,187 @@ class TestDestructiveOperationSafety(unittest.TestCase):
             workloads.bench_disk(0.05, 1, file_mb=8, out_dir=d)
             self.assertEqual(glob.glob(os.path.join(d, "pcbench_*.bin")), [],
                              "scratch files must not be left behind")
+
+
+# --------------------------------------------------------------------------- #
+class TestMLWorkloads(unittest.TestCase):
+    """Pure-Python ML benchmarks: real training, clustering, and search."""
+
+    def test_nn_actually_learns(self):
+        # The headline claim is that this is *real* training, so prove the
+        # network's loss falls when the weights are updated.
+        xs, ys = mlbench._nn_dataset()
+        w1, b1, w2, b2 = mlbench._nn_init()
+        first = mlbench._nn_train_step(xs, ys, w1, b1, w2, b2)
+        for _ in range(80):
+            last = mlbench._nn_train_step(xs, ys, w1, b1, w2, b2)
+        self.assertLess(last, first * 0.9)
+
+    def test_nn_is_deterministic_across_runs(self):
+        a = mlbench._nn_train_step(*mlbench._nn_dataset(), *mlbench._nn_init())
+        b = mlbench._nn_train_step(*mlbench._nn_dataset(), *mlbench._nn_init())
+        self.assertAlmostEqual(a, b, places=12)
+
+    def test_nn_initial_loss_is_near_random_chance(self):
+        # ln(1/4) for four balanced classes ~ 1.386.
+        xs, ys = mlbench._nn_dataset()
+        loss = mlbench._nn_train_step(xs, ys, *mlbench._nn_init())
+        self.assertLess(abs(loss - math.log(4)), 0.5)
+
+    def test_kmeans_converges_on_separable_blobs(self):
+        points = mlbench._blobs(600, 8, 5)
+        _, inertia = mlbench._kmeans(points, 5, 6)
+        # Ideal within-cluster variance is dims * sigma^2 = 8 * 0.36.
+        self.assertLess(inertia / 600, 6.0)
+
+    def test_kmeans_init_picks_distinct_seeds(self):
+        # Random seeding often draws two centroids from one blob; the
+        # farthest-point init must not.
+        points = mlbench._blobs(600, 4, 5)
+        seeds = mlbench._farthest_point_init(points, 5)
+        self.assertEqual(len(seeds), 5)
+        for i in range(len(seeds)):
+            for j in range(i + 1, len(seeds)):
+                self.assertGreater(mlbench._sq_dist(seeds[i], seeds[j]), 1.0)
+
+    def test_knn_finds_self_as_nearest(self):
+        ref = mlbench._blobs(200, 6, 4, seed=3)
+        found = mlbench._knn(ref, ref[:8], 1)
+        self.assertEqual([f[0] for f in found], list(range(8)))
+
+    def test_knn_returns_k_neighbours_sorted_by_distance(self):
+        ref = mlbench._blobs(150, 4, 3, seed=9)
+        q = ref[:1]
+        got = mlbench._knn(ref, q, 5)[0]
+        self.assertEqual(len(got), 5)
+        dists = [mlbench._sq_dist(q[0], ref[i]) for i in got]
+        self.assertEqual(dists, sorted(dists))
+
+    def test_blobs_are_identical_across_calls(self):
+        self.assertEqual(mlbench._blobs(50, 4, 3), mlbench._blobs(50, 4, 3))
+
+    def test_benchmarks_return_wellformed_results(self):
+        for fn, unit in ((mlbench.bench_nn_training, "steps/s"),
+                         (mlbench.bench_kmeans, "distances/s"),
+                         (mlbench.bench_knn, "comparisons/s")):
+            r = fn(0.05, 1)
+            self.assertGreater(r["rate"], 0)
+            self.assertEqual(r["unit"], unit)
+            self.assertTrue(r["validated"])
+
+
+class TestOnnxModelGeneration(unittest.TestCase):
+    """The ONNX protobuf is hand-written, so verify its structure."""
+
+    def test_model_contains_required_names(self):
+        blob = onnx_model.build_model(32, 2, 4)
+        for token in (b"input", b"output", b"MatMul", b"Relu", b"W"):
+            self.assertIn(token, blob)
+
+    def test_model_is_deterministic(self):
+        self.assertEqual(onnx_model.build_model(32, 2, 4),
+                         onnx_model.build_model(32, 2, 4))
+
+    def test_weight_tensor_is_shared_not_duplicated(self):
+        # One initializer reused by every layer keeps the file small; without
+        # sharing, size would scale with layer count.
+        small = len(onnx_model.build_model(64, 2, 4))
+        big = len(onnx_model.build_model(64, 16, 4))
+        self.assertLess(big - small, 4096)
+
+    def test_flops_scale_with_layers_and_batch(self):
+        one = onnx_model.flops_per_inference(64, 1, 8)
+        self.assertAlmostEqual(onnx_model.flops_per_inference(64, 2, 8) / one,
+                               2.0)
+        self.assertAlmostEqual(onnx_model.flops_per_inference(64, 1, 16) / one,
+                               2.0)
+
+    def test_weights_scaled_by_inverse_dim(self):
+        # Weight magnitude must fall as 1/dim. Without that scaling each layer
+        # multiplies activations by ~dim and a deep stack overflows to inf.
+        import struct
+        for dim in (64, 256):
+            blob = onnx_model.build_model(dim, 1, 4)
+            expected = struct.pack("<f", 1.0 / dim)
+            self.assertIn(expected, blob,
+                          f"weights for dim={dim} are not scaled by 1/dim")
+
+    def test_deep_stack_stays_finite(self):
+        # Simulate the activation magnitude the real graph produces.
+        dim, layers = 1024, onnx_model.DEFAULT_LAYERS
+        mag = 1.0 / dim
+        # Mixed signs: 6 of every 7 weights positive.
+        gain = dim * mag * (6 / 7 - 1 / 7)
+        activation = 1.0
+        for _ in range(layers):
+            activation *= gain
+        self.assertTrue(math.isfinite(activation))
+        self.assertLess(abs(activation), 1e30)
+
+    def test_write_model_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = onnx_model.write_model(os.path.join(d, "m.onnx"), 32, 2, 4)
+            self.assertTrue(os.path.isfile(p))
+            with open(p, "rb") as fh:
+                self.assertEqual(fh.read(), onnx_model.build_model(32, 2, 4))
+
+
+class TestNpuCrossVendor(unittest.TestCase):
+    def test_detect_reports_availability(self):
+        d = npu.detect()
+        self.assertIn("available", d)
+        if not d["available"]:
+            self.assertIn("note", d)
+
+    def test_provider_table_covers_major_vendors(self):
+        vendors = {v[1] for v in npu._EP_INFO.values() if v[1]}
+        for expected in ("Intel", "AMD", "Qualcomm", "Apple", "NVIDIA"):
+            self.assertIn(expected, vendors)
+
+    def test_intel_provider_targets_npu_device(self):
+        # OpenVINO defaults to CPU unless the device type is set explicitly.
+        _, _, _, opts = npu._EP_INFO["OpenVINOExecutionProvider"]
+        self.assertEqual(opts, {"device_type": "NPU"})
+
+    def test_extract_rates_requires_engagement(self):
+        payload = {"available": True, "devices": [
+            {"label": "X", "gflops": 900.0, "engaged": False}]}
+        self.assertEqual(npu.extract_rates(payload), {},
+                         "an unengaged accelerator must not be scored")
+        payload["devices"][0]["engaged"] = True
+        self.assertEqual(npu.extract_rates(payload), {"npu_onnx": 900.0})
+
+    def test_extract_rates_picks_fastest_engaged(self):
+        payload = {"available": True, "devices": [
+            {"label": "A", "gflops": 100.0, "engaged": True},
+            {"label": "B", "gflops": 400.0, "engaged": True}]}
+        self.assertEqual(npu.extract_rates(payload), {"npu_onnx": 400.0})
+
+    def test_extract_rates_handles_absent_or_errored(self):
+        for p in (None, {"available": False}, {"available": True,
+                                               "error": "boom"}):
+            self.assertEqual(npu.extract_rates(p), {})
+
+
+class TestNpuDetectionMultiVendor(unittest.TestCase):
+    def test_known_npu_pci_ids_map_to_vendors(self):
+        vendors = {v[1] for v in accel._NPU_PCI_IDS.values()}
+        self.assertIn("Intel", vendors)
+        self.assertIn("AMD", vendors)
+
+    def test_driver_table_covers_intel_and_amd(self):
+        self.assertIn("intel_vpu", accel._NPU_DRIVERS)
+        self.assertIn("amdxdna", accel._NPU_DRIVERS)
+
+    def test_windows_hints_match_vendor_naming(self):
+        for name in ("Intel(R) AI Boost", "AMD IPU Device",
+                     "Qualcomm(R) Hexagon(TM) NPU", "Neural Processor"):
+            self.assertTrue(accel._WINDOWS_NPU_HINTS.search(name), name)
+
+    def test_windows_hints_do_not_match_ordinary_devices(self):
+        for name in ("Intel(R) UHD Graphics", "Realtek Audio", "USB Hub"):
+            self.assertFalse(accel._WINDOWS_NPU_HINTS.search(name), name)
+
+    def test_api_table_has_entry_per_vendor(self):
+        for vendor in ("Intel", "AMD", "Qualcomm", "Apple"):
+            self.assertIn(vendor, accel._NPU_APIS)

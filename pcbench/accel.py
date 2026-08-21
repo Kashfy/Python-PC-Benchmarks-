@@ -13,6 +13,7 @@ Scope, stated plainly:
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import platform
@@ -195,64 +196,156 @@ def detect_gpus() -> list[dict]:
 # be inferred from the chip rather than probed.
 _APPLE_SILICON = re.compile(r"\bApple\s+M\d", re.I)
 
+# Windows exposes NPUs as PnP devices; vendors name them inconsistently.
 _WINDOWS_NPU_HINTS = re.compile(
-    r"neural processor|neural engine|ai boost|npu|hexagon|xdna", re.I)
+    r"neural processor|neural engine|ai boost|\bnpu\b|hexagon|xdna|"
+    r"\bipu\b|compute accelerator", re.I)
+
+# PCI IDs for the discrete NPU blocks on current laptop silicon. Vendor ID
+# alone is not enough — Intel and AMD both ship GPUs under the same vendor —
+# so the device ID identifies the NPU specifically.
+_NPU_PCI_IDS = {
+    # Intel "AI Boost" NPU (VPU), driver: intel_vpu
+    ("0x8086", "0x7d1d"): ("Intel AI Boost NPU (Meteor Lake)", "Intel"),
+    ("0x8086", "0xad1d"): ("Intel AI Boost NPU (Arrow Lake)", "Intel"),
+    ("0x8086", "0x643e"): ("Intel AI Boost NPU (Lunar Lake)", "Intel"),
+    ("0x8086", "0xb03e"): ("Intel AI Boost NPU (Panther Lake)", "Intel"),
+    # AMD XDNA / Ryzen AI, driver: amdxdna
+    ("0x1022", "0x1502"): ("AMD Ryzen AI NPU (XDNA, Phoenix)", "AMD"),
+    ("0x1022", "0x17f0"): ("AMD Ryzen AI NPU (XDNA2, Strix)", "AMD"),
+}
+
+# Linux kernel drivers that bind an NPU, when the PCI ID is unrecognised.
+_NPU_DRIVERS = {
+    "intel_vpu": ("Intel AI Boost NPU", "Intel"),
+    "ivpu": ("Intel AI Boost NPU", "Intel"),
+    "amdxdna": ("AMD Ryzen AI NPU (XDNA)", "AMD"),
+    "qaic": ("Qualcomm Cloud AI accelerator", "Qualcomm"),
+}
+
+# Which software stack can actually reach each vendor's NPU.
+_NPU_APIS = {
+    "Intel": "OpenVINO / DirectML / ONNX Runtime",
+    "AMD": "Vitis AI / DirectML / ONNX Runtime",
+    "Qualcomm": "QNN / DirectML / ONNX Runtime",
+    "Apple": "Core ML",
+}
+
+
+def _npus_linux() -> list[dict]:
+    """Detect NPUs through the accel subsystem and PCI IDs.
+
+    Linux exposes NPUs as /dev/accel/accelN (the accel subsystem added for
+    compute accelerators). Reading the backing PCI device identifies the
+    vendor precisely, which matters because a bare "accel0" node says nothing
+    about whose silicon it is.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+
+    for node in sorted(glob.glob("/sys/class/accel/accel*")):
+        name = os.path.basename(node)
+        vendor_id = _read(f"{node}/device/vendor").strip().lower()
+        device_id = _read(f"{node}/device/device").strip().lower()
+
+        label = vendor = None
+        if (vendor_id, device_id) in _NPU_PCI_IDS:
+            label, vendor = _NPU_PCI_IDS[(vendor_id, device_id)]
+        else:
+            # Fall back to whichever driver claimed the device.
+            driver = os.path.basename(
+                os.path.realpath(f"{node}/device/driver")) \
+                if os.path.exists(f"{node}/device/driver") else ""
+            if driver in _NPU_DRIVERS:
+                label, vendor = _NPU_DRIVERS[driver]
+            elif vendor_id:
+                label = f"Accelerator {name} [{vendor_id}:{device_id}]"
+                vendor = _pci_vendor(vendor_id)
+
+        if label and label not in seen:
+            seen.add(label)
+            found.append({"name": label, "vendor": vendor,
+                          "device": f"/dev/accel/{name}",
+                          "api": _NPU_APIS.get(vendor,
+                                               "Level Zero / ONNX Runtime"),
+                          "benchmarkable": False})
+
+    # A device node with no sysfs class entry still indicates an NPU.
+    if not found:
+        for dev, (label, vendor) in (
+                ("/dev/accel/accel0", ("Compute accelerator", None)),
+                ("/dev/amdxdna", _NPU_DRIVERS["amdxdna"])):
+            if os.path.exists(dev):
+                found.append({"name": label, "vendor": vendor,
+                              "device": dev,
+                              "api": _NPU_APIS.get(vendor,
+                                                   "vendor runtime"),
+                              "benchmarkable": False})
+    return found
+
+
+def _npus_windows() -> list[dict]:
+    """Detect NPUs via PnP enumeration.
+
+    Windows 11 gives NPUs their own "ComputeAccelerator" device class, but
+    older drivers register under System, so the query matches on name too.
+    """
+    out = _run(["powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_PnPEntity | "
+                "Where-Object { $_.PNPClass -eq 'ComputeAccelerator' -or "
+                "$_.Name -match 'Neural|NPU|AI Boost|Hexagon|XDNA|IPU' } | "
+                "Select-Object Name,Manufacturer,PNPClass | "
+                "ConvertTo-Json -Compress"])
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+
+    found = []
+    for item in data:
+        name = (item.get("Name") or "").strip()
+        klass = item.get("PNPClass") or ""
+        if not name:
+            continue
+        if klass != "ComputeAccelerator" and not _WINDOWS_NPU_HINTS.search(name):
+            continue
+        maker = item.get("Manufacturer") or ""
+        vendor = ("Intel" if re.search(r"intel", name + maker, re.I) else
+                  "AMD" if re.search(r"amd|xdna", name + maker, re.I) else
+                  "Qualcomm" if re.search(r"qualcomm|hexagon", name + maker,
+                                          re.I) else maker or None)
+        found.append({"name": name, "vendor": vendor,
+                      "api": _NPU_APIS.get(vendor, "DirectML / ONNX Runtime"),
+                      "benchmarkable": False})
+    return found
 
 
 def detect_npus(cpu_model: str = "") -> list[dict]:
+    """Enumerate neural accelerators across Apple, Intel, AMD, and Qualcomm."""
     sysname = platform.system()
-    npus: list[dict] = []
     try:
         if sysname == "Darwin":
             if _APPLE_SILICON.search(cpu_model or ""):
-                npus.append({
+                return [{
                     "name": "Apple Neural Engine",
                     "vendor": "Apple",
                     "api": "Core ML",
                     "benchmarkable": True,
                     "note": "not directly programmable; reachable only "
                             "through Core ML",
-                })
-        elif sysname == "Windows":
-            out = _run(["powershell", "-NoProfile", "-Command",
-                        "Get-CimInstance Win32_PnPEntity | "
-                        "Where-Object { $_.Name -match "
-                        "'Neural|NPU|AI Boost|Hexagon' } | "
-                        "Select-Object Name,Manufacturer | "
-                        "ConvertTo-Json -Compress"])
-            if out:
-                try:
-                    data = json.loads(out)
-                except json.JSONDecodeError:
-                    data = []
-                if isinstance(data, dict):
-                    data = [data]
-                for item in data:
-                    name = item.get("Name", "")
-                    if _WINDOWS_NPU_HINTS.search(name):
-                        npus.append({"name": name,
-                                     "vendor": item.get("Manufacturer"),
-                                     "api": "DirectML / OpenVINO",
-                                     "benchmarkable": False})
-        elif sysname == "Linux":
-            # Intel's NPU driver exposes /dev/accel/accelN; AMD XDNA uses
-            # an amdxdna node.
-            for node in ("/dev/accel", "/sys/class/accel"):
-                if os.path.exists(node):
-                    try:
-                        entries = os.listdir(node)
-                    except OSError:
-                        entries = []
-                    for e in entries:
-                        npus.append({"name": f"Accelerator ({e})",
-                                     "api": "Level Zero / OpenVINO",
-                                     "benchmarkable": False})
-            if os.path.exists("/dev/amdxdna"):
-                npus.append({"name": "AMD XDNA NPU", "vendor": "AMD",
-                             "api": "XRT", "benchmarkable": False})
+                }]
+            return []
+        if sysname == "Linux":
+            return _npus_linux()
+        if sysname == "Windows":
+            return _npus_windows()
     except Exception:
         pass
-    return npus
+    return []
 
 
 def inventory(cpu_model: str = "") -> dict:

@@ -12,7 +12,9 @@ from datetime import datetime, timezone
 
 from . import __version__
 from . import accel as accel_mod
+from . import mlbench
 from . import mlframework
+from . import npu as npu_mod
 from . import native as native_mod
 from . import network
 from . import power
@@ -26,7 +28,8 @@ from .sustained import run_sustained
 from .system import inventory, machine_state, state_warnings
 
 TESTS = ["cpu_int", "cpu_float", "cpu_multi", "compression", "hashing",
-         "json", "memory", "cache_sweep", "disk"]
+         "json", "memory", "cache_sweep", "disk",
+         "nn_training", "kmeans", "knn"]
 DEFAULT_TESTS = list(TESTS)
 
 
@@ -158,6 +161,9 @@ def _runners(args, info, disk_dir) -> dict:
         "cache_sweep": lambda: wl.bench_cache_sweep(
             s, info.get("ram_total_bytes", 0)),
         "disk": lambda: wl.bench_disk(s, r, args.disk_mb, disk_dir),
+        "nn_training": lambda: mlbench.bench_nn_training(s, r),
+        "kmeans": lambda: mlbench.bench_kmeans(s, r),
+        "knn": lambda: mlbench.bench_knn(s, r),
     }
 
 
@@ -274,6 +280,18 @@ def main(argv=None) -> int:
             print("  measuring power ...", flush=True)
         power_info = power.measure_under_load(info.get("cpu_model", ""))
 
+    # Cross-vendor NPU via ONNX Runtime (Intel / AMD / Qualcomm / DirectML).
+    npu_result = None
+    if not args.no_accel and not args.no_npu:
+        if npu_mod.detect().get("available"):
+            if not quiet:
+                print("  running ONNX Runtime NPU benchmark ...", flush=True)
+            npu_result = npu_mod.run(min(args.seconds, 3.0), disk_dir)
+            for key, value in npu_mod.extract_rates(npu_result).items():
+                results[key] = {"rate": value}
+        else:
+            npu_result = npu_mod.detect()
+
     sustained = None
     if sustained_seconds:
         workers = args.sustained_workers or info["cpu_cores_logical"]
@@ -304,6 +322,7 @@ def main(argv=None) -> int:
         "accelerators": accel_inv,
         "accel": accel,
         "ml_framework": ml,
+        "npu_onnx": npu_result,
         "network": net,
         "power": power_info,
         "perf_per_watt": ppw,

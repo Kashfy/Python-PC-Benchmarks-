@@ -103,6 +103,24 @@ def print_results(results: dict) -> None:
         if r.get("safety_notice"):
             print(f"      safety: {r['safety_notice']}")
 
+    ml_labels = [
+        ("nn_training", "Neural net training", "rate", "steps/s"),
+        ("kmeans", "K-means clustering", "rate", "distances/s"),
+        ("knn", "K-NN search", "rate", "comparisons/s"),
+    ]
+    for key, label, field, unit in ml_labels:
+        r = results.get(key)
+        if not isinstance(r, dict):
+            continue
+        if r.get("error"):
+            _row(label, "FAILED", f"  {r['error'][:40]}")
+            continue
+        extra = ""
+        if key == "nn_training" and r.get("samples_per_s"):
+            extra = f"  ({r['samples_per_s']:,.0f} samples/s, " \
+                    f"{r.get('mflops', 0):,.0f} MFLOPS)"
+        _row(label, fmt(r.get(field)), f" {unit}{extra}")
+
     r = results.get("cpu_multi")
     if isinstance(r, dict) and not r.get("error"):
         single = (results.get("cpu_int") or {}).get("rate")
@@ -217,6 +235,42 @@ def print_accelerators(inv: dict | None, accel: dict | None) -> None:
         print(f"  note: {note}")
 
 
+def print_npu_onnx(npu: dict | None) -> None:
+    """Cross-vendor NPU results from ONNX Runtime execution providers."""
+    if not npu:
+        return
+    hr("NPU — cross-vendor (ONNX Runtime)")
+    if not npu.get("available"):
+        print(f"  {npu.get('note', 'onnxruntime not installed')}")
+        return
+    if npu.get("error"):
+        print(f"  error: {npu['error']}")
+        return
+
+    _kv("Runtime", f"onnxruntime {npu.get('onnxruntime_version', '?')}")
+    _kv("Model", npu.get("model", "?"))
+    print()
+    _row("CPU provider (baseline)", fmt(npu.get("cpu_inferences_per_s")),
+         f" inf/s  ({npu.get('cpu_gflops', 0):,.0f} GFLOPS)")
+
+    for d in npu.get("devices", []):
+        if d.get("error"):
+            _row(d["label"], "unavailable", f"  {d['error'][:44]}")
+            continue
+        _row(d["label"], fmt(d["inferences_per_s"]),
+             f" inf/s  ({d['gflops']:,.0f} GFLOPS, {d['speedup_vs_cpu']}x)")
+
+    # Same honesty rule as the Apple Neural Engine path: without a clear
+    # speedup we cannot claim the accelerator actually ran the model.
+    engaged = [d for d in npu.get("devices", []) if d.get("engaged")]
+    if engaged:
+        print(f"\n  Fastest engaged accelerator: {npu['best_accelerator']} "
+              f"({npu['best_gflops']:,.0f} GFLOPS)")
+    elif npu.get("devices"):
+        print("\n  No accelerator beat the CPU by "
+              "1.5x — none is reported as engaged.")
+
+
 def print_ai(ml: dict | None) -> None:
     if not ml:
         return
@@ -319,6 +373,7 @@ def print_report(payload: dict) -> None:
     print_results(payload["results"])
     print_native(payload.get("native"))
     print_accelerators(payload.get("accelerators"), payload.get("accel"))
+    print_npu_onnx(payload.get("npu_onnx"))
     print_ai(payload.get("ml_framework"))
     print_network(payload.get("network"))
     print_power(payload.get("power"), payload.get("perf_per_watt"))
@@ -363,6 +418,8 @@ CSV_FIELDS = [
     "gpu_matmul_fp32_tflops", "gpu_matmul_fp16_tflops",
     "npu_name", "npu_gflops", "npu_speedup_vs_cpu",
     "ml_train_samples_s", "ml_infer_samples_s",
+    "npu_onnx_gflops", "npu_onnx_device",
+    "nn_train_steps_s", "kmeans_dist_s", "knn_cmp_s",
     "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
     "sustained_droop_pct", "composite_score",
 ]
@@ -426,6 +483,12 @@ def flatten_row(payload: dict) -> dict:
         "gpu_matmul_fp16_tflops": _rate(results, "gpu_matmul_fp16"),
         "ml_train_samples_s": _rate(results, "ml_train"),
         "ml_infer_samples_s": _rate(results, "ml_infer"),
+        "npu_onnx_gflops": _rate(results, "npu_onnx"),
+        "npu_onnx_device": ((payload.get("npu_onnx") or {})
+                            .get("best_accelerator") or ""),
+        "nn_train_steps_s": _rate(results, "nn_training"),
+        "kmeans_dist_s": _rate(results, "kmeans"),
+        "knn_cmp_s": _rate(results, "knn"),
         "net_loopback_mb_s": round(
             (payload.get("network") or {}).get("loopback_mb_s", 0) or 0, 1),
         "power_watts": power.get("package_w") or "",

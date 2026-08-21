@@ -7,7 +7,9 @@ native_engine.exe
 accel_engine
 accel_engine.exe
 *.mlmodel
-*.mlmodelc/
+*.onnx
+*.mlmodel
+*.onnxc/
 *.o
 *.obj
 

@@ -277,6 +277,64 @@ Pulls `ml_train` / `ml_infer` for scoring.
 
 ---
 
+## `pcbench.mlbench` — pure-Python ML workloads
+
+No framework required; every function is deterministic and self-validating.
+
+#### `bench_nn_training(seconds, repeats)` → steps/s
+Trains a real 32-24-4 MLP (forward, backprop, SGD). Also returns
+`samples_per_s`, `mflops`, and `topology`. Validates that loss falls below 90%
+of its initial value.
+
+#### `bench_kmeans(seconds, repeats)` → distances/s
+Lloyd's algorithm, 1,200 points × 8D, k=6. Reports `inertia_per_point` and
+validates convergence.
+
+#### `bench_knn(seconds, repeats)` → comparisons/s
+Brute-force k-NN, 40 queries × 900 refs × 12D. Validates that each point is its
+own nearest neighbour.
+
+#### Internals
+`_blobs` (deterministic clustered data), `_nn_dataset`, `_nn_init`,
+`_nn_train_step` (one full training step), `nn_flops_per_step`, `_sq_dist`,
+`_farthest_point_init` (maximin seeding — see
+[technical.md](technical.md#k-means-clustering) for why random seeding is
+unusable here), `_kmeans`, `_knn`.
+
+---
+
+## `pcbench.onnx_model` — ONNX model generator
+
+Writes the ONNX protobuf directly, so only `onnxruntime` is needed — not the
+`onnx` package. Verified against ONNX Runtime 1.29.
+
+#### `build_model(dim=1024, layers=10, batch=32) -> bytes`
+A `MatMul` + `Relu` stack sharing one weight initializer, with weights scaled
+by `1/dim` so deep stacks cannot overflow.
+
+#### `flops_per_inference(...)` · `write_model(path, ...)`
+FLOPs for one forward pass (`2·batch·dim²·layers`), and a writer that reuses an
+identical existing file.
+
+---
+
+## `pcbench.npu` — cross-vendor NPU benchmarking
+
+#### `detect() -> dict`
+Reports ONNX Runtime availability and which execution providers are installed,
+split into all providers and accelerator providers.
+
+#### `run(seconds, out_dir) -> dict`
+Benchmarks the CPU provider as a baseline, then every accelerator provider, and
+returns per-device throughput, GFLOPS, speedup, and an `engaged` flag. Rejects
+a result when ONNX Runtime silently fell back to CPU.
+
+#### `extract_rates(payload) -> dict`
+Returns the fastest **engaged** accelerator for scoring; an unengaged device is
+never scored.
+
+---
+
 ## `pcbench.power` — power & perf-per-watt
 
 #### `estimate_tdp(cpu_model) -> int | None`

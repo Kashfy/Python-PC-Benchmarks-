@@ -39,6 +39,12 @@ BASELINES = {
     # AI framework tier (optional; only when torch/onnxruntime present).
     "ml_train": 500.0,             # training samples/s
     "ml_infer": 2_000.0,           # inference samples/s
+    # Cross-vendor NPU via ONNX Runtime execution providers.
+    "npu_onnx": 500.0,             # GFLOPS on the fastest engaged accelerator
+    # Classic ML workloads, pure Python (no framework needed).
+    "nn_training": 400.0,          # MLP training steps/s
+    "kmeans": 1_000_000.0,         # point-centroid distances/s
+    "knn": 1_000_000.0,            # neighbour comparisons/s
 }
 
 # Which result key and field each score is derived from.
@@ -61,6 +67,10 @@ _SOURCES = [
     ("npu", "npu", "rate"),
     ("ml_train", "ml_train", "rate"),
     ("ml_infer", "ml_infer", "rate"),
+    ("npu_onnx", "npu_onnx", "rate"),
+    ("nn_training", "nn_training", "rate"),
+    ("kmeans", "kmeans", "rate"),
+    ("knn", "knn", "rate"),
 ]
 
 
@@ -95,9 +105,10 @@ def category_scores(subscores: dict) -> dict:
         "disk": ["disk_write", "disk_read", "disk_iops"],
         "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
                 "gpu_matmul_fp32", "gpu_matmul_fp16"],
-        "npu": ["npu"],
-        "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu",
-               "ml_train", "ml_infer"],
+        "npu": ["npu", "npu_onnx"],
+        "ml": ["nn_training", "kmeans", "knn"],
+        "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu", "npu_onnx",
+               "ml_train", "ml_infer", "nn_training", "kmeans", "knn"],
     }
     out = {}
     for name, keys in groups.items():

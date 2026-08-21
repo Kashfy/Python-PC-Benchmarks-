@@ -17,6 +17,7 @@ reports ``available: False`` and the run continues.
 
 from __future__ import annotations
 
+import os
 import time
 
 
@@ -118,48 +119,29 @@ def _bench_torch(seconds: float, batch: int) -> dict:
 def _bench_onnx(seconds: float, batch: int) -> dict:
     """Inference-only fallback when ONNX Runtime is present but PyTorch isn't.
 
-    ONNX Runtime does not train, so this reports inference throughput only —
-    still useful, and honest about the omission.
+    ONNX Runtime cannot train, so this reports inference throughput only and
+    says so. The model comes from :mod:`pcbench.onnx_model`, which writes the
+    protobuf directly — so the heavyweight ``onnx`` package is not required.
     """
+    import tempfile
+
     import numpy as np
     import onnxruntime as ort
 
-    providers = ort.get_available_providers()
-    # Build a tiny matmul-stack model in-memory via the ONNX helper if
-    # available; otherwise report capability without a synthetic model.
-    try:
-        from onnx import helper, TensorProto
-        import onnx
-    except Exception:
-        return {"available": True, "framework": "onnxruntime",
-                "framework_version": ort.__version__,
-                "providers": providers,
-                "note": "onnx package not present; cannot build test model",
-                "infer_samples_per_s": None}
+    from . import onnx_model
 
-    dim = 512
-    nodes, inits, names = [], [], []
-    prev = "input"
-    for i in range(6):
-        w = f"W{i}"
-        inits.append(helper.make_tensor(
-            w, TensorProto.FLOAT, [dim, dim],
-            (np.random.randn(dim, dim).astype(np.float32) * 0.02).ravel()))
-        out = "output" if i == 5 else f"h{i}"
-        nodes.append(helper.make_node("MatMul", [prev, w], [out]))
-        prev = out
-        names.append(out)
-    graph = helper.make_graph(
-        nodes, "bench",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT,
-                                       [batch, dim])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT,
-                                       [batch, dim])],
-        inits)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    sess = ort.InferenceSession(model.SerializeToString(),
-                                providers=providers)
-    feed = {"input": np.random.randn(batch, dim).astype(np.float32)}
+    providers = [p for p in ort.get_available_providers()
+                 if p != "AzureExecutionProvider"]
+    path = onnx_model.write_model(
+        os.path.join(tempfile.gettempdir(), "pcbench_ml.onnx"))
+
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    sess = ort.InferenceSession(path, sess_options=so, providers=providers)
+    dim = onnx_model.DEFAULT_DIM
+    feed = {"input": np.random.rand(onnx_model.DEFAULT_BATCH, dim)
+            .astype(np.float32)}
+
     for _ in range(3):
         sess.run(None, feed)
     start = time.perf_counter()
@@ -168,14 +150,19 @@ def _bench_onnx(seconds: float, batch: int) -> dict:
         sess.run(None, feed)
         n += 1
     elapsed = time.perf_counter() - start
+
+    active = sess.get_providers()
     return {
         "available": True,
         "framework": "onnxruntime",
         "framework_version": ort.__version__,
-        "device": providers[0] if providers else "cpu",
+        "device": active[0] if active else "cpu",
+        "device_name": (active[0].replace("ExecutionProvider", "")
+                        if active else "CPU"),
         "providers": providers,
-        "batch_size": batch,
-        "infer_samples_per_s": round(n * batch / elapsed, 1),
+        "batch_size": onnx_model.DEFAULT_BATCH,
+        "infer_samples_per_s": round(n * onnx_model.DEFAULT_BATCH / elapsed, 1),
+        "gflops": round(n * onnx_model.flops_per_inference() / elapsed / 1e9, 1),
         "note": "ONNX Runtime does not train; inference only",
     }
 

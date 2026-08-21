@@ -62,6 +62,7 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `zlib` | Compression workload |
 | `struct` | Packing float weights into the Core ML protobuf |
 | `socket` / `threading` | Loopback network benchmark |
+| `struct` | Packing weights into the Core ML and ONNX protobufs |
 
 ## Optional dependency: an ML framework (AI tier only)
 
@@ -72,8 +73,20 @@ only when you opt in by installing it:
 
 ```bash
 pip install torch          # real training + inference, CUDA/ROCm/MPS/CPU
-pip install onnxruntime    # inference-only fallback
+pip install onnxruntime    # inference + cross-vendor NPU benchmarking
 ```
+
+`onnxruntime` additionally unlocks **cross-vendor NPU benchmarking** (Intel,
+AMD, Qualcomm, DirectML). Vendor-specific builds target their own NPU:
+
+```bash
+pip install onnxruntime-openvino    # Intel AI Boost NPU
+pip install onnxruntime-directml    # any DirectML device on Windows
+pip install onnxruntime-qnn         # Qualcomm Hexagon NPU
+```
+
+The `onnx` package is **not** required — pcbench writes the ONNX protobuf
+itself.
 
 ## Optional dependency: `psutil`
 
@@ -136,7 +149,10 @@ pcbench [options]          #  or:  python3 benchmark.py [options]
 | `--mem-mb K` | `64` | Memory buffer size |
 
 Test names: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`,
-`json`, `memory`, `cache_sweep`, `disk`.
+`json`, `memory`, `cache_sweep`, `disk`, `nn_training`, `kmeans`, `knn`.
+
+The three ML workloads (`nn_training`, `kmeans`, `knn`) need no dependencies —
+they are pure standard library.
 
 ### Sustained load
 
@@ -224,7 +240,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-101 cases, standard library only — no pytest, no test dependencies.
+146 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

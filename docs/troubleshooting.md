@@ -149,6 +149,40 @@ python3 benchmark.py --ai
 If a framework *is* installed but errors, the section shows the framework and
 the error message; the rest of the run is unaffected.
 
+## NPU section says "no accelerator beat the CPU by 1.5x"
+
+The accelerator ran but was not faster than the CPU, so it is not reported as
+engaged. This is a real result, not a bug — common reasons:
+
+- **The CPU is genuinely fast at this workload.** Apple's CPU uses AMX for
+  matrix multiply and often beats routing the same matmul through Core ML.
+- **The provider fell back to CPU.** pcbench detects this and says so.
+- **The model does not suit the NPU.** NPUs favour quantised/INT8 convolution
+  work; a float32 matmul stack may stay on CPU or GPU.
+
+For Intel/AMD NPUs specifically, install the vendor build — plain `onnxruntime`
+does not include their providers:
+
+```bash
+pip install onnxruntime-openvino    # Intel
+pip install onnxruntime-directml    # Windows, any DX12 NPU/GPU
+pip install onnxruntime-qnn         # Qualcomm
+```
+
+## An NPU is detected but not benchmarked
+
+Detection and benchmarking are separate. Detection works everywhere from PCI
+IDs and drivers; benchmarking needs `onnxruntime` plus the matching execution
+provider. Install one of the vendor packages above.
+
+## ML workload failed validation
+
+`nn_training`, `kmeans`, and `knn` each verify a known-correct outcome — loss
+decreasing, clusters converging, points being their own nearest neighbour. A
+failure here means the same thing as any other validation failure: suspect
+unstable memory, an overclock, or cooling. See
+[VALIDATION FAILED](#validation-failed-exit-code-4).
+
 ## Power shows "(estimated)" instead of real watts
 
 Real power metering is privileged:

@@ -24,3 +24,5 @@ project [README](../README.md) for a quick start, then dive in here.
 - **How do I get real AI training numbers?** → [technical: AI framework tier](technical.md#ai-training--inference-optional-framework-tier)
 - **Is the power number real or estimated?** → [technical: power](technical.md#power--perf-per-watt)
 - **Can this damage my SSD / RAM / laptop?** → [safety.md](safety.md) (short answer: no)
+- **Does it support Intel / AMD NPUs?** → [technical: cross-vendor NPU](technical.md#cross-vendor-npu-via-onnx-runtime)
+- **What ML workloads run without a framework?** → [technical: ML workloads](technical.md#machine-learning-workloads-pure-python)
