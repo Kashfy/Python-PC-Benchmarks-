@@ -35,6 +35,33 @@ Resource use is capped so it cannot harm a machine indirectly:
 
 Full audit in [docs/safety.md](docs/safety.md).
 
+## Two ways to run it
+
+**Zero install** — the standard-library core works immediately, everywhere:
+
+```bash
+python3 benchmark.py
+```
+
+**With optional packages** — unlocks benchmarks the standard library cannot
+provide. One command, into a project-local venv, nothing installed until you
+confirm:
+
+```bash
+python3 install.py            # interactive; --list to preview, --tier to pick
+.venv/bin/python benchmark.py
+```
+
+| Tier | Unlocks | Why the stdlib can't |
+|------|---------|----------------------|
+| `compute` | BLAS matmul, FFT, LAPACK (numpy, scipy, numba) | Pure Python measures **CPython, not your CPU** — 113 MFLOPS vs **450 GFLOPS** on the same M4 |
+| `gpu` | GPU compute on NVIDIA/AMD/Intel (pyopencl), NVIDIA telemetry (pynvml) | No portable GPU API — GPU benchmarking was Apple-only |
+| `crypto` | AES-NI throughput, Zstandard, LZ4, BLAKE3 | **No AES primitive exists** in the stdlib |
+| `system` | Better sensors, charts, rich tables, reference ML (psutil, matplotlib, rich, scikit-learn) | Limited sensor access on Windows/Linux |
+
+Everything degrades gracefully: a missing package removes its section and
+nothing else. Scores omit absent capabilities rather than penalising them.
+
 ## Quick start
 
 ```bash
@@ -413,7 +440,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-185 tests, standard library only.
+204 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

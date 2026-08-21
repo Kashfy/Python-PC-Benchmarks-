@@ -25,6 +25,8 @@ project [README](../README.md) for a quick start, then dive in here.
 - **Why no GPU benchmark on Windows/Linux?** → [technical: coverage](technical.md#what-is-and-isnt-covered)
 - **How do I get real AI training numbers?** → [technical: AI framework tier](technical.md#ai-training--inference-optional-framework-tier)
 - **Is the power number real or estimated?** → [technical: power](technical.md#power--perf-per-watt)
+- **A package failed to install — now what?** → [troubleshooting: install](troubleshooting.md#a-package-failed-to-install)
+- **What do the optional packages add?** → [packages: tiers](packages.md#optional-package-tiers)
 - **What does TFLOPS / IOPS / NPU / GEMM mean?** → [glossary.md](glossary.md)
 - **How does the neural-network training actually work?** → [ml-algorithms.md](ml-algorithms.md#1-neural-network-training)
 - **Can this damage my SSD / RAM / laptop?** → [safety.md](safety.md) (short answer: no)

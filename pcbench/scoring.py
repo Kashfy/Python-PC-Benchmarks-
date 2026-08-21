@@ -50,6 +50,16 @@ BASELINES = {
     "mem_scaling": 20_000.0,       # peak multi-process copy bandwidth MB/s
     "compile": 300.0,              # compiles per minute
     "syscall": 20_000_000.0,       # syscalls/s (i.e. 50 ns each)
+    # Optional-package tiers. Absent packages are omitted from the composite
+    # rather than scored as zero.
+    "blas_matmul": 100.0,          # GFLOPS fp64 via BLAS
+    "fft": 5.0,                    # GFLOPS
+    "lapack": 500.0,               # Cholesky decompositions/s
+    "aes": 2_000.0,                # MB/s AES-256-GCM
+    "zstd": 400.0,                 # MB/s Zstandard
+    "lz4": 800.0,                  # MB/s LZ4
+    "blake3": 1_000.0,             # MB/s BLAKE3
+    "gpu_opencl": 1_000.0,         # GFLOPS via OpenCL
 }
 
 # Which result key and field each score is derived from.
@@ -80,6 +90,14 @@ _SOURCES = [
     ("mem_scaling", "mem_scaling", "rate"),
     ("compile", "compile", "rate"),
     ("syscall", "latency", "rate"),
+    ("blas_matmul", "blas_matmul", "rate"),
+    ("fft", "fft", "rate"),
+    ("lapack", "lapack", "rate"),
+    ("aes", "aes", "rate"),
+    ("zstd", "zstd", "rate"),
+    ("lz4", "lz4", "rate"),
+    ("blake3", "blake3", "rate"),
+    ("gpu_opencl", "gpu_opencl", "rate"),
 ]
 
 
@@ -110,11 +128,13 @@ def category_scores(subscores: dict) -> dict:
     groups = {
         "cpu": ["cpu_int", "cpu_float", "cpu_multi", "compression",
                 "hashing", "json"],
+        "numeric": ["blas_matmul", "fft", "lapack"],
+        "crypto": ["aes", "zstd", "lz4", "blake3"],
         "memory": ["memory", "mem_scaling"],
         "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
         "system": ["compile", "syscall"],
         "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
-                "gpu_matmul_fp32", "gpu_matmul_fp16"],
+                "gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"],
         "npu": ["npu", "npu_onnx"],
         "ml": ["nn_training", "kmeans", "knn"],
         "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu", "npu_onnx",

@@ -15,6 +15,10 @@ sensors_engine.exe
 *.o
 *.obj
 
+# Installer virtual environment
+.venv/
+venv/
+
 # Python
 __pycache__/
 *.pyc

@@ -19,7 +19,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, cli, compare, core, coreml_model, cores,  # noqa: E402
-                     sysbench,
+                     cryptobench, gpucompute, numeric, optional, sysbench,
                      limits, mlbench, mlframework, network, npu, onnx_model,
                      power, regression, report, scoring, sustained, system,
                      thermal, workloads)
@@ -1351,3 +1351,142 @@ class TestProfiles(unittest.TestCase):
 
     def test_unknown_profile_rejected(self):
         self.assertEqual(cli.main(["--profile", "nonsense", "--no-save"]), 2)
+
+
+# --------------------------------------------------------------------------- #
+class TestOptionalRegistry(unittest.TestCase):
+    """The optional-package tiers must be coherent and never break the core."""
+
+    def test_every_tier_has_summary_and_packages(self):
+        for name, tier in optional.TIERS.items():
+            self.assertTrue(tier["summary"], name)
+            self.assertTrue(tier["packages"], name)
+
+    def test_package_fields_are_populated(self):
+        for pkg in optional.all_packages():
+            self.assertTrue(pkg.import_name)
+            self.assertTrue(pkg.pip_name)
+            self.assertTrue(pkg.purpose)
+            self.assertGreater(pkg.approx_mb, 0)
+
+    def test_each_tier_has_a_critical_package(self):
+        # Without one, "usable" would be true for a tier that cannot do
+        # anything meaningful.
+        for name, tier in optional.TIERS.items():
+            self.assertTrue(any(p.critical for p in tier["packages"]),
+                            f"tier {name} has no critical package")
+
+    def test_status_shape(self):
+        st = optional.status()
+        self.assertEqual(set(st["tiers"]), set(optional.TIERS))
+        for tier in st["tiers"].values():
+            self.assertIn("complete", tier)
+            self.assertIn("usable", tier)
+
+    def test_have_matches_real_import(self):
+        # json is always importable; a nonsense name never is.
+        self.assertTrue(optional.have("json"))
+        self.assertFalse(optional.have("definitely_not_a_module_xyz"))
+
+    def test_missing_respects_tier_filter(self):
+        one = optional.missing(["crypto"])
+        crypto_names = {p.pip_name for p in optional.TIERS["crypto"]["packages"]}
+        for pkg in one:
+            self.assertIn(pkg.pip_name, crypto_names)
+
+    def test_summary_line_is_string(self):
+        self.assertIsInstance(optional.summary_line(), str)
+
+    def test_pyproject_extras_match_registry(self):
+        # A tier added to the registry but not to pyproject would be
+        # uninstallable via pip.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "pyproject.toml")) as fh:
+            text = fh.read()
+        for name in optional.TIERS:
+            self.assertIn(f"{name} = [", text,
+                          f"pyproject.toml has no '{name}' extra")
+
+
+class TestOptionalBenchmarksDegrade(unittest.TestCase):
+    """Every optional benchmark must be safe to call when packages are absent."""
+
+    def test_numeric_without_numpy(self):
+        r = numeric.run(0.05, 1)
+        self.assertIn("available", r)
+        if not r["available"]:
+            self.assertIn("note", r)
+
+    def test_numeric_matmul_reports_skip(self):
+        if optional.have("numpy"):
+            self.skipTest("numpy present; testing the absent path")
+        self.assertTrue(numeric.bench_matmul(0.05, 1).get("skipped"))
+
+    def test_crypto_without_packages(self):
+        r = cryptobench.run(0.05, 1)
+        self.assertIn("available", r)
+
+    def test_gpu_without_pyopencl(self):
+        r = gpucompute.run(0.05)
+        self.assertIn("available", r)
+        if not r["available"]:
+            self.assertIn("note", r)
+        self.assertIsInstance(gpucompute.devices(), list)
+
+    def test_extract_rates_safe_on_unavailable(self):
+        for mod in (numeric, cryptobench, gpucompute):
+            self.assertEqual(mod.extract_rates(None), {})
+            self.assertEqual(mod.extract_rates({"available": False}), {})
+
+    def test_optional_scores_are_defined(self):
+        for key in ("blas_matmul", "fft", "lapack", "aes", "zstd", "lz4",
+                    "blake3", "gpu_opencl"):
+            self.assertIn(key, scoring.BASELINES)
+
+    def test_absent_optional_packages_do_not_penalise_score(self):
+        # A machine without numpy must score purely on what it does have.
+        s = scoring.compute_scores(
+            {"cpu_int": {"rate": scoring.BASELINES["cpu_int"]}})
+        self.assertAlmostEqual(s["composite"], 100.0, places=4)
+        self.assertNotIn("blas_matmul", s["subscores"])
+
+
+class TestInstaller(unittest.TestCase):
+    def test_venv_python_path_shape(self):
+        import install
+        path = install.venv_python("somedir")
+        self.assertIn("somedir", path)
+        self.assertTrue(path.endswith("python") or path.endswith("python.exe"))
+
+    def test_list_mode_exits_cleanly(self):
+        import contextlib
+        import io
+        import install
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = install.main(["--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("compute", buf.getvalue())
+
+    def test_unknown_tier_rejected(self):
+        import install
+        self.assertEqual(install.main(["--tier", "nonsense"]), 2)
+
+    def test_declining_installs_nothing(self):
+        # Confirmation is required; a non-affirmative answer must abort.
+        import builtins
+        import contextlib
+        import io
+        import install
+        real_input = builtins.input
+        builtins.input = lambda *a: "n"
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = install.main(["--tier", "compute"])
+            if code == 0:
+                self.skipTest("compute tier already fully installed")
+            self.assertEqual(code, 1)
+            self.assertIn("Cancelled", buf.getvalue())
+        finally:
+            builtins.input = real_input
