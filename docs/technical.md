@@ -385,6 +385,28 @@ baseline. This is what turns the tool into a health check: a failing SSD,
 clogged cooler, or driver regression shows up as a slowdown against the
 machine's own past.
 
+### Comparing only comparable runs
+
+Some metrics depend on the settings used, so a changed flag would otherwise
+look like failing hardware. Observed in practice: a `--quick` run (64 MB disk
+test) followed by a default run (256 MB) produced a **-40.9% "disk regression"**
+that was entirely an artifact — larger files exhaust an SSD's SLC write cache,
+so throughput legitimately falls.
+
+The run settings are therefore recorded in the CSV (`cfg_disk_mb`,
+`cfg_mem_mb`), and metrics that depend on them are compared **only against
+prior runs that used the same value**:
+
+| Metric | Governed by |
+|--------|-------------|
+| Disk write / read / IOPS | `--disk-mb` |
+| Memory bandwidth | `--mem-mb` |
+
+Everything else (CPU, ML, hashing, composite) is setting-independent and always
+compared. When no prior run used the same settings, the affected metrics are
+skipped and the report says how many — rather than reporting a false
+regression.
+
 ## Network stack
 
 A TCP **loopback** (127.0.0.1) benchmark: bulk throughput plus ping/pong

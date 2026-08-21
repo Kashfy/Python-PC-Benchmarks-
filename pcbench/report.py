@@ -79,63 +79,87 @@ def _kv(label: str, value) -> None:
     print(f"  {label:<14}: {value}")
 
 
+def _sub(title: str) -> None:
+    """Sub-heading inside the results block."""
+    print(f"\n  ── {title} " + "─" * max(0, WIDTH - 8 - len(title)))
+
+
+def _metric(results: dict, key: str, label: str, unit: str,
+            field: str = "rate") -> None:
+    """Render one metric row, with stability and any safety notice."""
+    r = results.get(key)
+    if not isinstance(r, dict):
+        return
+    if r.get("error"):
+        _row(label, "FAILED", f"  {r['error'][:40]}")
+        return
+    suffix = f" {unit}"
+    if "cv" in r:
+        suffix += f"  ({stability_note(r['cv'])}, ±{r['cv'] * 100:.1f}%)"
+    if key == "nn_training" and r.get("samples_per_s"):
+        suffix = (f" {unit}  ({r['samples_per_s']:,.0f} samples/s, "
+                  f"{r.get('mflops', 0):,.0f} MFLOPS)")
+    _row(label, fmt(r.get(field)), suffix)
+    if r.get("safety_notice"):
+        print(f"      safety: {r['safety_notice']}")
+
+
 def print_results(results: dict) -> None:
+    """Render results grouped by subsystem.
+
+    Grouping matters: a flat list of a dozen unrelated metrics makes any one of
+    them hard to find, and readers miss whole categories entirely.
+    """
     hr("Benchmark Results")
-    labels = [
-        ("cpu_int", "CPU Integer (primes)", "rate", "primes/s"),
-        ("cpu_float", "CPU Float (math ops)", "rate", "iters/s"),
-        ("compression", "Compression (zlib)", "rate", "MB/s"),
-        ("hashing", "Hashing (SHA-256)", "rate", "MB/s"),
-        ("json", "JSON parse", "rate", "MB/s"),
-        ("memory", "Memory copy bandwidth", "rate", "MB/s"),
-    ]
-    for key, label, field, unit in labels:
-        r = results.get(key)
-        if not isinstance(r, dict):
-            continue
-        if r.get("error"):
-            _row(label, "FAILED", f"  {r['error'][:40]}")
-            continue
-        note = ""
-        if "cv" in r:
-            note = f"  ({stability_note(r['cv'])}, ±{r['cv'] * 100:.1f}%)"
-        _row(label, fmt(r.get(field)), f" {unit}{note}")
-        if r.get("safety_notice"):
-            print(f"      safety: {r['safety_notice']}")
 
-    ml_labels = [
-        ("nn_training", "Neural net training", "rate", "steps/s"),
-        ("kmeans", "K-means clustering", "rate", "distances/s"),
-        ("knn", "K-NN search", "rate", "comparisons/s"),
-    ]
-    for key, label, field, unit in ml_labels:
-        r = results.get(key)
-        if not isinstance(r, dict):
-            continue
-        if r.get("error"):
-            _row(label, "FAILED", f"  {r['error'][:40]}")
-            continue
-        extra = ""
-        if key == "nn_training" and r.get("samples_per_s"):
-            extra = f"  ({r['samples_per_s']:,.0f} samples/s, " \
-                    f"{r.get('mflops', 0):,.0f} MFLOPS)"
-        _row(label, fmt(r.get(field)), f" {unit}{extra}")
-
+    # ---- CPU ----
+    _sub("CPU")
+    _metric(results, "cpu_int", "Integer (primes)", "primes/s")
+    _metric(results, "cpu_float", "Float (math ops)", "iters/s")
     r = results.get("cpu_multi")
     if isinstance(r, dict) and not r.get("error"):
         single = (results.get("cpu_int") or {}).get("rate")
         scale = f"  →  {r['rate'] / single:.1f}x vs 1 core" if single else ""
-        _row(f"CPU Multi-core ({r['workers']}w)", fmt(r["rate"]),
+        _row(f"Multi-core ({r['workers']} workers)", fmt(r["rate"]),
              f" primes/s{scale}")
+    _metric(results, "compression", "Compression (zlib)", "MB/s")
+    _metric(results, "hashing", "Hashing (SHA-256)", "MB/s")
+    _metric(results, "json", "JSON parse", "MB/s")
 
+    # ---- Machine learning ----
+    if any(k in results for k in ("nn_training", "kmeans", "knn")):
+        _sub("Machine Learning (pure Python, no framework)")
+        _metric(results, "nn_training", "Neural net training", "steps/s")
+        _metric(results, "kmeans", "K-means clustering", "distances/s")
+        _metric(results, "knn", "K-NN search", "comparisons/s")
+
+    # ---- Memory ----
+    if "memory" in results or "cache_sweep" in results:
+        _sub("Memory")
+        _metric(results, "memory", "Copy bandwidth", "MB/s")
+        sweep = results.get("cache_sweep")
+        if isinstance(sweep, dict) and sweep.get("points"):
+            print("\n    Bandwidth by working-set size (cache hierarchy):")
+            rates = [pt["mb_per_s"] for pt in sweep["points"]]
+            peak = max(rates) or 1
+            for pt in sweep["points"]:
+                bar = "█" * max(1, int(pt["mb_per_s"] / peak * 32))
+                print(f"      {pt['label']:>7}  {bar:<32} "
+                      f"{pt['mb_per_s']:>9,.0f} MB/s")
+            if sweep.get("cache_to_dram_ratio"):
+                print(f"      cache-to-DRAM ratio: "
+                      f"{sweep['cache_to_dram_ratio']}x")
+
+    # ---- Storage ----
     r = results.get("disk")
     if isinstance(r, dict):
+        _sub("Storage")
         if r.get("skipped") or r.get("error"):
             _row("Disk I/O", "skipped", f"  {r.get('error', '')[:40]}")
         else:
-            _row("Disk sequential write", fmt(r["write_rate"]), " MB/s")
-            _row("Disk sequential read", fmt(r["read_rate"]), " MB/s")
-            _row("Disk random read (4K)", fmt(r["random_read_iops"]), " IOPS")
+            _row("Sequential write", fmt(r["write_rate"]), " MB/s")
+            _row("Sequential read", fmt(r["read_rate"]), " MB/s")
+            _row("Random read (4K)", fmt(r["random_read_iops"]), " IOPS")
             if r.get("total_written_mb"):
                 # Flash wear should never be invisible to the user.
                 print(f"      wrote {r['total_written_mb']:,} MB to storage "
@@ -144,18 +168,6 @@ def print_results(results: dict) -> None:
                 print(f"      safety: {r['safety_notice']}")
             if not r.get("cache_bypassed"):
                 print(f"      note: {r['note']}")
-
-    sweep = results.get("cache_sweep")
-    if isinstance(sweep, dict) and sweep.get("points"):
-        print("\n  Memory bandwidth by working-set size (cache hierarchy):")
-        rates = [p["mb_per_s"] for p in sweep["points"]]
-        peak = max(rates) or 1
-        for p in sweep["points"]:
-            bar = "█" * max(1, int(p["mb_per_s"] / peak * 34))
-            print(f"    {p['label']:>7}  {bar:<34} {p['mb_per_s']:>9,.0f} MB/s")
-        if sweep.get("cache_to_dram_ratio"):
-            print(f"    cache-to-DRAM bandwidth ratio: "
-                  f"{sweep['cache_to_dram_ratio']}x")
 
 
 def print_native(native: dict | None) -> None:
@@ -410,6 +422,7 @@ def save_json(payload: dict, out_dir: str) -> str:
 
 CSV_FIELDS = [
     "timestamp_utc", "tool_version", "hostname", "os", "arch", "arch_family",
+    "cfg_disk_mb", "cfg_mem_mb",
     "cpu_model", "cores_physical", "cores_logical", "ram_gb", "on_ac_power",
     "cpu_int_primes_s", "cpu_float_iters_s", "cpu_multi_primes_s",
     "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
@@ -450,6 +463,8 @@ def flatten_row(payload: dict) -> dict:
     return {
         "timestamp_utc": payload["timestamp_utc"],
         "tool_version": payload["version"],
+        "cfg_disk_mb": (payload.get("config") or {}).get("disk_mb", ""),
+        "cfg_mem_mb": (payload.get("config") or {}).get("mem_mb", ""),
         "hostname": info["hostname"],
         "os": info["os"],
         "arch": info["architecture"],
@@ -513,7 +528,8 @@ def append_csv(payload: dict, out_dir: str) -> str:
         with open(path, newline="", encoding="utf-8") as f:
             existing = next(csv.reader(f), [])
         if existing and existing != CSV_FIELDS:
-            os.replace(path, path + ".v2.bak")
+            stamp = payload["timestamp_utc"].replace(":", "")
+            os.replace(path, f"{path}.{stamp}.bak")
 
     exists = os.path.isfile(path)
     with open(path, "a", newline="", encoding="utf-8") as f:

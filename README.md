@@ -321,7 +321,9 @@ Regression Check
 ```
 
 Catches a failing SSD, a clogged cooler, or a driver regression that a single
-run would never show.
+run would never show. Metrics that depend on run settings (disk size, memory
+buffer) are compared **only against runs that used the same settings**, so
+changing a flag never masquerades as failing hardware.
 
 ## Network stack
 
@@ -368,7 +370,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-146 tests, standard library only.
+153 tests, standard library only.
 
 ## Documentation
 

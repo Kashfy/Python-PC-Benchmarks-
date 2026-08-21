@@ -204,6 +204,18 @@ each time) and subsequent runs will compare against the median of the prior
 ones. Regression compares a machine only against **itself**; cross-machine
 comparison is `--compare`.
 
+## A "regression" appeared right after changing a flag
+
+Metrics that depend on run settings are only compared against prior runs using
+the same settings, so this should no longer happen. If you see disk or memory
+metrics **skipped** in the regression section, that is why: no earlier run used
+the current `--disk-mb` / `--mem-mb`. Run the same command twice and the
+comparison becomes available.
+
+Historically a `--quick` run (64 MB disk test) followed by a default run
+(256 MB) reported a bogus -40% disk regression — bigger files exhaust an SSD's
+SLC cache, which is a settings effect, not hardware failure.
+
 ## A regression was flagged but the machine is fine
 
 Benchmarks are noisy. If a one-off background task slowed a run, re-run when

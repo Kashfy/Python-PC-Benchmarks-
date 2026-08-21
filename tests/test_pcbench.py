@@ -394,7 +394,13 @@ class TestReportPersistence(unittest.TestCase):
             with open(p, "w", newline="") as f:
                 f.write("old,columns\n1,2\n")
             report.append_csv(self._payload(), d)
-            self.assertTrue(os.path.exists(p + ".v2.bak"))
+            # The backup name carries a timestamp so successive schema
+            # changes never overwrite an earlier archive.
+            import glob as _glob
+            backups = _glob.glob(p + "*.bak")
+            self.assertEqual(len(backups), 1, "old history must be archived")
+            with open(backups[0]) as fh:
+                self.assertIn("old,columns", fh.read())
             with open(p, newline='') as fh:
                 rows = list(csv.DictReader(fh))
             self.assertEqual(rows[0]["hostname"], "h1")
@@ -1039,3 +1045,88 @@ class TestNpuDetectionMultiVendor(unittest.TestCase):
     def test_api_table_has_entry_per_vendor(self):
         for vendor in ("Intel", "AMD", "Qualcomm", "Apple"):
             self.assertIn(vendor, accel._NPU_APIS)
+
+
+# --------------------------------------------------------------------------- #
+class TestRegressionConfigAwareness(unittest.TestCase):
+    """A changed setting must never be reported as failing hardware.
+
+    Observed in practice: a --quick run (64 MB disk test) followed by a default
+    run (256 MB) produced a bogus -40% "disk regression", because larger files
+    exhaust an SSD's SLC cache. That is the settings changing, not the drive.
+    """
+
+    HIST = [{"hostname": "h", "timestamp_utc": "t1",
+             "cfg_disk_mb": "64", "cfg_mem_mb": "64",
+             "disk_iops": "45007", "disk_write_mb_s": "3528",
+             "cpu_int_primes_s": "4400000", "composite_score": "260"}]
+
+    def _current(self, disk_mb="256"):
+        return {"hostname": "h", "timestamp_utc": "t2",
+                "cfg_disk_mb": disk_mb, "cfg_mem_mb": "64",
+                "disk_iops": "26592", "disk_write_mb_s": "2779",
+                "cpu_int_primes_s": "4460000", "composite_score": "257"}
+
+    def test_disk_metrics_skipped_when_size_differs(self):
+        res = regression.analyze(self._current("256"), self.HIST)
+        cols = [f["column"] for f in res["findings"]]
+        self.assertNotIn("disk_iops", cols)
+        self.assertNotIn("disk_write_mb_s", cols)
+        self.assertEqual(res["status"], "ok")
+        self.assertIn("disk_iops", res["skipped_metrics"])
+
+    def test_disk_metrics_compared_when_size_matches(self):
+        res = regression.analyze(self._current("64"), self.HIST)
+        cols = [f["column"] for f in res["findings"]]
+        self.assertIn("disk_iops", cols)
+        self.assertEqual(res["status"], "regression")
+
+    def test_config_independent_metrics_always_compared(self):
+        # CPU throughput does not depend on --disk-mb, so it must still be
+        # compared even when the disk setting changed.
+        res = regression.analyze(self._current("256"), self.HIST)
+        self.assertNotIn("cpu_int_primes_s", res["skipped_metrics"])
+
+    def test_render_mentions_skipped_metrics(self):
+        out = regression.render(regression.analyze(self._current("256"),
+                                                   self.HIST))
+        self.assertIn("skipped", out)
+
+
+class TestReportSections(unittest.TestCase):
+    """Results are grouped so no category gets lost in a flat list."""
+
+    def _capture(self, results):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report.print_results(results)
+        return buf.getvalue()
+
+    def test_ml_workloads_get_their_own_section(self):
+        out = self._capture({
+            "cpu_int": {"rate": 1000.0},
+            "nn_training": {"rate": 900.0, "samples_per_s": 21600,
+                            "mflops": 112},
+            "kmeans": {"rate": 2.3e6},
+            "knn": {"rate": 2.4e6},
+        })
+        self.assertIn("Machine Learning", out)
+        self.assertIn("Neural net training", out)
+        self.assertIn("K-means clustering", out)
+        self.assertIn("K-NN search", out)
+
+    def test_sections_only_appear_when_populated(self):
+        out = self._capture({"cpu_int": {"rate": 1000.0}})
+        self.assertIn("CPU", out)
+        self.assertNotIn("Machine Learning", out)
+        self.assertNotIn("Storage", out)
+
+    def test_storage_section_discloses_write_volume(self):
+        out = self._capture({"disk": {
+            "write_rate": 100.0, "read_rate": 200.0,
+            "random_read_iops": 5000.0, "cache_bypassed": True,
+            "file_mb": 256, "total_written_mb": 768, "note": "ok"}})
+        self.assertIn("Storage", out)
+        self.assertIn("768 MB", out)
