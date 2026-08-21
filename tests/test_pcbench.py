@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, cli, compare, core, coreml_model,  # noqa: E402
                      limits, mlbench, mlframework, network, npu, onnx_model,
-                     power, regression, report, scoring, system, workloads)
+                     power, regression, report, scoring, sustained, system,
+                     thermal, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -1130,3 +1131,103 @@ class TestReportSections(unittest.TestCase):
             "file_mb": 256, "total_written_mb": 768, "note": "ok"}})
         self.assertIn("Storage", out)
         self.assertIn("768 MB", out)
+
+
+# --------------------------------------------------------------------------- #
+class TestThermal(unittest.TestCase):
+    """Temperatures are always Celsius, and never invented."""
+
+    def test_read_returns_dict(self):
+        self.assertIsInstance(thermal.read("."), dict)
+
+    def test_readings_are_plausible_celsius(self):
+        t = thermal.read(".")
+        if not t.get("cpu_celsius"):
+            self.skipTest("no temperature sensor on this machine")
+        self.assertGreater(t["cpu_celsius"], -50)
+        self.assertLess(t["cpu_celsius"], 150)
+        self.assertIn("source", t)
+
+    def test_describe_labels_by_severity(self):
+        self.assertIn("normal", thermal.describe({"cpu_celsius": 45.0}))
+        self.assertIn("warm", thermal.describe({"cpu_celsius": 80.0}))
+        self.assertIn("hot", thermal.describe({"cpu_celsius": 95.0}))
+        self.assertIn("°C", thermal.describe({"cpu_celsius": 45.0}))
+
+    def test_describe_handles_missing_sensor(self):
+        self.assertEqual(thermal.describe({}), "unavailable")
+
+    def test_battery_health_shape(self):
+        b = thermal.battery_health()
+        self.assertIsInstance(b, dict)
+        if b.get("health_percent") is not None:
+            self.assertGreater(b["health_percent"], 0)
+            self.assertLessEqual(b["health_percent"], 120)
+
+    def test_hot_threshold_above_warm(self):
+        self.assertGreater(thermal.HOT_CELSIUS, thermal.WARM_CELSIUS)
+
+
+class TestSystemFeatureDetection(unittest.TestCase):
+    def test_cpu_features_is_list_of_strings(self):
+        f = system.cpu_features()
+        self.assertIsInstance(f, list)
+        for item in f:
+            self.assertIsInstance(item, str)
+
+    def test_virtualization_returns_str_or_none(self):
+        v = system.virtualization()
+        self.assertTrue(v is None or isinstance(v, str))
+
+    def test_inventory_includes_new_fields(self):
+        info = system.inventory()
+        self.assertIn("cpu_features", info)
+        self.assertIn("virtualization", info)
+
+    def test_machine_state_reports_celsius_key(self):
+        st = system.machine_state(".")
+        self.assertIn("cpu_celsius", st)
+        self.assertIn("temperatures", st)
+
+    def test_warning_when_already_hot(self):
+        w = system.state_warnings({"on_ac_power": True, "cpu_celsius": 97.0})
+        self.assertTrue(any("°C" in x for x in w))
+
+    def test_no_heat_warning_when_cool(self):
+        w = system.state_warnings({"on_ac_power": True, "cpu_celsius": 45.0,
+                                   "load_per_core": 0.05})
+        self.assertEqual(w, [])
+
+
+class TestSustainedTemperature(unittest.TestCase):
+    def test_temp_summary_computes_rise(self):
+        samples = [{"celsius": 50.0}, {"celsius": 62.0}, {"celsius": 58.0}]
+        out = sustained._temp_summary(samples)
+        self.assertEqual(out["temp_start_celsius"], 50.0)
+        self.assertEqual(out["temp_peak_celsius"], 62.0)
+        self.assertEqual(out["temp_end_celsius"], 58.0)
+        self.assertEqual(out["temp_rise_celsius"], 12.0)
+
+    def test_temp_summary_empty_when_no_sensor(self):
+        self.assertEqual(sustained._temp_summary(
+            [{"celsius": None}, {"rate": 1.0}]), {})
+
+
+class TestOutputWritabilityGuard(unittest.TestCase):
+    def test_writable_dir_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(cli._check_output_writable(d))
+
+    def test_unwritable_dir_reports_fix(self):
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "locked")
+            os.makedirs(sub)
+            os.chmod(sub, 0o500)          # read+execute, no write
+            try:
+                problem = cli._check_output_writable(sub)
+                if problem is None:
+                    self.skipTest("running as root; permissions not enforced")
+                self.assertIn("not writable", problem)
+                self.assertIn("chown", problem)
+            finally:
+                os.chmod(sub, 0o700)

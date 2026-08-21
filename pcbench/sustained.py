@@ -16,6 +16,7 @@ from __future__ import annotations
 from . import limits
 from .core import clock
 from .system import machine_state, thermal_pressure
+from .thermal import read as read_temps
 from .workloads import PRIMES_PER_CHUNK, cpu_integer_chunk
 
 # Fraction of the run, taken from the end, that defines "sustained"
@@ -24,7 +25,7 @@ _TAIL_FRACTION = 0.25
 
 
 def run_sustained(duration: float, window: float = 5.0,
-                  workers: int = 1) -> dict:
+                  workers: int = 1, script_dir: str = ".") -> dict:
     """Load the CPU for ``duration`` seconds, sampling every ``window``.
 
     ``workers`` > 1 runs the load on multiple processes to generate enough heat
@@ -32,9 +33,10 @@ def run_sustained(duration: float, window: float = 5.0,
     """
     aborted = ""
     if workers > 1:
-        samples, aborted = _run_parallel(duration, window, workers)
+        samples, aborted = _run_parallel(duration, window, workers,
+                                         script_dir)
     else:
-        samples, aborted = _run_single(duration, window)
+        samples, aborted = _run_single(duration, window, script_dir)
 
     if not samples:
         return {"error": "no samples collected"}
@@ -59,6 +61,26 @@ def run_sustained(duration: float, window: float = 5.0,
         "state_after": machine_state(),
         "aborted_early": bool(aborted),
         "abort_reason": aborted,
+        **_temp_summary(samples),
+    }
+
+
+def _temp_summary(samples: list[dict]) -> dict:
+    """Start, peak, and rise in CPU temperature over the run.
+
+    The temperature rise is what turns a throughput curve into a cooling
+    assessment: a machine that holds its clocks while barely warming is a
+    different machine from one that hits its limit in ninety seconds.
+    """
+    temps = [s["celsius"] for s in samples
+             if s.get("celsius") is not None]
+    if not temps:
+        return {}
+    return {
+        "temp_start_celsius": round(temps[0], 1),
+        "temp_peak_celsius": round(max(temps), 1),
+        "temp_end_celsius": round(temps[-1], 1),
+        "temp_rise_celsius": round(max(temps) - temps[0], 1),
     }
 
 
@@ -73,6 +95,14 @@ def _verdict(droop: float) -> str:
             "workloads")
 
 
+def _sample_temp(script_dir: str) -> float | None:
+    """Current CPU temperature in Celsius, or None if unreadable."""
+    try:
+        return read_temps(script_dir).get("cpu_celsius")
+    except Exception:
+        return None
+
+
 def _check_thermal() -> str:
     """Return an abort reason if the machine is in thermal distress.
 
@@ -85,7 +115,8 @@ def _check_thermal() -> str:
     return reason if should else ""
 
 
-def _run_single(duration: float, window: float) -> tuple[list[dict], str]:
+def _run_single(duration: float, window: float,
+                script_dir: str = ".") -> tuple[list[dict], str]:
     samples = []
     run_start = clock()
     while clock() - run_start < duration:
@@ -106,6 +137,7 @@ def _run_single(duration: float, window: float) -> tuple[list[dict], str]:
             "t": round(clock() - run_start, 1),
             "window_s": round(elapsed, 2),
             "rate": chunks * PRIMES_PER_CHUNK / elapsed,
+            "celsius": _sample_temp(script_dir),
         })
     return samples, ""
 
@@ -120,8 +152,8 @@ def _window_worker(window: float) -> int:
     return chunks * PRIMES_PER_CHUNK
 
 
-def _run_parallel(duration: float, window: float,
-                  workers: int) -> tuple[list[dict], str]:
+def _run_parallel(duration: float, window: float, workers: int,
+                  script_dir: str = ".") -> tuple[list[dict], str]:
     """Sample aggregate throughput across ``workers`` processes.
 
     The pool is created once and reused for every window so process-spawn cost
@@ -147,6 +179,7 @@ def _run_parallel(duration: float, window: float,
                 "t": round(clock() - run_start, 1),
                 "window_s": round(elapsed, 2),
                 "rate": primes / elapsed,
+                "celsius": _sample_temp(script_dir),
             })
     return samples, ""
 

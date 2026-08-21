@@ -167,6 +167,44 @@ def _runners(args, info, disk_dir) -> dict:
     }
 
 
+def _check_output_writable(out_dir: str) -> str | None:
+    """Verify results can be saved *before* spending minutes benchmarking.
+
+    Running once with sudo (for real power readings) leaves root-owned files
+    behind, and every later unprivileged run then fails to save. Discovering
+    that after a ten-minute run is needlessly painful, so it is checked up
+    front and the fix is spelled out.
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        return f"cannot create {out_dir}: {e}"
+
+    probe = os.path.join(out_dir, ".pcbench_write_test")
+    try:
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+    except OSError:
+        owner = ""
+        try:
+            import pwd
+            st = os.stat(out_dir)
+            existing = [f for f in os.listdir(out_dir) if not f.startswith(".")]
+            if existing:
+                st = os.stat(os.path.join(out_dir, existing[0]))
+            owner = pwd.getpwuid(st.st_uid).pw_name
+        except Exception:
+            pass
+        hint = (f" (files are owned by '{owner}')" if owner else "")
+        return (f"results in '{out_dir}' are not writable{hint}. "
+                f"If you ran with sudo before, reclaim them:\n"
+                f"      sudo chown -R $(whoami) {out_dir}\n"
+                f"    or write elsewhere with --output-dir DIR, "
+                f"or skip saving with --no-save")
+    return None
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -188,6 +226,14 @@ def main(argv=None) -> int:
         return 2
 
     quiet = args.json_stdout
+
+    # Fail fast on an unwritable output directory rather than after the run.
+    if not args.no_save:
+        problem = _check_output_writable(args.output_dir)
+        if problem:
+            print(f"error: {problem}", file=sys.stderr)
+            return 5
+
     disk_dir = tempfile.gettempdir() if args.no_save else args.output_dir
     try:
         os.makedirs(disk_dir, exist_ok=True)
@@ -195,7 +241,9 @@ def main(argv=None) -> int:
         disk_dir = tempfile.gettempdir()
 
     info = inventory()
-    state = machine_state()
+    state = machine_state(_repo_root())
+    from . import thermal as thermal_mod
+    state["battery"] = thermal_mod.battery_health() or None
     warnings = state_warnings(state)
 
     if not quiet:
@@ -299,7 +347,7 @@ def main(argv=None) -> int:
             print(f"  running sustained load for {sustained_seconds:.0f}s "
                   f"on {workers} worker(s) ...", flush=True)
         sustained = run_sustained(sustained_seconds, args.sustained_window,
-                                  workers)
+                                  workers, _repo_root())
 
     scores = compute_scores(results)
     ppw = power.perf_per_watt(scores["composite"], power_info) if power_info \

@@ -183,6 +183,30 @@ failure here means the same thing as any other validation failure: suspect
 unstable memory, an overclock, or cooling. See
 [VALIDATION FAILED](#validation-failed-exit-code-4).
 
+## "results are not writable" (exit code 5)
+
+Running once with `sudo` (for real power readings) leaves **root-owned files**
+in `results/`, so later unprivileged runs cannot save. The tool now detects
+this before benchmarking rather than after, and prints the fix:
+
+```bash
+sudo chown -R $(whoami) results
+```
+
+Or write elsewhere with `--output-dir ~/bench-results`, or skip saving with
+`--no-save`.
+
+## Temperature shows "unavailable"
+
+| Platform | Requirement |
+|----------|-------------|
+| macOS | `sensors_engine` must compile — needs Command Line Tools (`xcode-select --install`) |
+| Linux | Needs `/sys/class/hwmon` or `/sys/class/thermal`; absent in many containers and VMs |
+| Windows | Needs WMI `MSAcpi_ThermalZoneTemperature`, which many OEMs never implement |
+
+No temperature is ever invented — an unreadable sensor is reported as
+unavailable rather than estimated.
+
 ## Power shows "(estimated)" instead of real watts
 
 Real power metering is privileged:

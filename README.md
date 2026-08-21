@@ -52,6 +52,7 @@ pcbench --quick
 
 | Feature | Why it matters |
 |---------|----------------|
+| **Temperature in °C** | Real sensor readings on macOS (IOHID, no root), Linux (hwmon/thermal), Windows (WMI) — plus temperature tracked through sustained load. |
 | **Machine-state guard** | Refuses to run on battery or under load, because those produce numbers that look like hardware differences but aren't. Override with `--force`. |
 | **Warm-up pass** | Discards the cold-cache, low-clock first iterations before timing. |
 | **Median of repeats** | Resists one-off outliers; reports a stability rating (`excellent`…`unstable`). |
@@ -370,7 +371,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-153 tests, standard library only.
+163 tests, standard library only.
 
 ## Documentation
 
@@ -380,6 +381,8 @@ Full reference docs in [`docs/`](docs/README.md):
 - [technical.md](docs/technical.md) — methodology, units, statistics, scoring
 - [functions.md](docs/functions.md) — per-function reference
 - [packages.md](docs/packages.md) — dependencies, toolchain, CLI
+- [glossary.md](docs/glossary.md) — every acronym and unit explained
+- [ml-algorithms.md](docs/ml-algorithms.md) — every ML algorithm, with equations
 - [safety.md](docs/safety.md) — hardware-safety audit and resource caps
 - [troubleshooting.md](docs/troubleshooting.md) — common problems and fixes
 

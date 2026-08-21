@@ -6,6 +6,8 @@ native_engine
 native_engine.exe
 accel_engine
 accel_engine.exe
+sensors_engine
+sensors_engine.exe
 *.mlmodel
 *.onnx
 *.mlmodel

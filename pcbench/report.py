@@ -66,8 +66,34 @@ def print_system(info: dict, state: dict, warnings: list[str]) -> None:
     if state.get("load_average"):
         _kv("Load average", ", ".join(f"{x:.2f}"
                                       for x in state["load_average"]))
-    if state.get("thermal"):
+    if info.get("cpu_features"):
+        _kv("CPU features", ", ".join(info["cpu_features"]))
+    if info.get("virtualization"):
+        _kv("Virtualization", f"{info['virtualization']} — results are not "
+                              f"comparable to bare metal")
+
+    temps = state.get("temperatures") or {}
+    if temps.get("cpu_celsius") is not None:
+        from .thermal import describe as _describe
+        _kv("Temperature", f"CPU {_describe(temps)}")
+        if temps.get("drive_celsius") is not None:
+            _kv("Drive temp", f"{temps['drive_celsius']:.1f} °C")
+        if temps.get("fan_rpm"):
+            _kv("Fans", ", ".join(f"{r:,} RPM" for r in temps["fan_rpm"]))
+    elif state.get("thermal"):
         _kv("Thermal", state["thermal"])
+
+    batt = state.get("battery") or {}
+    if batt:
+        bits = []
+        if batt.get("health_percent") is not None:
+            bits.append(f"{batt['health_percent']:.1f}% of design capacity")
+        if batt.get("cycle_count") is not None:
+            bits.append(f"{batt['cycle_count']} cycles")
+        if batt.get("celsius") is not None:
+            bits.append(f"{batt['celsius']:.1f} °C")
+        if bits:
+            _kv("Battery", ", ".join(bits))
 
     if warnings:
         print()
@@ -358,8 +384,17 @@ def print_sustained(s: dict | None) -> None:
     _row("Peak throughput", fmt(s["peak_rate"]), f" {s['unit']}")
     _row("Sustained (final 25%)", fmt(s["sustained_rate"]), f" {s['unit']}")
     _row("Droop", f"{s['droop_percent']:.1f}", " %")
+    if s.get("temp_peak_celsius") is not None:
+        _row("Temperature", f"{s['temp_start_celsius']:.1f} → "
+                            f"{s['temp_peak_celsius']:.1f}",
+             f" °C  (rose {s['temp_rise_celsius']:.1f} °C)")
+
     if len(rates) > 1:
         print(f"\n  Throughput over time: {sparkline(rates)}")
+        temps = [x.get("celsius") for x in s["samples"]]
+        if all(t is not None for t in temps) and len(temps) > 1:
+            print(f"  Temperature over time: {sparkline(temps)}"
+                  f"   ({min(temps):.0f}–{max(temps):.0f} °C)")
         print(f"    (each mark = {s['window_s']:.0f}s; left = start, "
               f"right = end)")
     if s.get("aborted_early"):
@@ -434,6 +469,8 @@ CSV_FIELDS = [
     "npu_onnx_gflops", "npu_onnx_device",
     "nn_train_steps_s", "kmeans_dist_s", "knn_cmp_s",
     "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
+    "cpu_celsius", "battery_health_pct", "battery_cycles",
+    "sustained_temp_peak_c", "sustained_temp_rise_c",
     "sustained_droop_pct", "composite_score",
 ]
 
@@ -509,6 +546,13 @@ def flatten_row(payload: dict) -> dict:
         "power_watts": power.get("package_w") or "",
         "power_estimated": power.get("estimated", ""),
         "score_per_watt": ppw.get("score_per_watt", "") if ppw else "",
+        "cpu_celsius": payload["state"].get("cpu_celsius") or "",
+        "battery_health_pct": ((payload["state"].get("battery") or {})
+                               .get("health_percent") or ""),
+        "battery_cycles": ((payload["state"].get("battery") or {})
+                           .get("cycle_count") or ""),
+        "sustained_temp_peak_c": sus.get("temp_peak_celsius", ""),
+        "sustained_temp_rise_c": sus.get("temp_rise_celsius", ""),
         "sustained_droop_pct": sus.get("droop_percent", ""),
         "composite_score": payload["scores"]["composite"],
     }

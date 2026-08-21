@@ -292,8 +292,127 @@ def inventory() -> dict:
         "python_implementation": platform.python_implementation(),
         "free_threaded_build": gil["free_threaded_build"],
         "gil_enabled": gil["gil_enabled"],
+        "cpu_features": cpu_features(),
+        "virtualization": virtualization(),
         "psutil_available": has_psutil(),
     }
+
+
+# --------------------------------------------------------------------------- #
+# CPU instruction-set features
+#
+# These explain benchmark results rather than merely decorating them: hardware
+# SHA or AES instructions make the hashing benchmark several times faster, and
+# wide SIMD (AVX-512, SVE) shows up directly in floating-point throughput.
+# --------------------------------------------------------------------------- #
+_FEATURE_LABELS = {
+    # x86
+    "aes": "AES-NI", "sha_ni": "SHA-NI", "sha-ni": "SHA-NI",
+    "avx": "AVX", "avx2": "AVX2", "avx512f": "AVX-512",
+    "sse4_2": "SSE4.2", "fma": "FMA",
+    # ARM
+    "aes_arm": "AES", "sha256": "SHA-256", "sha512": "SHA-512",
+    "sha3": "SHA-3", "asimd": "NEON", "neon": "NEON", "sve": "SVE",
+    "sve2": "SVE2", "i8mm": "Int8 matmul", "bf16": "BFloat16",
+    "dotprod": "DotProd", "amx": "AMX",
+}
+
+
+def cpu_features() -> list[str]:
+    """Human-readable list of performance-relevant CPU instruction sets."""
+    system = platform.system()
+    found: list[str] = []
+    try:
+        if system == "Darwin":
+            if platform.machine().startswith("arm"):
+                out = _run(["sysctl", "-a"])
+                checks = [
+                    (r"hw\.optional\.arm\.FEAT_AES:\s*1", "AES"),
+                    (r"hw\.optional\.arm\.FEAT_SHA256:\s*1", "SHA-256"),
+                    (r"hw\.optional\.arm\.FEAT_SHA512:\s*1", "SHA-512"),
+                    (r"hw\.optional\.arm\.FEAT_SHA3:\s*1", "SHA-3"),
+                    (r"hw\.optional\.arm\.FEAT_DotProd:\s*1", "DotProd"),
+                    (r"hw\.optional\.arm\.FEAT_I8MM:\s*1", "Int8 matmul"),
+                    (r"hw\.optional\.arm\.FEAT_BF16:\s*1", "BFloat16"),
+                    (r"hw\.optional\.AdvSIMD:\s*1", "NEON"),
+                    (r"hw\.optional\.arm\.FEAT_SVE:\s*1", "SVE"),
+                    (r"hw\.optional\.amx_version:\s*[1-9]", "AMX"),
+                ]
+                for pattern, label in checks:
+                    if re.search(pattern, out):
+                        found.append(label)
+            else:
+                flags = _run(["sysctl", "-n", "machdep.cpu.features",
+                              "machdep.cpu.leaf7_features"]).lower()
+                for key, label in (("aes", "AES-NI"), ("sha", "SHA-NI"),
+                                   ("avx512f", "AVX-512"), ("avx2", "AVX2"),
+                                   ("avx1.0", "AVX"), ("fma", "FMA")):
+                    if key in flags:
+                        found.append(label)
+
+        elif system == "Linux":
+            flags = set()
+            for line in _read("/proc/cpuinfo").splitlines():
+                low = line.lower()
+                if low.startswith("flags") or low.startswith("features"):
+                    flags.update(low.split(":", 1)[1].split())
+            for key in ("aes", "sha_ni", "avx512f", "avx2", "avx", "fma",
+                        "sse4_2", "sha256", "sha512", "sha3", "asimd",
+                        "sve", "sve2", "i8mm", "bf16", "dotprod"):
+                if key in flags:
+                    label = _FEATURE_LABELS.get(key, key.upper())
+                    if label not in found:
+                        found.append(label)
+
+        elif system == "Windows":
+            # PowerShell exposes IsProcessorFeaturePresent indirectly; the
+            # identifier string is a reliable coarse fallback.
+            ident = os.environ.get("PROCESSOR_IDENTIFIER", "").lower()
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance Win32_Processor).Name"]).lower()
+            blob = ident + " " + out
+            if "intel" in blob or "amd" in blob:
+                found.append("x86-64")
+    except Exception:
+        pass
+    return found
+
+
+def virtualization() -> str | None:
+    """Detect a hypervisor. Benchmarks in a VM are not comparable to bare metal."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            if _run(["sysctl", "-n", "kern.hv_vmm_present"]).strip() == "1":
+                return "virtual machine"
+            return None
+        if system == "Linux":
+            for path in ("/sys/class/dmi/id/product_name",
+                         "/sys/class/dmi/id/sys_vendor"):
+                v = _read(path).lower()
+                for needle, name in (("kvm", "KVM"), ("vmware", "VMware"),
+                                     ("virtualbox", "VirtualBox"),
+                                     ("qemu", "QEMU"), ("xen", "Xen"),
+                                     ("hyper-v", "Hyper-V"),
+                                     ("parallels", "Parallels")):
+                    if needle in v:
+                        return name
+            if "hypervisor" in _read("/proc/cpuinfo").lower():
+                return "hypervisor present"
+            return None
+        if system == "Windows":
+            out = _run(["powershell", "-NoProfile", "-Command",
+                        "(Get-CimInstance Win32_ComputerSystem).Model"])
+            low = out.lower()
+            for needle, name in (("virtual", "virtual machine"),
+                                 ("vmware", "VMware"), ("kvm", "KVM"),
+                                 ("parallels", "Parallels")):
+                if needle in low:
+                    return name
+            return None
+    except Exception:
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -379,16 +498,31 @@ def thermal_pressure() -> str | None:
     return None
 
 
-def machine_state() -> dict:
+def machine_state(script_dir: str = ".") -> dict:
     """Volatile conditions captured at the start of a run."""
     la = load_average()
     logical = os.cpu_count() or 1
-    return {
+
+    # Real degrees Celsius where the platform exposes a sensor. This is both a
+    # reported figure and the input to the sustained-load thermal cutoff.
+    from . import thermal as _thermal
+    temps = _thermal.read(script_dir)
+
+    state = {
         "on_ac_power": on_ac_power(),
         "load_average": [round(x, 2) for x in la] if la else None,
         "load_per_core": round(la[0] / logical, 3) if la else None,
         "thermal": thermal_pressure(),
+        "temperatures": temps or None,
+        "cpu_celsius": temps.get("cpu_celsius") if temps else None,
     }
+    # Fold a measured temperature into the free-form thermal string so the
+    # existing throttle/abort checks see it too.
+    if state["cpu_celsius"] is not None:
+        base = state["thermal"] or ""
+        state["thermal"] = (f"{base}, max {state['cpu_celsius']:.0f}C".lstrip(", ")
+                            if base else f"max {state['cpu_celsius']:.0f}C")
+    return state
 
 
 def state_warnings(state: dict) -> list[str]:
@@ -401,6 +535,10 @@ def state_warnings(state: dict) -> list[str]:
     if lpc is not None and lpc > 0.30:
         warns.append(f"System already busy (load/core = {lpc:.2f}). "
                      "Close other applications before benchmarking.")
+    temp = state.get("cpu_celsius")
+    if temp is not None and temp >= 95:
+        warns.append(f"CPU is already at {temp:.0f} °C before starting. "
+                     f"Let the machine cool down first.")
     therm = state.get("thermal") or ""
     if "throttled" in therm:
         warns.append(f"CPU is thermally throttled ({therm}). "

@@ -23,6 +23,7 @@ _COLUMNS = [
     ("npu_gflops", "NPU GF", "{:,.0f}"),
     ("ml_train_samples_s", "train s/s", "{:,.0f}"),
     ("score_per_watt", "score/W", "{:,.1f}"),
+    ("cpu_celsius", "CPU °C", "{:,.0f}"),
 ]
 
 

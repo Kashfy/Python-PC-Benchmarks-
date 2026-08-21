@@ -63,6 +63,7 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `struct` | Packing float weights into the Core ML protobuf |
 | `socket` / `threading` | Loopback network benchmark |
 | `struct` | Packing weights into the Core ML and ONNX protobufs |
+| `glob` | Sensor, power-supply, and hwmon enumeration |
 
 ## Optional dependency: an ML framework (AI tier only)
 
@@ -112,6 +113,20 @@ math library and pthreads.
 `pcbench` builds it automatically, rebuilding only when the binary is missing
 or older than the source. Verified warning-free under
 `-Wall -Wextra -std=c11` on both clang and gcc.
+
+## Sensors engine toolchain (macOS)
+
+`sensors_engine.m` reads temperatures through the unprivileged IOHID thermal
+usage page. It links only Foundation and IOKit and builds in well under a
+second:
+
+```bash
+clang -O2 -fobjc-arc sensors_engine.m -o sensors_engine \
+      -framework Foundation -framework IOKit
+```
+
+It is deliberately separate from `accel_engine.m` so temperatures are still
+available when accelerator benchmarking is skipped.
 
 ## Accelerator engine toolchain (macOS)
 
@@ -217,6 +232,7 @@ The native engine separately accepts `--json`, `--seconds`, `--repeats`,
 | `0` | Success |
 | `2` | Invalid arguments |
 | `3` | Refused — machine state would distort results |
+| `5` | Output directory not writable (often root-owned after a `sudo` run) |
 | `4` | Validation failure — hardware may be unstable |
 
 Codes 3 and 4 are designed for scripting: a CI job or fleet sweep can treat
@@ -240,7 +256,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-146 cases, standard library only — no pytest, no test dependencies.
+163 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 
