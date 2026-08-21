@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import csv
 import os
+import platform
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcbench import cli, compare, core, report, scoring, system, workloads  # noqa: E402
+from pcbench import (accel, cli, compare, core, coreml_model, report,  # noqa: E402
+                     scoring, system, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -442,3 +444,142 @@ class TestCompare(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --------------------------------------------------------------------------- #
+class TestCoreMLModel(unittest.TestCase):
+    """The .mlmodel protobuf is written by hand, so its structure is checked
+    here rather than trusted."""
+
+    def test_varint_encoding(self):
+        self.assertEqual(coreml_model._varint(0), b"\x00")
+        self.assertEqual(coreml_model._varint(1), b"\x01")
+        self.assertEqual(coreml_model._varint(127), b"\x7f")
+        self.assertEqual(coreml_model._varint(128), b"\x80\x01")
+        self.assertEqual(coreml_model._varint(300), b"\xac\x02")
+
+    def test_tag_wire_format(self):
+        # field 1, wire type 2 -> (1 << 3) | 2 == 0x0A
+        self.assertEqual(coreml_model._tag(1, 2), b"\x0a")
+        # field 500 needs a multi-byte tag
+        self.assertEqual(len(coreml_model._tag(500, 2)), 2)
+
+    def test_length_delimited_prefixes_length(self):
+        out = coreml_model._msg(1, b"abc")
+        self.assertEqual(out, b"\x0a\x03abc")
+
+    def test_packed_floats_roundtrip(self):
+        import struct
+        out = coreml_model._packed_floats(1, [1.0, 2.0])
+        self.assertEqual(struct.unpack("<2f", out[2:]), (1.0, 2.0))
+
+    def test_model_is_deterministic(self):
+        a = coreml_model.build_model(8, 8, 2)
+        b = coreml_model.build_model(8, 8, 2)
+        self.assertEqual(a, b)
+
+    def test_model_grows_with_layers(self):
+        small = coreml_model.build_model(8, 8, 2)
+        big = coreml_model.build_model(8, 8, 6)
+        self.assertGreater(len(big), len(small))
+
+    def test_model_contains_layer_and_io_names(self):
+        blob = coreml_model.build_model(8, 8, 3)
+        for token in (b"input", b"output", b"conv0", b"conv2"):
+            self.assertIn(token, blob)
+
+    def test_flops_scale_correctly(self):
+        one = coreml_model.flops_per_inference(16, 8, 1)
+        two = coreml_model.flops_per_inference(16, 8, 2)
+        self.assertAlmostEqual(two / one, 2.0)
+        # Doubling channels quadruples work (in_ch x out_ch).
+        wide = coreml_model.flops_per_inference(32, 8, 1)
+        self.assertAlmostEqual(wide / one, 4.0)
+
+    def test_write_model_creates_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = coreml_model.write_model(os.path.join(d, "m.mlmodel"), 8, 8, 2)
+            self.assertTrue(os.path.isfile(p))
+            self.assertGreater(os.path.getsize(p), 0)
+
+    def test_write_model_reuses_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.mlmodel")
+            coreml_model.write_model(p, 8, 8, 2)
+            first = os.path.getmtime(p)
+            coreml_model.write_model(p, 8, 8, 2)
+            self.assertEqual(first, os.path.getmtime(p))
+
+
+class TestAccel(unittest.TestCase):
+    def test_inventory_shape(self):
+        inv = accel.inventory("Apple M4")
+        for key in ("gpus", "npus", "gpu_count", "npu_count",
+                    "benchmark_supported"):
+            self.assertIn(key, inv)
+        self.assertEqual(inv["gpu_count"], len(inv["gpus"]))
+
+    def test_apple_silicon_reports_neural_engine(self):
+        if platform.system() != "Darwin":
+            self.skipTest("Apple-only detection path")
+        npus = accel.detect_npus("Apple M4")
+        self.assertTrue(any("Neural Engine" in n["name"] for n in npus))
+
+    def test_non_apple_cpu_has_no_ane(self):
+        if platform.system() != "Darwin":
+            self.skipTest("Apple-only detection path")
+        self.assertEqual(accel.detect_npus("Intel Core i7-9750H"), [])
+
+    def test_detect_gpus_returns_list(self):
+        self.assertIsInstance(accel.detect_gpus(), list)
+
+    def test_pci_vendor_lookup(self):
+        self.assertEqual(accel._pci_vendor("0x10de"), "NVIDIA")
+        self.assertEqual(accel._pci_vendor("0x1002"), "AMD")
+        self.assertEqual(accel._pci_vendor("0xdead"), "0xdead")
+
+    def test_extract_rates_from_engine_payload(self):
+        payload = {"results": [
+            {"name": "GPU FP32 FMA", "unit": "GFLOPS", "value": 2000.0},
+            {"name": "GPU FP16 FMA", "unit": "GFLOPS", "value": 2500.0},
+            {"name": "GPU memory bandwidth", "unit": "MB/s", "value": 80000.0},
+            {"name": "Neural Engine throughput", "unit": "GFLOPS",
+             "value": 9000.0},
+            {"name": "GPU kernel launch latency", "unit": "us", "value": 120.0},
+        ]}
+        rates = accel.extract_rates(payload)
+        self.assertEqual(rates["gpu_fp32"], 2000.0)
+        self.assertEqual(rates["npu"], 9000.0)
+        # Latency is not a throughput rate and must not be scored as one.
+        self.assertNotIn("gpu_launch", rates)
+
+    def test_extract_rates_ignores_errors_and_zeros(self):
+        self.assertEqual(accel.extract_rates({"error": "x"}), {})
+        self.assertEqual(accel.extract_rates(None), {})
+        self.assertEqual(accel.extract_rates(
+            {"results": [{"name": "GPU FP32 FMA", "value": 0}]}), {})
+
+    def test_run_returns_none_off_apple(self):
+        if platform.system() == "Darwin":
+            self.skipTest("non-Apple path")
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(accel.run(0.1, d, d))
+
+
+class TestAcceleratorScoring(unittest.TestCase):
+    def test_gpu_and_npu_score_and_roll_up(self):
+        results = {"gpu_fp32": {"rate": scoring.BASELINES["gpu_fp32"]},
+                   "npu": {"rate": scoring.BASELINES["npu"] * 2}}
+        s = scoring.compute_scores(results)
+        self.assertAlmostEqual(s["subscores"]["gpu_fp32"], 100.0, places=4)
+        self.assertAlmostEqual(s["subscores"]["npu"], 200.0, places=4)
+        cats = scoring.category_scores(s["subscores"])
+        self.assertIn("gpu", cats)
+        self.assertIn("npu", cats)
+
+    def test_absent_accelerators_do_not_penalize(self):
+        # A machine with no GPU/NPU must score purely on what it does have.
+        with_cpu = scoring.compute_scores(
+            {"cpu_int": {"rate": scoring.BASELINES["cpu_int"]}})
+        self.assertAlmostEqual(with_cpu["composite"], 100.0, places=4)
+        self.assertNotIn("gpu_fp32", with_cpu["subscores"])

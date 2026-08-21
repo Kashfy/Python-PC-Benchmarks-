@@ -149,6 +149,65 @@ def print_native(native: dict | None) -> None:
             print(f"    {p['label']:>7}  {p['ns']:>8.2f} ns")
 
 
+def print_accelerators(inv: dict | None, accel: dict | None) -> None:
+    """Render GPU/NPU inventory and, where available, their benchmarks."""
+    if not inv and not accel:
+        return
+    hr("Accelerators — GPU / NPU")
+
+    for gpu in (inv or {}).get("gpus", []):
+        bits = [gpu.get("name", "unknown")]
+        detail = []
+        if gpu.get("cores"):
+            detail.append(f"{gpu['cores']} cores")
+        if gpu.get("vram_mb"):
+            detail.append(f"{gpu['vram_mb'] / 1024:.1f} GB")
+        if gpu.get("metal"):
+            detail.append(str(gpu["metal"]))
+        if gpu.get("driver"):
+            detail.append(f"driver {gpu['driver']}")
+        if detail:
+            bits.append("(" + ", ".join(detail) + ")")
+        _kv("GPU", " ".join(bits))
+
+    for npu in (inv or {}).get("npus", []):
+        label = npu.get("name", "unknown")
+        if npu.get("api"):
+            label += f"  (via {npu['api']})"
+        _kv("NPU", label)
+
+    if not (inv or {}).get("gpus") and not (inv or {}).get("npus"):
+        _kv("Detected", "none")
+
+    if accel and "error" in accel:
+        print(f"\n  (accelerator engine: {accel['error']})")
+        if accel.get("detail"):
+            print(f"   {accel['detail'][:200]}")
+        return
+    if not accel:
+        if inv and not inv.get("benchmark_supported"):
+            print("\n  Compute benchmarking is Apple-only for now "
+                  "(Metal / Core ML); inventory shown above.")
+        return
+
+    print()
+    for item in accel.get("results", []):
+        _row(item.get("name", "?"), fmt(item.get("value")),
+             f" {item.get('unit', '')}")
+
+    ane = accel.get("ane")
+    if ane:
+        # Core ML never reports placement, so the CPU-relative speedup is the
+        # only evidence that work actually reached the Neural Engine.
+        speedup = ane.get("speedup_vs_cpu") or 0
+        verdict = ("Neural Engine ENGAGED" if ane.get("engaged")
+                   else "Neural Engine did NOT engage")
+        print(f"\n  {verdict} — {speedup:.2f}x vs CPU-only Core ML")
+
+    for note in accel.get("notes", []):
+        print(f"  note: {note}")
+
+
 def print_sustained(s: dict | None) -> None:
     if not s or s.get("error"):
         return
@@ -182,6 +241,7 @@ def print_report(payload: dict) -> None:
     print_system(payload["system"], payload["state"], payload["warnings"])
     print_results(payload["results"])
     print_native(payload.get("native"))
+    print_accelerators(payload.get("accelerators"), payload.get("accel"))
     print_sustained(payload.get("sustained"))
     print_scores(payload["scores"])
     _print_validation(payload["results"])
@@ -218,8 +278,16 @@ CSV_FIELDS = [
     "cpu_int_primes_s", "cpu_float_iters_s", "cpu_multi_primes_s",
     "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
     "disk_write_mb_s", "disk_read_mb_s", "disk_iops", "disk_cache_bypassed",
+    "gpu_name", "gpu_fp32_gflops", "gpu_fp16_gflops", "gpu_bandwidth_mb_s",
+    "npu_name", "npu_gflops", "npu_speedup_vs_cpu",
     "sustained_droop_pct", "composite_score",
 ]
+
+
+def _first_name(payload: dict, kind: str) -> str:
+    """Name of the first detected GPU/NPU, for the CSV row."""
+    items = (payload.get("accelerators") or {}).get(kind) or []
+    return items[0].get("name", "") if items else ""
 
 
 def _rate(results: dict, key: str, field: str = "rate") -> float:
@@ -265,6 +333,15 @@ def append_csv(payload: dict, out_dir: str) -> str:
         "disk_read_mb_s": _rate(results, "disk", "read_rate"),
         "disk_iops": _rate(results, "disk", "random_read_iops"),
         "disk_cache_bypassed": (results.get("disk") or {}).get("cache_bypassed"),
+        "gpu_name": _first_name(payload, "gpus"),
+        "gpu_fp32_gflops": _rate(results, "gpu_fp32"),
+        "gpu_fp16_gflops": _rate(results, "gpu_fp16"),
+        "gpu_bandwidth_mb_s": _rate(results, "gpu_bandwidth"),
+        "npu_name": _first_name(payload, "npus"),
+        "npu_gflops": _rate(results, "npu"),
+        "npu_speedup_vs_cpu": round(
+            ((payload.get("accel") or {}).get("ane") or {})
+            .get("speedup_vs_cpu", 0) or 0, 2),
         "sustained_droop_pct": sus.get("droop_percent", ""),
         "composite_score": payload["scores"]["composite"],
     }
@@ -393,6 +470,33 @@ def save_html(payload: dict, out_dir: str) -> str:
                 f"<div class='bar'><i style='width:{pct:.0f}%'></i></div></td>"
                 f"<td class='num'>{v:.0f}</td></tr>")
         parts.append("</table></div>")
+
+    inv = payload.get("accelerators") or {}
+    accel = payload.get("accel") or {}
+    if inv.get("gpus") or inv.get("npus"):
+        parts.append("<div class='card'><h2>Accelerators</h2><table>")
+        for gpu in inv.get("gpus", []):
+            extra = f" · {gpu['cores']} cores" if gpu.get("cores") else ""
+            parts.append(f"<tr><td>GPU</td><td class='num'>"
+                         f"{e(str(gpu.get('name', '?')))}{e(extra)}</td></tr>")
+        for npu in inv.get("npus", []):
+            parts.append(f"<tr><td>NPU</td><td class='num'>"
+                         f"{e(str(npu.get('name', '?')))}</td></tr>")
+        for item in accel.get("results", []):
+            if isinstance(item.get("value"), (int, float)):
+                parts.append(
+                    f"<tr><td>{e(str(item['name']))}</td><td class='num'>"
+                    f"{item['value']:,.1f} {e(str(item.get('unit', '')))}"
+                    f"</td></tr>")
+        parts.append("</table>")
+        ane = accel.get("ane")
+        if ane:
+            cls = "good" if ane.get("engaged") else "warn"
+            state = "engaged" if ane.get("engaged") else "did not engage"
+            parts.append(
+                f"<p class='note {cls}'>Neural Engine {state} — "
+                f"{ane.get('speedup_vs_cpu', 0):.2f}x vs CPU-only Core ML.</p>")
+        parts.append("</div>")
 
     sus = payload.get("sustained")
     if sus and not sus.get("error"):

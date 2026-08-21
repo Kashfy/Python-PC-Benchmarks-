@@ -7,6 +7,7 @@
 | Python | **3.8+** | Needs `math.isqrt` and `statistics.fmean`. |
 | OS | Windows, macOS, Linux | All three have dedicated probe paths. |
 | C compiler | **Optional** | Only for the native engine. |
+| Xcode Command Line Tools | **Optional, macOS** | Only for GPU/NPU benchmarks. Full Xcode is *not* needed. |
 
 **No `pip install` is required.** The tool imports only the standard library.
 
@@ -59,6 +60,7 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `unittest` | Test suite |
 | `winreg` | Windows CPU model (lazy import) |
 | `zlib` | Compression workload |
+| `struct` | Packing float weights into the Core ML protobuf |
 
 ## Optional dependency: `psutil`
 
@@ -84,6 +86,23 @@ math library and pthreads.
 `pcbench` builds it automatically, rebuilding only when the binary is missing
 or older than the source. Verified warning-free under
 `-Wall -Wextra -std=c11` on both clang and gcc.
+
+## Accelerator engine toolchain (macOS)
+
+`accel_engine.m` is Objective-C linking Foundation, Metal, and CoreML — all
+present in the Command Line Tools SDK:
+
+```bash
+clang -O2 -fobjc-arc accel_engine.m -o accel_engine \
+      -framework Foundation -framework Metal -framework CoreML
+```
+
+Metal shaders are compiled **at runtime** via `newLibraryWithSource:`, so the
+offline `metal` compiler (full Xcode only) is not required.
+
+The Core ML model used for the Neural Engine test is generated at runtime by
+`pcbench/coreml_model.py`, which writes the `.mlmodel` protobuf directly — no
+`coremltools` dependency.
 
 ## Command-line interface
 
@@ -125,6 +144,18 @@ Test names: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`,
 | `--compare` | — | Ranked table of past runs, then exit |
 | `--all-runs` | off | With `--compare`, every run rather than latest per host |
 
+### Accelerators
+
+| Flag | Description |
+|------|-------------|
+| `--no-gpu` | Skip GPU compute benchmarks |
+| `--no-npu` | Skip NPU / Apple Neural Engine benchmarks |
+| `--no-accel` | Skip all accelerator benchmarks (inventory still reported) |
+
+GPU/NPU **inventory** works on all platforms. Compute **benchmarking** is
+Apple-only (Metal + Core ML); see
+[technical.md](technical.md#gpu-and-npu-benchmarking) for why.
+
 ### Other
 
 | Flag | Description |
@@ -158,6 +189,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 | `benchmarks.csv` | One row per run, for comparison |
 | `report_<host>_<timestamp>.html` | Self-contained report (`--html`) |
 | `benchmarks.csv.v2.bak` | Auto-archived history from an older schema |
+| `ane_model.mlmodel` | Generated Neural Engine benchmark model (regenerated as needed) |
 
 ## Tests
 
@@ -165,7 +197,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-64 cases, standard library only — no pytest, no test dependencies.
+84 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

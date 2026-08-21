@@ -209,6 +209,54 @@ Never raises.
 
 ---
 
+## `pcbench.accel` — GPU / NPU
+
+#### `detect_gpus() -> list[dict]`
+Per-platform GPU enumeration: `system_profiler -json` (macOS); `nvidia-smi` →
+`lspci` → `/sys/class/drm` (Linux); `Win32_VideoController` (Windows). Each
+entry carries name and, where known, vendor, cores, VRAM, driver, Metal family.
+
+#### `detect_npus(cpu_model="") -> list[dict]`
+Apple Neural Engine is inferred from an Apple-silicon CPU model (every M-series
+Mac has one). Windows matches PnP device names against Neural/NPU/AI Boost/
+Hexagon; Linux checks `/dev/accel`, `/sys/class/accel`, and `/dev/amdxdna`.
+Entries carry `benchmarkable`, which is only true for the ANE today.
+
+#### `inventory(cpu_model="") -> dict`
+`{gpus, npus, gpu_count, npu_count, benchmark_supported}`.
+
+#### `build(src, exe)` · `run(seconds, script_dir, out_dir, gpu=True, ane=True)`
+Compiles `accel_engine.m` with clang and the Foundation/Metal/CoreML
+frameworks, generates the Core ML model, and runs the engine. Returns `None`
+off Apple platforms, `{"error": ...}` on failure. Never raises.
+
+#### `extract_rates(payload) -> dict`
+Pulls `gpu_fp32`, `gpu_fp16`, `gpu_bandwidth`, and `npu` out for scoring.
+Latency is deliberately excluded — lower-is-better values must not be scored as
+throughput.
+
+---
+
+## `pcbench.coreml_model` — ANE model generator
+
+Writes a `.mlmodel` protobuf directly, so no `coremltools` dependency is
+needed.
+
+#### `_varint`, `_tag`, `_msg`, `_uint`, `_str`, `_packed_uints`, `_packed_floats`
+Minimal protobuf wire-format writers.
+
+#### `build_model(channels=64, spatial=64, layers=12) -> bytes`
+Serializes a convolution stack. Convolution is used because it is what the ANE
+is built for and what Core ML most reliably offloads. **The defaults are large
+on purpose**: Core ML keeps small models on the CPU, where the benchmark would
+measure nothing.
+
+#### `flops_per_inference(...) -> float` · `write_model(path, ...) -> str`
+FLOPs for one forward pass, and a writer that reuses an identical existing
+file.
+
+---
+
 ## `pcbench.cli`
 
 #### `build_parser() -> ArgumentParser` · `main(argv=None) -> int` · `entry()`
@@ -248,3 +296,24 @@ the prefetcher cannot predict) and `pointer_chase_ns(bytes, seconds)`.
 
 **Output** — `print_human`, `print_json` (the contract `pcbench.native`
 consumes), `main`. Exits 2 if validation failed.
+
+---
+
+## `accel_engine.m` (Apple)
+
+**Shaders** — `kShaderSource` holds Metal Shading Language compiled at runtime
+via `newLibraryWithSource:`: `fma_f32` / `fma_f16` (four independent dependent
+FMA chains, so the compiler cannot vectorize the work away), `bandwidth`
+(float4 copy), and `nop` (launch latency).
+
+**`run_gpu(seconds)`** — device info plus FP32/FP16 GFLOPS, memory bandwidth,
+and kernel launch latency.
+
+**`run_coreml(compiled, units, shape, seconds, ok)`** — inferences/sec under one
+`MLComputeUnits` setting, after a warm-up that absorbs model load, weight
+conversion, and ANE program compilation.
+
+**`run_ane(modelPath, seconds, flops, shape)`** — compiles the model, then runs
+it CPU-only, CPU+ANE, and All. Reports throughput, effective GFLOPS, and the
+speedup; flags `engaged` only above 1.5x, since Core ML never states placement
+directly.

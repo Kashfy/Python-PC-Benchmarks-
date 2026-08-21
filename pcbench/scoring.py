@@ -27,6 +27,13 @@ BASELINES = {
     "disk_write": 500.0,           # MB/s
     "disk_read": 1_000.0,          # MB/s
     "disk_iops": 20_000.0,         # 4 KiB random read ops/s
+    # Accelerators. Absent hardware is simply omitted from the composite
+    # rather than scored as zero, so a machine without a GPU or NPU is not
+    # punished for lacking one.
+    "gpu_fp32": 1_000.0,           # GFLOPS
+    "gpu_fp16": 1_500.0,           # GFLOPS
+    "gpu_bandwidth": 100_000.0,    # MB/s
+    "npu": 2_000.0,                # GFLOPS effective
 }
 
 # Which result key and field each score is derived from.
@@ -41,6 +48,10 @@ _SOURCES = [
     ("disk_write", "disk", "write_rate"),
     ("disk_read", "disk", "read_rate"),
     ("disk_iops", "disk", "random_read_iops"),
+    ("gpu_fp32", "gpu_fp32", "rate"),
+    ("gpu_fp16", "gpu_fp16", "rate"),
+    ("gpu_bandwidth", "gpu_bandwidth", "rate"),
+    ("npu", "npu", "rate"),
 ]
 
 
@@ -73,6 +84,8 @@ def category_scores(subscores: dict) -> dict:
                 "hashing", "json"],
         "memory": ["memory"],
         "disk": ["disk_write", "disk_read", "disk_iops"],
+        "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth"],
+        "npu": ["npu"],
     }
     out = {}
     for name, keys in groups.items():

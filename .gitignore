@@ -4,6 +4,10 @@ results/
 # Compiled native engine
 native_engine
 native_engine.exe
+accel_engine
+accel_engine.exe
+*.mlmodel
+*.mlmodelc/
 *.o
 *.obj
 

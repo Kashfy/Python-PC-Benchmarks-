@@ -142,6 +142,88 @@ device rather than buffered in RAM.
 
 `1 MB = 1024 × 1024 bytes` throughout.
 
+## GPU and NPU benchmarking
+
+### What is and isn't covered
+
+| Capability | Windows | macOS | Linux |
+|------------|---------|-------|-------|
+| GPU inventory (model, VRAM, driver) | yes | yes | yes |
+| NPU presence detection | yes | yes | yes |
+| GPU compute benchmark | no | **yes** (Metal) | no |
+| NPU compute benchmark | no | **yes** (Core ML) | no |
+
+Compute benchmarks need vendor frameworks — CUDA, ROCm, oneAPI, or an OpenCL
+runtime. Writing those paths without the hardware to test them would produce
+code that looks supported and silently misreports, which is worse than an
+honest gap. Non-Apple systems get full inventory and a stated limitation.
+
+### GPU (Metal)
+
+Four measurements, all from compute kernels compiled **at runtime** via
+`newLibraryWithSource:` so only the Command Line Tools are needed — the offline
+`metal` compiler ships solely with full Xcode.
+
+| Measurement | Method |
+|-------------|--------|
+| **FP32 / FP16 FMA** | Four independent dependent FMA chains per thread over 1M threads. Independent chains give the scheduler instruction-level parallelism; dependent *within* a chain stops the compiler collapsing the loop. Results are written out so nothing is dead code. |
+| **Memory bandwidth** | 256 MB `float4` copy; counts one read plus one write per element. |
+| **Kernel launch latency** | Minimal kernel with a full commit/`waitUntilCompleted` round trip — this is dispatch overhead, not GPU work. |
+
+On Apple GPUs FP16 is only modestly faster than FP32 (measured 2,505 vs 2,322
+GFLOPS on an M4) because the ALUs run both at similar rates; unlike some
+discrete GPUs there is no 2x half-precision path.
+
+Note that launch latency is a **lower-is-better** figure and is deliberately
+excluded from scoring, where every other metric is higher-is-better.
+
+### Neural Engine (Core ML)
+
+The ANE is **not directly programmable**. No public API accepts arbitrary
+work — Core ML alone decides whether a model runs on CPU, GPU, or ANE. Two
+consequences shape the design:
+
+**1. The benchmark must be a model.** `pcbench/coreml_model.py` writes the
+`.mlmodel` protobuf byte by byte rather than depending on `coremltools`,
+preserving the zero-dependency guarantee. It emits a convolution stack, since
+convolution is what the ANE is built for and what Core ML most reliably
+offloads.
+
+**2. Placement must be inferred.** Core ML never reports where a model ran, so
+the same model is timed under `MLComputeUnitsCPUOnly` and
+`MLComputeUnitsCPUAndNeuralEngine`, and the ratio is the evidence:
+
+```
+Core ML CPU-only          :   416.7 inferences/s
+Neural Engine             : 2,535.0 inferences/s
+Neural Engine ENGAGED — 6.08x vs CPU-only Core ML
+```
+
+Below **1.5x** the tool reports that the ANE did *not* engage rather than
+presenting a CPU number as an NPU result.
+
+**Model size is load-bearing.** Core ML keeps small models on the CPU because
+dispatch overhead exceeds the work. Measured on an M4: a 16-channel 32x32
+model ran at **0.92x** of CPU-only speed — it never left the CPU — while the
+64-channel 64x64 12-layer default reaches **6.08x**. The defaults are large
+deliberately.
+
+Effective throughput is derived from the model's known arithmetic cost:
+
+```
+FLOPs per layer = out_ch x in_ch x K x K x H x W x 2      (MAC = 2 FLOPs)
+effective GFLOPS = inferences/s x total FLOPs / 1e9
+```
+
+At 2,535 inferences/s over 3.62 GFLOP that is ~9,190 GFLOPS effective.
+
+### Accelerator scoring
+
+GPU and NPU results feed the same baseline-relative scoring as everything else
+and roll up into `GPU` and `NPU` category scores. Machines **without** a GPU or
+NPU simply omit those subscores rather than scoring zero, so absent hardware
+never drags the composite down.
+
 ## Statistics
 
 Each test runs `--repeats` times; the headline `rate` is the **median**, which

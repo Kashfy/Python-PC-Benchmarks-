@@ -4,10 +4,11 @@ A reliable, cross-platform benchmark and hardware-diagnostics tool for
 **Windows, macOS, and Linux** on **x86-64, ARM64, and other** CPU
 architectures.
 
-It measures CPU, memory, and disk in **meaningful, comparable units**,
-detects **thermal throttling** under sustained load, **validates** that the
-hardware computes correct results, gathers a full hardware inventory, and
-records everything to JSON/CSV/HTML so you can compare machines over time.
+It measures CPU, memory, disk, **GPU, and NPU** (including the **Apple Neural
+Engine**) in meaningful, comparable units, detects **thermal throttling** under
+sustained load, **validates** that the hardware computes correct results,
+gathers a full hardware inventory, and records everything to JSON/CSV/HTML so
+you can compare machines over time.
 
 - **Pure Python standard library** — runs on any machine with Python 3.8+,
   **no `pip install` required**.
@@ -128,6 +129,9 @@ python3 benchmark.py --compare
 | `--output-dir D` | `results` | Output location |
 | `--no-save` | off | Write no files |
 | `--no-native` | off | Skip the C engine |
+| `--no-gpu` | off | Skip GPU compute benchmarks |
+| `--no-npu` | off | Skip NPU / Neural Engine benchmarks |
+| `--no-accel` | off | Skip all accelerator benchmarks (inventory still shown) |
 | `--force` | off | Run despite distorting machine state |
 
 Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
@@ -147,7 +151,46 @@ Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
 | Cache sweep | MB/s | Bandwidth vs. working-set size → cache tiers |
 | Disk | MB/s + IOPS | Sequential write/read **and** 4 KiB random reads |
 
-The native engine adds **multi-threaded CPU** and **pointer-chase memory
+## GPU and Neural Engine
+
+Accelerator **inventory** (GPU model, cores, VRAM, driver; NPU presence) works
+on all three platforms. Compute **benchmarking** is currently Apple-only, via
+Metal and Core ML:
+
+```
+Accelerators — GPU / NPU
+  GPU           : Apple M4 (10 cores)
+  NPU           : Apple Neural Engine  (via Core ML)
+
+  GPU FP32 FMA              :          2,322 GFLOPS
+  GPU FP16 FMA              :          2,505 GFLOPS
+  GPU memory bandwidth      :         77,946 MB/s
+  GPU kernel launch latency :          133.9 us
+  Core ML CPU-only          :          416.7 inferences/s
+  Neural Engine             :          2,535 inferences/s
+  Neural Engine throughput  :          9,186 GFLOPS
+
+  Neural Engine ENGAGED — 6.08x vs CPU-only Core ML
+```
+
+The Neural Engine **cannot be programmed directly** — no public API accepts
+arbitrary work. Core ML alone decides placement, so the tool runs the same
+model under `cpuOnly` and `cpuAndNeuralEngine` and reports the speedup, which
+is the only honest evidence the ANE was actually used. Below 1.5x it says so
+rather than presenting a CPU result as an NPU one.
+
+The Core ML model is **generated at runtime** by writing the `.mlmodel`
+protobuf directly, so no `coremltools` install is needed. It is deliberately
+large (64 channels, 64x64, 12 conv layers) because Core ML keeps small models
+on the CPU — a 16-channel model measured here never left the CPU at all.
+
+Requires only the Command Line Tools: the Metal shaders are compiled at
+**runtime**, avoiding the offline `metal` compiler that ships only with full
+Xcode.
+
+## Native engine extras
+
+The native C engine adds **multi-threaded CPU** and **pointer-chase memory
 latency**, which maps the cache hierarchy precisely:
 
 ```
@@ -184,7 +227,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-64 tests, standard library only.
+84 tests, standard library only.
 
 ## Documentation
 

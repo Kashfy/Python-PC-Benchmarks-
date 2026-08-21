@@ -19,6 +19,8 @@ _COLUMNS = [
     ("mem_mb_s", "Mem MB/s", "{:,.0f}"),
     ("disk_write_mb_s", "Disk W", "{:,.0f}"),
     ("disk_iops", "IOPS", "{:,.0f}"),
+    ("gpu_fp32_gflops", "GPU GF", "{:,.0f}"),
+    ("npu_gflops", "NPU GF", "{:,.0f}"),
 ]
 
 

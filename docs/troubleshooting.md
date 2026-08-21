@@ -99,6 +99,50 @@ directly:
 Exit status 2 from the engine means *its* validation failed — see the
 validation section above.
 
+## "Neural Engine did NOT engage"
+
+The speedup over CPU-only Core ML came in below 1.5x, meaning Core ML kept the
+model on the CPU. The reported number is a CPU result, not an ANE one — which
+is why the tool says so instead of publishing it as NPU performance.
+
+Causes:
+
+- **Not Apple silicon.** Intel Macs have no Neural Engine.
+- **Model too small for this chip.** Dispatch overhead exceeded the work.
+- **ANE busy** with another process.
+- **macOS restrictions** in some VM or virtualized environments, where the ANE
+  is not exposed at all.
+
+The model geometry lives in `pcbench/coreml_model.py`
+(`DEFAULT_CHANNELS`, `DEFAULT_SPATIAL`, `DEFAULT_LAYERS`); raising them
+increases the work per inference.
+
+## No accelerator section / "accelerator engine build failed"
+
+GPU and NPU **benchmarks** require macOS plus the Command Line Tools. Install
+them with:
+
+```bash
+xcode-select --install
+```
+
+Full Xcode is *not* required — Metal shaders are compiled at runtime precisely
+to avoid it.
+
+On Windows and Linux the inventory is shown and benchmarking is skipped by
+design; see [technical.md](technical.md#what-is-and-isnt-covered).
+
+Skip accelerators entirely with `--no-accel`, or individually with `--no-gpu` /
+`--no-npu`.
+
+## GPU shows as "unknown" or is missing
+
+- **Linux**: install `pciutils` for `lspci`, or the NVIDIA driver for
+  `nvidia-smi`. Headless containers often expose nothing at all.
+- **Windows**: `AdapterRAM` is a signed 32-bit field and misreports anything at
+  or above 4 GB, so VRAM is omitted rather than shown wrong.
+- **VMs**: virtual display adapters frequently report no useful model.
+
 ## Multi-core scaling is far below the core count
 
 Expected. A 10-core chip rarely reaches 10×:

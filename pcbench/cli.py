@@ -11,6 +11,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from . import __version__
+from . import accel as accel_mod
 from . import native as native_mod
 from . import report as report_mod
 from . import workloads as wl
@@ -71,6 +72,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--all-runs", action="store_true",
                    help="With --compare, list every run, not just the latest "
                         "per machine")
+
+    g = p.add_argument_group("accelerators")
+    g.add_argument("--no-gpu", action="store_true",
+                   help="Skip GPU compute benchmarks")
+    g.add_argument("--no-npu", action="store_true",
+                   help="Skip NPU / Apple Neural Engine benchmarks")
+    g.add_argument("--no-accel", action="store_true",
+                   help="Skip all accelerator benchmarks (inventory still "
+                        "reported)")
 
     g = p.add_argument_group("other")
     g.add_argument("--no-native", action="store_true",
@@ -199,6 +209,21 @@ def main(argv=None) -> int:
         native = native_mod.run(args.seconds, args.repeats, _repo_root(),
                                 threads=info["cpu_cores_logical"])
 
+    # Accelerator inventory is cheap and always collected; benchmarking it is
+    # opt-out and only implemented on Apple platforms.
+    accel_inv = accel_mod.inventory(info.get("cpu_model", ""))
+    accel = None
+    if not args.no_accel and not (args.no_gpu and args.no_npu):
+        if accel_inv["benchmark_supported"]:
+            if not quiet:
+                print("  running accelerator engine (GPU/NPU) ...", flush=True)
+            accel = accel_mod.run(args.seconds, _repo_root(), disk_dir,
+                                  gpu=not args.no_gpu, ane=not args.no_npu)
+            # Fold the headline accelerator rates in so they score like any
+            # other metric.
+            for key, value in accel_mod.extract_rates(accel).items():
+                results[key] = {"rate": value}
+
     sustained = None
     if sustained_seconds:
         workers = args.sustained_workers or info["cpu_cores_logical"]
@@ -223,6 +248,8 @@ def main(argv=None) -> int:
         "warnings": warnings,
         "results": results,
         "native": native,
+        "accelerators": accel_inv,
+        "accel": accel,
         "sustained": sustained,
         "scores": scores,
     }
