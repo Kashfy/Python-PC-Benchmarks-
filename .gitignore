@@ -1,0 +1,12 @@
+# Benchmark output
+results/
+
+# Compiled native engine
+native_engine
+native_engine.exe
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.pyc
