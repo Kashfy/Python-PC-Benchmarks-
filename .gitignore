@@ -10,3 +10,6 @@ native_engine.exe
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/

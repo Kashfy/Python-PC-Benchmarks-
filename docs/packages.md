@@ -1,91 +1,152 @@
 # Packages, Dependencies & Toolchain
 
-What the tool needs to run, what it optionally uses, and the CLI surface.
-
 ## Runtime requirements
 
 | Component | Requirement | Notes |
 |-----------|-------------|-------|
-| Python | **3.8 or newer** | Uses f-strings, `math.isqrt`, `statistics.fmean`, and `from __future__ import annotations`. |
-| OS | Windows, macOS, or Linux | All three have dedicated code paths. |
-| C compiler | **Optional** | Only needed for the native engine (`cc`, `clang`, or `gcc`; MSVC `cl` for manual builds). |
+| Python | **3.8+** | Needs `math.isqrt` and `statistics.fmean`. |
+| OS | Windows, macOS, Linux | All three have dedicated probe paths. |
+| C compiler | **Optional** | Only for the native engine. |
 
-**No `pip install` is required.** `benchmark.py` imports only the Python
-standard library.
+**No `pip install` is required.** The tool imports only the standard library.
 
-## Python standard-library modules used
+## Installation
 
-All are bundled with CPython — nothing to install:
+Three ways to run it, all equivalent:
+
+```bash
+# 1. Straight from a checkout — no install
+python3 benchmark.py
+
+# 2. Installed, with a console command
+pip install -e .
+pcbench --quick
+
+# 3. As a module
+python3 -m pcbench
+```
+
+The [`benchmark.py`](../benchmark.py) launcher exists so the tool can be copied
+onto an unfamiliar machine and run immediately, with no install step and no
+`PYTHONPATH` fiddling.
+
+## Standard-library modules used
 
 | Module | Used for |
 |--------|----------|
 | `argparse` | CLI parsing |
-| `json` | JSON output + parsing the native engine's output |
-| `math` | `isqrt`, `sin`/`cos`/`sqrt`, `exp`, `log` (scoring & workloads) |
-| `multiprocessing` | Multi-core CPU test (`spawn` context) |
-| `os` | File descriptors, `cpu_count`, `posix_fadvise`, env vars |
-| `platform` | OS / arch / CPU / Python identification |
-| `re` | Parsing `/proc/meminfo`, sanitizing filenames |
-| `shutil` | `which` (compiler discovery), `disk_usage` (space guard) |
-| `statistics` | `median`, `fmean`, `stdev` |
-| `subprocess` | Running `sysctl` and the native engine |
-| `sys` | `maxsize` (bitness), `byteorder`, exit codes |
-| `tempfile` | Disk-test scratch files, fallback scratch dir |
-| `time` | `perf_counter` timing |
+| `csv` | History file read/write |
+| `ctypes` | Windows RAM and power queries (lazy import) |
 | `datetime` | UTC timestamps |
-| `csv` | Appending to `benchmarks.csv` (imported inside `append_csv`) |
-| `ctypes` | Windows RAM query (`GlobalMemoryStatusEx`), imported lazily |
+| `fcntl` | macOS `F_NOCACHE` page-cache bypass (lazy import) |
+| `glob` | Linux power-supply and thermal sysfs nodes |
+| `hashlib` | SHA-256 workload |
+| `html` | Escaping in the HTML report |
+| `json` | JSON output, parsing native engine output |
+| `math` | `isqrt`, trig, `exp`/`log` for scoring |
+| `multiprocessing` | Multi-core and sustained tests (`spawn`) |
+| `os` | File descriptors, `cpu_count`, `pread`, `posix_fadvise` |
+| `platform` | OS / arch / Python identification |
+| `random` | Deterministic corpus and random-read offsets |
+| `re` | Parsing `/proc` files, sanitizing filenames |
+| `shutil` | `which`, `disk_usage` |
+| `statistics` | `median`, `fmean`, `stdev` |
+| `subprocess` | `sysctl`, `pmset`, PowerShell, the native engine |
+| `sys` | Bitness, byte order, exit codes |
+| `sysconfig` | Free-threaded build detection |
+| `tempfile` | Scratch files |
+| `time` | `perf_counter` |
+| `unittest` | Test suite |
+| `winreg` | Windows CPU model (lazy import) |
+| `zlib` | Compression workload |
 
 ## Optional dependency: `psutil`
 
-`psutil` is **not required**. If it is importable, it is used to improve two
-fields — total RAM (`virtual_memory().total`) and physical core count
-(`cpu_count(logical=False)`). Without it, the tool falls back to native OS
-probes (`sysctl`, `/proc/*`, `ctypes`). The `system.psutil_available` field in
-the output records which path was taken.
-
-To install it (only if you want the marginally richer detection):
+Not required. When importable it improves exactly two fields — total RAM and
+physical core count. Otherwise the tool falls back to native OS probes. The
+`system.psutil_available` field records which path was taken.
 
 ```bash
-python3 -m pip install psutil
+python3 -m pip install psutil       # or: pip install -e ".[extras]"
 ```
 
 ## Native engine toolchain
 
-`native_engine.c` is standard C11 with no third-party libraries. It links only
-the C runtime and, on POSIX, the math library (`-lm`).
+Standard C11, no third-party libraries. Links the C runtime plus, on POSIX, the
+math library and pthreads.
 
 | Platform | Build command |
 |----------|---------------|
-| macOS / Linux | `cc -O2 native_engine.c -o native_engine -lm` |
+| macOS / Linux | `cc -O2 native_engine.c -o native_engine -lm -lpthread` |
 | Windows (MinGW) | `gcc -O2 native_engine.c -o native_engine.exe` |
 | Windows (MSVC) | `cl /O2 native_engine.c` |
 
-`benchmark.py` does this automatically via `run_native_engine()`, rebuilding
-only when the binary is missing or older than the source. Pass `--no-native` to
-skip it entirely.
+`pcbench` builds it automatically, rebuilding only when the binary is missing
+or older than the source. Verified warning-free under
+`-Wall -Wextra -std=c11` on both clang and gcc.
 
 ## Command-line interface
 
 ```
-python3 benchmark.py [options]
+pcbench [options]          #  or:  python3 benchmark.py [options]
 ```
+
+### Workload
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--seconds N` | `3.0` | Target duration per test, per repeat |
+| `--seconds N` | `3.0` | Duration per test, per repeat |
 | `--repeats M` | `3` | Repeats per test (median reported) |
-| `--disk-mb K` | `256` | Disk-test file size (MB) |
-| `--mem-mb K` | `64` | Memory-test buffer size (MB) |
-| `--only a,b` | all | Subset of `cpu_int,cpu_float,cpu_multi,memory,disk` |
-| `--quick` | off | Fast preset: 1s × 2 repeats, 64 MB disk |
-| `--no-native` | off | Skip the native C engine |
-| `--no-save` | off | Don't write JSON/CSV |
-| `--output-dir D` | `results` | Output directory for JSON/CSV |
-| `--json-stdout` | off | Print the full payload as JSON to stdout |
+| `--only a,b` | all | Subset of tests |
+| `--skip a,b` | none | Exclude tests |
+| `--quick` | off | 1s × 2 repeats, 64 MB disk |
+| `--disk-mb K` | `256` | Disk test file size |
+| `--mem-mb K` | `64` | Memory buffer size |
 
-The native engine accepts `--json`, `--seconds`, `--repeats`, `--mem-mb`, and
-`--disk-mb`.
+Test names: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`,
+`json`, `memory`, `cache_sweep`, `disk`.
+
+### Sustained load
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--sustained D` | off | Thermal test duration: `30s`, `5m`, `1h` |
+| `--sustained-window N` | `5.0` | Sampling window, seconds |
+| `--sustained-workers N` | all cores | Load processes |
+
+### Output
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output-dir D` | `results` | Output location |
+| `--html` | off | Also write a self-contained HTML report |
+| `--json-stdout` | off | Print full payload as JSON |
+| `--no-save` | off | Write no files |
+| `--compare` | — | Ranked table of past runs, then exit |
+| `--all-runs` | off | With `--compare`, every run rather than latest per host |
+
+### Other
+
+| Flag | Description |
+|------|-------------|
+| `--no-native` | Skip the C engine |
+| `--force` | Run despite distorting machine state |
+| `--version` | Print version |
+
+The native engine separately accepts `--json`, `--seconds`, `--repeats`,
+`--threads`, `--mem-mb`, `--disk-mb`.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `2` | Invalid arguments |
+| `3` | Refused — machine state would distort results |
+| `4` | Validation failure — hardware may be unstable |
+
+Codes 3 and 4 are designed for scripting: a CI job or fleet sweep can treat
+them distinctly from a normal failure.
 
 ## Output artifacts
 
@@ -93,13 +154,23 @@ Written to `--output-dir` (default `results/`, git-ignored):
 
 | File | Contents |
 |------|----------|
-| `benchmark_<host>_<timestamp>.json` | Full structured payload for one run |
-| `benchmarks.csv` | One appended row per run for spreadsheet comparison |
+| `benchmark_<host>_<timestamp>.json` | Full payload for one run |
+| `benchmarks.csv` | One row per run, for comparison |
+| `report_<host>_<timestamp>.html` | Self-contained report (`--html`) |
+| `benchmarks.csv.v2.bak` | Auto-archived history from an older schema |
 
-## Version support notes
+## Tests
 
-- `statistics.fmean` requires Python **3.8+**; `math.isqrt` requires **3.8+**.
-  These set the floor.
-- `os.posix_fadvise` exists only on Linux; its absence elsewhere is handled.
-- `multiprocessing` `spawn` is the default on Windows/macOS and forced on
-  Linux here for consistent behavior.
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+64 cases, standard library only — no pytest, no test dependencies.
+
+## Version notes
+
+- `math.isqrt` and `statistics.fmean` set the Python 3.8 floor.
+- `os.posix_fadvise` is Linux-only; `fcntl.F_NOCACHE` is macOS-only. Both are
+  guarded.
+- `os.getloadavg()` is unavailable on Windows and returns `None` there.
+- `multiprocessing` uses `spawn` explicitly on all platforms for consistency.

@@ -1,192 +1,250 @@
 # Function Reference
 
-Every public function in `benchmark.py` and `native_engine.c`, grouped by role.
-Signatures reflect the source; see [technical.md](technical.md) for the
-methodology behind them.
+Public API of every module. See [technical.md](technical.md) for the
+methodology behind these and [architecture.md](architecture.md) for how they
+fit together.
 
 ---
 
-## `benchmark.py`
+## `pcbench.core` — timing, statistics, validation
 
-### Console formatting
+Pure functions, no I/O — the most heavily unit-tested module.
 
-#### `hr(title="") -> None`
-Prints a 70-character rule, optionally with a centered title line. Used to
-separate report sections.
+#### `clock() -> float`
+Monotonic high-resolution timestamp (`time.perf_counter`).
 
-#### `fmt_num(x) -> str`
-Formats a number for the console: thousands-separated with no decimals when
-≥ 1000, one decimal in `[10, 1000)`, three decimals below 10.
-
-### Timed-loop core
+#### `warmup(chunk_func, seconds) -> int`
+Runs `chunk_func` untimed for ~15% of `seconds` (clamped 0.05–1.0 s) to reach a
+steady state before measurement. Always runs at least once. Returns the
+iteration count.
 
 #### `timed_loop(chunk_func, seconds) -> (elapsed, iterations)`
-Calls `chunk_func` repeatedly until `seconds` elapse. Returns the actual
-elapsed time and the number of chunks executed. The caller multiplies
-`iterations` by the work-per-chunk constant to get a rate.
+Calls `chunk_func` repeatedly until `seconds` elapse.
 
-### Workloads
+#### `summarize(samples) -> dict`
+Reduces per-repeat rates to `{median, mean, stdev, cv, min, max, samples}`.
+`cv` (stdev/mean) is a normalized stability indicator.
 
-#### `_is_prime(n) -> bool`
-Trial-division primality test up to `math.isqrt(n)`.
+#### `stability_note(cv) -> str`
+Maps a coefficient of variation to `excellent` / `good` / `fair` / `unstable`.
 
-#### `cpu_integer_chunk() -> None`
-One integer chunk: primality-tests every integer in `[50000, 51000)`.
+#### `ValidationError`
+Raised when a workload computes an incorrect result — a hardware finding, not a
+bug.
 
-#### `cpu_float_chunk() -> None`
-One float chunk: 50,000 iterations of `sin(x)*cos(x) + sqrt(x)`.
+#### `check_exact(name, got, expected)` / `check_close(name, got, expected, rel_tol=1e-9)`
+Assert a workload's output. `check_close` uses a relative tolerance because
+platform math libraries differ in the last bits.
 
-#### `_multicore_worker(duration) -> int`
-Top-level, picklable worker for `multiprocessing`. Runs integer chunks for
-`duration` seconds and returns the number of primes tested. Times itself to
-avoid cross-process clock issues.
+---
 
-### Benchmark runners
+## `pcbench.system` — inventory and machine state
 
-Each returns a dict containing at least `unit` and `rate` (the median), plus
-the full statistics from `_summarize`.
+#### `arch_family(machine) -> str`
+Normalizes `platform.machine()` to a canonical ISA family.
 
-#### `_summarize(samples) -> dict`
-Reduces a list of per-repeat rates to `{median, mean, stdev, min, max,
-samples}`. `stdev` is 0 for a single sample.
+#### `cpu_model() -> str`
+Human CPU name. `sysctl machdep.cpu.brand_string` (macOS); `/proc/cpuinfo`
+model name → device-tree model → Hardware/Model (Linux); registry
+`ProcessorNameString` → `PROCESSOR_IDENTIFIER` (Windows).
 
-#### `bench_cpu_integer(seconds, repeats) -> dict`
-Runs the integer workload `repeats` times. Unit `primes/s`.
+#### `total_ram_bytes() -> int`
+`psutil` → `sysctl hw.memsize` / `/proc/meminfo` / `GlobalMemoryStatusEx`.
+Returns 0 if undetectable.
 
-#### `bench_cpu_float(seconds, repeats) -> dict`
-Runs the float workload `repeats` times. Unit `iters/s`.
+#### `physical_cores() -> int | None`
+`psutil` → `sysctl hw.physicalcpu` (macOS), distinct `(physical id, core id)`
+pairs (Linux), PowerShell `Win32_Processor.NumberOfCores` with a `wmic`
+fallback (Windows).
 
-#### `bench_cpu_multicore(seconds, logical_cores) -> dict`
-Runs the integer workload across `logical_cores` spawned processes. Returns the
-aggregate `rate`, the worker count, wall time, and per-worker prime counts.
-Unit `primes/s`.
+#### `cpu_frequency_mhz() -> float | None`
+Base/max clock where exposed. Returns `None` on Apple Silicon, which publishes
+no nominal clock.
 
-#### `bench_memory(seconds, repeats, buf_mb=64) -> dict`
-Measures memory copy bandwidth by repeatedly copying a `buf_mb` buffer. Unit
-`MB/s`.
+#### `gil_status() -> dict`
+`{free_threaded_build, gil_enabled}`. Python 3.13+ can be built free-threaded,
+which changes multi-threaded scaling dramatically.
 
-#### `_advise_dropcache(fd) -> None`
-Best-effort hint (`posix_fadvise DONTNEED` on Linux) to drop the OS page cache
-for a file descriptor before the read test. No-op where unsupported.
+#### `inventory() -> dict`
+The full static fact set: host, OS, architecture family/bits/endianness, CPU
+model, core counts, base clock, RAM, Python version and GIL status.
 
-#### `bench_disk(seconds, repeats, file_mb, out_dir) -> dict`
-Writes and reads a `file_mb` file in `out_dir`. Returns `write_rate` and
-`read_rate` (medians) plus full `write`/`read` stat blocks. Returns
-`{"skipped": True, "error": ...}` if free space is insufficient.
+#### `on_ac_power() -> bool | None`
+True on AC, False on battery, None if unknown or no battery.
 
-### Hardware / OS inventory
+#### `load_average() -> tuple | None` · `thermal_pressure() -> str | None`
+System load (not on Windows) and a best-effort throttling/temperature reading.
 
-#### `_run(cmd) -> str`
-Runs a command with a 5-second timeout and returns trimmed stdout, or `""` on
-any error. Used to shell out to `sysctl` etc.
+#### `machine_state() -> dict`
+Volatile conditions: `{on_ac_power, load_average, load_per_core, thermal}`.
 
-#### `_cpu_model() -> str`
-Returns a human CPU name. Sources by OS: `sysctl machdep.cpu.brand_string`
-(macOS); `/proc/cpuinfo` "model name", device-tree model, or "Hardware"/"Model"
-(Linux); `PROCESSOR_IDENTIFIER` (Windows). Falls back to
-`platform.processor()`/`platform.machine()`.
+#### `state_warnings(state) -> list[str]`
+Conditions that will distort results — battery power, load per core > 0.30,
+active thermal throttling. A non-empty list stops the run unless `--force`.
 
-#### `_total_ram_bytes() -> int`
-Total physical RAM in bytes. Uses `psutil` if available, else `sysctl
-hw.memsize` (macOS), `/proc/meminfo` (Linux), or `GlobalMemoryStatusEx` via
-`ctypes` (Windows). Returns 0 if undetectable.
+---
 
-#### `_physical_cores() -> int | None`
-Physical (not logical) core count. Uses `psutil` if available, else `sysctl
-hw.physicalcpu` (macOS) or `physical id`/`core id` pairs in `/proc/cpuinfo`
-(Linux). Returns `None` if undetectable.
+## `pcbench.workloads` — the benchmarks
 
-#### `_has_psutil() -> bool`
-Whether `psutil` can be imported.
+Every `bench_*` validates, warms up, repeats, and returns a dict with at least
+`unit` and `rate`.
 
-#### `_arch_family(machine) -> str`
-Maps a raw `platform.machine()` string to a canonical ISA family (see the table
-in [technical.md](technical.md)).
+#### Chunks and constants
+`cpu_integer_chunk() -> int` (returns the prime count, `EXPECTED_PRIME_COUNT ==
+89`), `cpu_float_chunk() -> float` (returns the sum, `EXPECTED_FLOAT_SUM`),
+`_is_prime(n)`, `_corpus(size)` (deterministic, compressible test data).
 
-#### `gather_system_info() -> dict`
-Assembles the full inventory: hostname, OS/release/version/platform,
-architecture + `arch_family` + bits + byte order, CPU model, physical/logical
-cores, total RAM (bytes and GB), Python version/implementation, and whether
-psutil is present.
+#### `bench_cpu_integer(seconds, repeats)` → primes/s
+#### `bench_cpu_float(seconds, repeats)` → iters/s
+#### `bench_cpu_multicore(seconds, workers=None)` → primes/s
+One `spawn` process per logical core; returns aggregate rate, worker count,
+wall time, and per-worker counts. `_multicore_worker` is module-level so it
+stays picklable.
 
-### Native engine integration
+#### `bench_compression(seconds, repeats)` → MB/s
+zlib level 6 round-trip, CRC-verified.
 
-#### `_find_compiler() -> str | None`
-Returns the first available compiler among `cc`, `clang`, `gcc`, or `None`.
+#### `bench_hashing(seconds, repeats)` → MB/s
+SHA-256; reaches hardware crypto instructions where present.
 
-#### `run_native_engine(seconds, repeats, script_dir) -> dict | None`
-Compiles `native_engine.c` (only if the binary is missing or stale), runs it
-with `--json`, and returns the parsed JSON. Returns `None` if the source is
-absent, or an `{"error": ...}` dict if no compiler is found or the build/run
-fails. Never raises.
+#### `bench_json(seconds, repeats)` → MB/s
+JSON parse throughput.
 
-### Scoring
+#### `bench_memory(seconds, repeats, buf_mb=64)` → MB/s
+Sustained copy bandwidth; verifies the copy afterwards.
+
+#### `bench_cache_sweep(total_seconds, ram_bytes)` → dict
+Bandwidth across working sets from 128 KB to 128 MB, revealing cache tiers.
+Returns `points`, `peak_mb_per_s`, `dram_mb_per_s`, `cache_to_dram_ratio`.
+
+#### `bench_disk(seconds, repeats, file_mb, out_dir)` → dict
+Sequential write (through `fsync`), sequential read, and 4 KiB random-read
+IOPS. Returns `write_rate`, `read_rate`, `random_read_iops`, and
+`cache_bypassed`. Skips with a reason when free space is insufficient.
+
+#### `_set_nocache(fd) -> bool` · `_drop_cache(fd) -> bool`
+Page-cache defeat. `_set_nocache` (macOS `F_NOCACHE`) **must** run before the
+file is written — it prevents caching but does not evict. `_drop_cache`
+(Linux `posix_fadvise`) evicts after `fsync`.
+
+#### `_random_read_iops(fd, size, budget) -> float`
+4 KiB reads at random offsets, batched so `clock()` overhead stays off the
+measured path.
+
+---
+
+## `pcbench.sustained` — thermal behavior
+
+#### `run_sustained(duration, window=5.0, workers=1) -> dict`
+Runs continuous load, sampling per window. Returns `samples`, `peak_rate`,
+`sustained_rate` (mean of the final 25%), `droop_percent`, `verdict`, and
+post-run machine state.
+
+#### `sparkline(values) -> str`
+Compact unicode bar chart scaled to the values' own range.
+
+Internals: `_run_single`, `_run_parallel` (creates the pool once and reuses it
+so load stays continuous and heat accumulates), `_window_worker`, `_verdict`.
+
+---
+
+## `pcbench.scoring`
+
+#### `BASELINES: dict`
+Fixed reference rates; baseline == 100.
 
 #### `compute_scores(results) -> dict`
-Normalizes each available rate against its `BASELINES` entry (baseline = 100)
-and returns `{"subscores": {...}, "composite": <geometric mean>}`.
+`{"subscores": {...}, "composite": float}`. Skipped, errored, and zero-rate
+entries are excluded (a zero would make `log()` raise).
 
-### Output
+#### `category_scores(subscores) -> dict`
+Rolls subscores up into CPU / memory / disk headline numbers.
 
-#### `print_console_report(info, results, scores, native) -> None`
-Renders the full human-readable report: system info, benchmark results, the
-native section (if present), and scores.
+---
+
+## `pcbench.report`
+
+#### Console
+`hr(title)`, `fmt(x)`, `print_system`, `print_results`, `print_native`,
+`print_sustained`, `print_scores`, and `print_report(payload)` which calls them
+in order and appends any validation failures.
 
 #### `save_json(payload, out_dir) -> str`
-Writes the full payload to `results/benchmark_<host>_<timestamp>.json` and
-returns the path.
+Writes `benchmark_<host>_<timestamp>.json`.
 
 #### `append_csv(payload, out_dir) -> str`
-Appends one flattened row (headline rates + composite) to
-`results/benchmarks.csv`, writing a header first if the file is new. Returns the
-path.
+Appends one flattened row. If an existing file's header does not match
+`CSV_FIELDS`, it is archived to `benchmarks.csv.v2.bak` — appending new columns
+to an old file would silently misalign every row.
 
-### Entry point
+#### `save_html(payload, out_dir) -> str`
+Self-contained HTML report: inline CSS, no external assets, no scripts, all
+interpolated values HTML-escaped, and every field read defensively so the page
+renders even when a probe returned nothing.
 
-#### `parse_args(argv=None) -> argparse.Namespace`
-Defines and parses all CLI flags (see [packages.md](packages.md) /
-`README.md` for the flag table).
+---
 
-#### `main(argv=None) -> int`
-Orchestrates a full run and returns a process exit code (0 success, 2 for a
-bad `--only` value).
+## `pcbench.compare`
+
+#### `load_history(csv_path) -> list[dict]`
+Reads the CSV history; returns `[]` if absent.
+
+#### `latest_per_host(rows) -> list[dict]`
+Keeps the newest run per hostname (ISO-8601 timestamps sort as text), ranked by
+composite score.
+
+#### `render_table(rows, all_runs=False) -> str`
+Ranked comparison table with each machine's percentage of the best score.
+Columns with no data anywhere are omitted.
+
+---
+
+## `pcbench.native`
+
+#### `find_compiler() -> str | None` · `build(src, exe) -> (bool, str)`
+#### `run(seconds, repeats, script_dir, threads=None) -> dict | None`
+Compiles when the binary is missing or stale, runs with `--json`, returns
+parsed output. `None` if the source is absent; `{"error": ...}` on failure.
+Never raises.
+
+---
+
+## `pcbench.cli`
+
+#### `build_parser() -> ArgumentParser` · `main(argv=None) -> int` · `entry()`
+Exit codes: `0` success, `2` bad arguments, `3` refused due to machine state,
+`4` validation failure.
+
+#### `parse_duration(text) -> float`
+Parses `90`, `30s`, `5m`, `1h`. Rejects non-positive and malformed values.
+
+#### `select_tests(only, skip) -> list[str]`
+Resolves `--only`/`--skip` against `TESTS`, raising `ValueError` on unknown
+names.
+
+#### `_runners(args, info, disk_dir) -> dict`
+Maps every test name to its callable. A test in `TESTS` without an entry here
+is caught by the suite.
 
 ---
 
 ## `native_engine.c`
 
-### Timing & platform
+**Platform layer** — `now_seconds()` (`QueryPerformanceCounter` / 
+`clock_gettime`), `cpu_count()`, and a `thread_t` typedef over Win32 threads
+and pthreads.
 
-- `now_seconds()` — monotonic high-resolution clock
-  (`QueryPerformanceCounter` on Windows, `clock_gettime(CLOCK_MONOTONIC)` on
-  POSIX).
+**Workloads** — `is_prime`, `cpu_integer_chunk` (returns the count for
+validation), `cpu_float_chunk`.
 
-### Workloads
+**Statistics** — `median`, `stddev`.
 
-- `is_prime(n)` — trial-division primality test.
-- `cpu_integer_chunk()` — primality over `[50000, 51000)`, accumulating into a
-  `volatile` sink so the optimizer can't delete the work.
-- `cpu_float_chunk()` — 50,000 iterations of `sin*cos + sqrt`, into a
-  `volatile` double sink.
+**Runners** — `run_rate`, `run_memory` (memcpy bandwidth, verified),
+`run_multithread(seconds, nthreads)` (real threads, no GIL or spawn cost),
+`run_disk` (uses `F_NOCACHE` before writing on macOS, `posix_fadvise` on Linux).
 
-### Statistics
+**Latency** — `build_cycle` (Sattolo's algorithm, guaranteeing a single cycle
+the prefetcher cannot predict) and `pointer_chase_ns(bytes, seconds)`.
 
-- `median(v, n)` — insertion-sorts a small array and returns the median.
-- `stddev(v, n)` — sample standard deviation (0 for n < 2).
-
-### Runners
-
-- `run_rate(func, seconds, units_per_chunk)` — the timed-loop core; returns
-  work-units per second.
-- `run_memory(seconds, buf_mb)` — `memcpy` bandwidth in MB/s.
-- `run_disk(seconds, file_mb, *out_write, *out_read)` — sequential write/read
-  MB/s via a temp file (`GetTempPathA`/`fopen` on Windows, `mkstemp`+`fsync` on
-  POSIX).
-
-### Output & entry
-
-- `print_human(r, n)` — human-readable table.
-- `print_json(r, n, seconds, repeats)` — the JSON contract consumed by
-  `benchmark.py`.
-- `main(argc, argv)` — parses `--json/--seconds/--repeats/--mem-mb/--disk-mb`,
-  runs all workloads `repeats` times, and prints results.
+**Output** — `print_human`, `print_json` (the contract `pcbench.native`
+consumes), `main`. Exits 2 if validation failed.

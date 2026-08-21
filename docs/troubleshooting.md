@@ -1,136 +1,198 @@
 # Troubleshooting
 
-Common issues, what causes them, and how to fix them. Most problems are
-environmental (compiler, permissions, thermal state) rather than bugs.
+Most problems here are environmental — power state, thermals, compilers,
+permissions — rather than bugs.
 
-## The native (C) engine section is missing or shows an error
+## "System already busy" / "Running on BATTERY" — the run stops
 
-**"no C compiler found (cc/clang/gcc); skipped"**
-No compiler is on `PATH`. The Python benchmarks still ran — only the
-compiler-optimized comparison is skipped. Install one if you want it:
+**This is intentional** (exit code 3). Benchmarking on battery or under load
+produces numbers that look like hardware differences but are not, and those
+numbers then silently poison every later comparison.
 
-- macOS: `xcode-select --install`
-- Debian/Ubuntu: `sudo apt install build-essential`
-- Fedora: `sudo dnf install gcc`
-- Windows: install MSVC (Visual Studio Build Tools) or MinGW-w64, then run from
-  a Developer Command Prompt, or just use `--no-native`.
-
-**"native build failed"**
-The `detail` field carries the compiler's stderr. Usually a missing math
-library or a toolchain misconfig. Try building by hand to see the full error:
+Fix the condition — plug in, close background applications, let the machine
+cool — or override:
 
 ```bash
-cc -O2 native_engine.c -o native_engine -lm
+python3 benchmark.py --force
 ```
 
-**"native run failed" / "native run error"**
-The binary built but exited non-zero or produced unparseable output — often a
-sandbox blocking the temp-file write. Run it directly to inspect:
+The thresholds: battery power, load per core above 0.30, or an active thermal
+throttle. Note that running the benchmark itself raises the load average, so
+back-to-back runs may trip the guard; wait a minute between them.
+
+## "VALIDATION FAILED" (exit code 4)
+
+A workload computed the **wrong answer**. This is the most serious result the
+tool can produce and is not a software bug in normal use. Common causes, in
+rough order of likelihood:
+
+1. **Unstable overclock / XMP-EXPO memory profile** — revert to stock and retest.
+2. **Failing RAM** — run MemTest86 or `memtester`.
+3. **Inadequate cooling** — a CPU past its thermal limit can compute
+   incorrectly rather than merely slowly.
+4. **Undervolting** applied to CPU or memory.
+5. A miscompiled or mismatched Python/C runtime.
+
+Reproduce with a single test to narrow it down:
 
 ```bash
-./native_engine --json --seconds 1 --repeats 1
+python3 benchmark.py --only cpu_int --seconds 30 --repeats 5 --no-native
 ```
 
-To skip the engine entirely: `python3 benchmark.py --no-native`.
+If it passes at stock settings and fails when overclocked, the overclock is
+unstable.
+
+## Disk read numbers look impossibly high
+
+Check `cache_bypassed` in the JSON, or the console note. When it is `false`
+the read was served from the OS page cache rather than the drive.
+
+| Platform | Status |
+|----------|--------|
+| macOS | Bypassed via `F_NOCACHE` |
+| Linux | Bypassed via `posix_fadvise(DONTNEED)` |
+| Windows | **Not bypassed** — reads are an optimistic upper bound |
+
+On Windows, or if bypass fails, trust the **write** figure (timed through
+`fsync`) and treat reads as a floor. Increasing `--disk-mb` well beyond RAM
+helps:
+
+```bash
+python3 benchmark.py --only disk --disk-mb 4096
+```
 
 ## Disk test is skipped
 
-**"not enough free space for N MB disk test"**
-The guard requires free space ≥ 1.2 × the test file. Lower the size or point
-the scratch dir elsewhere:
+**"needs ~N MB free"** — the guard requires free space ≥ 1.2× the file size.
 
 ```bash
 python3 benchmark.py --disk-mb 64
 python3 benchmark.py --output-dir /path/on/a/bigger/disk
 ```
 
-## Disk read numbers look impossibly high
+## The native (C) engine section is missing
 
-Read throughput above what the drive can physically do (e.g. tens of GB/s on a
-SATA SSD) means the read was served from the **OS page cache**, not the device.
-The tool drops the cache on Linux (`posix_fadvise`) but cannot on macOS/Windows
-without elevated privileges. Mitigations:
+**"no C compiler found"** — the Python benchmarks still ran; only the
+compiler-optimized comparison and the pointer-chase latency curve are missing.
 
-- Increase `--disk-mb` well beyond a few hundred MB so the file exceeds cache.
-- Treat read numbers as a **floor**, and trust the write number (post-`fsync`)
-  as the more device-accurate figure.
+- macOS: `xcode-select --install`
+- Debian/Ubuntu: `sudo apt install build-essential`
+- Fedora: `sudo dnf install gcc`
+- Windows: MSVC Build Tools or MinGW-w64, or just use `--no-native`.
 
-## Multi-core scaling is lower than the core count
+**"native build failed"** — the `detail` field carries compiler stderr. Build
+by hand to see everything:
 
-Expected. A 10-core chip rarely gives 10× the single-core rate because of:
+```bash
+cc -O2 native_engine.c -o native_engine -lm -lpthread
+```
 
-- **Hybrid cores** — efficiency cores are slower than performance cores.
-- **SMT/Hyper-Threading** — two logical threads share one physical core.
-- **Spawn overhead** — process startup is counted in wall time; it dominates on
-  very short runs.
+On older POSIX toolchains a missing `-lpthread` is the usual cause.
 
-Use `--seconds 5` or more for a cleaner scaling figure. See
-[technical.md](technical.md#cpu-multi-core--primes-s--scaling-factor).
+**"native run failed"** — often a sandbox blocking the temp-file write. Run it
+directly:
 
-## Results vary a lot between runs (high stdev)
+```bash
+./native_engine --json --seconds 1 --repeats 1
+```
 
-Benchmarks are sensitive to machine state. To stabilize:
+Exit status 2 from the engine means *its* validation failed — see the
+validation section above.
 
-- Close background apps and browser tabs.
-- Plug in laptops — battery power profiles throttle the CPU.
-- Let the machine cool between runs (thermal throttling depresses later runs).
-- Increase `--seconds` and `--repeats` (e.g. `--seconds 5 --repeats 5`).
+## Multi-core scaling is far below the core count
 
-A high `stdev` relative to the `median` in the JSON is the signal to do this.
+Expected. A 10-core chip rarely reaches 10×:
+
+- **Hybrid cores** — efficiency cores are much slower than performance cores.
+  An Apple M4 (4P + 6E) lands near 5×.
+- **SMT / Hyper-Threading** — two threads sharing a core don't double
+  throughput.
+- **Process spawn cost** — counted in wall time, dominant on short runs.
+
+Use `--seconds 5` or more. Compare against the native engine's threaded number:
+if C scales much better than Python, the gap is interpreter overhead, not
+hardware.
+
+## Results marked "unstable" / high variance
+
+The stability rating comes from the coefficient of variation. `unstable` (>10%)
+means the number should not be trusted.
+
+- Close background apps; plug in.
+- Let the machine cool — thermal throttling depresses later repeats.
+- Increase `--seconds 5 --repeats 5`.
+- On a laptop, run `--sustained 5m` to see whether throttling is the cause.
+
+## The cache sweep looks flat
+
+Chips with very large caches and high memory bandwidth (Apple Silicon
+especially) show a gentle curve rather than sharp cliffs. The sweep also starts
+at 128 KB because smaller sizes measure interpreter overhead rather than the
+cache.
+
+For a precise hierarchy map, use the native engine's pointer-chase latency
+table — it resolves L1 clearly, which the Python sweep cannot.
 
 ## `CPU model` shows an architecture string instead of a name
 
-On some Linux ARM boards `/proc/cpuinfo` has no "model name" line. The tool
-falls back to the device-tree model, then "Hardware"/"Model", then the raw
-architecture. This is cosmetic — the benchmark numbers are unaffected. The
-`architecture` and `arch_family` fields still identify the chip class.
+Some Linux ARM boards have no "model name" in `/proc/cpuinfo`. The tool falls
+back to the device-tree model, then Hardware/Model, then the raw architecture.
+Cosmetic only — benchmark numbers are unaffected.
 
-## RAM or physical-core count shows `null` / `unknown`
+## RAM or physical-core count shows `null`
 
-The OS-specific probe couldn't read it (unusual environment, container, or
-locked-down system). Installing `psutil` often fixes detection:
+The OS probe couldn't read it (unusual environment, container, locked-down
+system). Installing `psutil` usually fixes it:
 
 ```bash
 python3 -m pip install psutil
 ```
 
-Benchmarks run normally regardless; only the inventory field is affected.
+## `--compare` shows nothing
 
-## `Unknown test(s): ...` and the tool exits
+"No history found" means `results/benchmarks.csv` doesn't exist yet — run the
+benchmark at least once without `--no-save`. If you used a custom
+`--output-dir`, pass the same one to `--compare`.
 
-An invalid name was passed to `--only`. Valid values are exactly:
-`cpu_int`, `cpu_float`, `cpu_multi`, `memory`, `disk`.
+If a `benchmarks.csv.v2.bak` appeared, your history was written by an older
+version with a different schema; it was archived rather than corrupted. The old
+data is intact in the `.bak` file.
 
-## `RuntimeError` about multiprocessing / repeated banner output on Windows
+## Unknown test name / invalid duration (exit 2)
 
-This happens if the module is run in a way that bypasses the `__main__` guard.
-Always launch as a script (`python benchmark.py`), not by importing and calling
-`main()` from an interactive shell without a `if __name__ == "__main__"` guard.
-The script already calls `mp.freeze_support()` for frozen/`.exe` builds.
+Valid tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`,
+`json`, `memory`, `cache_sweep`, `disk`.
+Valid durations: `90`, `30s`, `5m`, `1h`.
 
 ## Permission denied writing results
 
-The default `results/` directory couldn't be created or written. Redirect
-output:
-
 ```bash
 python3 benchmark.py --output-dir ~/bench-results
-# or don't write files at all:
 python3 benchmark.py --no-save
 ```
 
-## Python version too old
+## Multiprocessing errors or repeated banners on Windows
 
-Errors mentioning `isqrt`, `fmean`, or f-strings mean Python < 3.8. Install a
-newer Python 3 and run with it explicitly (e.g. `python3.12 benchmark.py`).
+Launch as a script (`python benchmark.py` or `pcbench`), not by importing and
+calling `main()` without a `__main__` guard. `mp.freeze_support()` is already
+called for frozen builds.
 
-## Still stuck?
+## Python too old
 
-Capture a full machine-readable dump to share when reporting an issue:
+Errors mentioning `isqrt` or `fmean` mean Python < 3.8. Run with a newer
+interpreter, e.g. `python3.12 benchmark.py`.
+
+## Reporting an issue
+
+Capture a full machine-readable dump:
 
 ```bash
-python3 benchmark.py --json-stdout --no-save > run.json
+python3 benchmark.py --json-stdout --no-save --force > run.json
 ```
 
-That file contains the system inventory, every raw sample, and any per-test
-error messages.
+It contains the inventory, machine state, every raw sample, and any per-test
+error messages. Also useful:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

@@ -4,18 +4,15 @@ A reliable, cross-platform benchmark and hardware-diagnostics tool for
 **Windows, macOS, and Linux** on **x86-64, ARM64, and other** CPU
 architectures.
 
-It measures CPU (single- and multi-core), memory bandwidth, and disk I/O in
-**meaningful, comparable units**, gathers a hardware/OS inventory (including
-chip architecture), and writes results to the console plus timestamped JSON
-and an appended CSV so you can compare many machines over time.
+It measures CPU, memory, and disk in **meaningful, comparable units**,
+detects **thermal throttling** under sustained load, **validates** that the
+hardware computes correct results, gathers a full hardware inventory, and
+records everything to JSON/CSV/HTML so you can compare machines over time.
 
-- **`benchmark.py`** — the primary tool. Pure Python **standard library**, so
-  it runs on any machine with Python 3.8+ with **no `pip install`**. If
-  [`psutil`](https://pypi.org/project/psutil/) happens to be installed it's
-  used for richer hardware info, but it is entirely optional.
-- **`native_engine.c`** — an optional native (C) engine that `benchmark.py`
-  auto-compiles and runs to give **compiler-optimized** numbers alongside the
-  Python results. Builds on Windows (MSVC/MinGW), macOS, and Linux.
+- **Pure Python standard library** — runs on any machine with Python 3.8+,
+  **no `pip install` required**.
+- **Optional native C engine** — auto-compiled for compiler-optimized numbers
+  and real memory-latency measurement.
 
 ## Quick start
 
@@ -23,128 +20,177 @@ and an appended CSV so you can compare many machines over time.
 python3 benchmark.py
 ```
 
-That runs every test at default settings and prints a report like:
+Or install it and use the command:
+
+```bash
+pip install -e .
+pcbench --quick
+```
+
+## What makes it reliable
+
+| Feature | Why it matters |
+|---------|----------------|
+| **Machine-state guard** | Refuses to run on battery or under load, because those produce numbers that look like hardware differences but aren't. Override with `--force`. |
+| **Warm-up pass** | Discards the cold-cache, low-clock first iterations before timing. |
+| **Median of repeats** | Resists one-off outliers; reports a stability rating (`excellent`…`unstable`). |
+| **Result validation** | Every workload verifies its own output. A wrong answer means unstable RAM/overclock/cooling — and exits with code 4. |
+| **Cache-bypassed disk I/O** | Uses `F_NOCACHE`/`posix_fadvise` *before* writing, so reads measure the drive, not RAM. Reports whether it succeeded. |
+| **Fail-soft** | One failing probe never aborts the run. |
+
+## Example
 
 ```
 System Information
-  Hostname      : my-laptop
-  OS            : Linux 6.8.0
-  Architecture  : ARM64 (aarch64, 64-bit, little-endian)
-  CPU           : Apple M4 / Snapdragon X / Ryzen 7 7840U ...
-  Cores         : 8 physical / 16 logical
+  Hostname      : Kashfys-Air.lan
+  OS            : Darwin 25.6.0
+  Architecture  : ARM64 (arm64, 64-bit, little-endian)
+  CPU           : Apple M4
+  Cores         : 10 physical / 10 logical
   RAM           : 16.0 GB
-  Python        : CPython 3.12.3
+  Power         : AC
+  Thermal       : nominal
 
 Benchmark Results
-  CPU Integer (primes)   :  4,491,982 primes/s
-  CPU Float (math ops)   : 19,706,117 iters/s
-  CPU Multi-core (10w)   : 22,597,141 primes/s  ->  5.0x vs 1 core
-  Memory copy bandwidth  :     41,909 MB/s
-  Disk write             :      5,147 MB/s
-  Disk read              :     14,027 MB/s
+  CPU Integer (primes)      :      4,437,140 primes/s  (excellent, ±0.8%)
+  CPU Float (math ops)      :     19,847,875 iters/s   (excellent, ±0.3%)
+  Compression (zlib)        :           48.0 MB/s
+  Hashing (SHA-256)         :          3,207 MB/s
+  JSON parse                :          177.2 MB/s
+  Memory copy bandwidth     :         42,677 MB/s
+  CPU Multi-core (10w)      :     22,337,201 primes/s  →  5.0x vs 1 core
+  Disk sequential write     :          5,260 MB/s
+  Disk sequential read      :          3,763 MB/s
+  Disk random read (4K)     :         37,994 IOPS
 
-Scores (baseline machine = 100, higher is better)
-  ...
-  COMPOSITE     :    589.7
+  Memory bandwidth by working-set size (cache hierarchy):
+     128 KB  ████████████████████████████████      69,754 MB/s
+       2 MB  ██████████████████████████████████    73,200 MB/s
+      32 MB  ████████████████████                  44,888 MB/s
+     128 MB  ███████████████████                   41,914 MB/s
+```
+
+## Thermal / sustained-load testing
+
+A three-second benchmark only measures *burst* speed. Thin and fanless laptops
+hold peak clocks for a minute, then drop to whatever their cooling sustains —
+often 15–40% lower. That gap is what determines real performance on long work
+like compiling or video export.
+
+```bash
+python3 benchmark.py --sustained 5m
+```
+
+```
+Sustained Load — thermal behavior
+  Peak throughput           :     24,119,411 primes/s
+  Sustained (final 25%)     :     20,894,599 primes/s
+  Droop                     :           13.4 %
+
+  Throughput over time: █▆▄▃▂▂▁▂
+  Verdict: mild throttling — typical for a well-cooled laptop
+```
+
+## Comparing machines
+
+Every run appends to `results/benchmarks.csv`. Rank your fleet with:
+
+```bash
+python3 benchmark.py --compare
+```
+
+```
+  Machine                              Score    CPU int   CPU multi    SHA256    Disk W     IOPS
+  ----------------------------------------------------------------------------------------------
+  linux-desktop (AMD Ryzen 9 7950X)      612  5,200,000  98,000,000     2,100     4,100   52,000   (best)
+  Kashfys-Air.lan (Apple M4)             349  4,481,993  21,357,440     3,207     4,307   46,960   (57% of best)
+  rpi5 (Raspberry Pi 5)                   88    900,000   3,400,000       310        95    6,100   (14% of best)
 ```
 
 ## Options
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--seconds N` | `3.0` | Target duration per test, per repeat |
-| `--repeats M` | `3` | Repeats per test (the **median** is reported) |
-| `--disk-mb K` | `256` | Disk-test file size in MB |
-| `--mem-mb K` | `64` | Memory-test buffer size in MB |
-| `--only a,b` | all | Run a subset: `cpu_int,cpu_float,cpu_multi,memory,disk` |
-| `--quick` | off | Fast pass (1s × 2 repeats, small disk test) |
-| `--no-native` | off | Skip the optional C engine |
-| `--no-save` | off | Don't write JSON/CSV files |
-| `--output-dir D` | `results` | Where JSON/CSV go |
-| `--json-stdout` | off | Print the full result payload as JSON to stdout |
+| `--seconds N` | `3.0` | Duration per test, per repeat |
+| `--repeats M` | `3` | Repeats per test (median reported) |
+| `--only a,b` | all | Subset of tests (see below) |
+| `--skip a,b` | none | Exclude tests |
+| `--quick` | off | Fast pass (1s × 2 repeats) |
+| `--disk-mb K` | `256` | Disk test file size |
+| `--mem-mb K` | `64` | Memory buffer size |
+| `--sustained D` | off | Thermal test, e.g. `30s`, `5m`, `1h` |
+| `--sustained-window N` | `5.0` | Sampling window for the thermal test |
+| `--sustained-workers N` | all cores | Load processes for the thermal test |
+| `--compare` | — | Show ranked table of past runs and exit |
+| `--all-runs` | off | With `--compare`, show every run |
+| `--html` | off | Also write a self-contained HTML report |
+| `--json-stdout` | off | Print full payload as JSON |
+| `--output-dir D` | `results` | Output location |
+| `--no-save` | off | Write no files |
+| `--no-native` | off | Skip the C engine |
+| `--force` | off | Run despite distorting machine state |
 
-Examples:
-
-```bash
-python3 benchmark.py --seconds 5 --repeats 5      # more stable numbers
-python3 benchmark.py --quick                      # ~15s smoke test
-python3 benchmark.py --only cpu_int,cpu_multi     # CPU only
-python3 benchmark.py --json-stdout --no-save      # pipe JSON elsewhere
-```
+Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
+`memory`, `cache_sweep`, `disk`.
 
 ## What each test measures
 
-| Test | Unit | What it stresses |
-|------|------|------------------|
-| **CPU Integer** | primes/s | Integer ALU, branch prediction (primality testing) |
-| **CPU Float** | iters/s | FPU / libm (`sin`/`cos`/`sqrt` in a tight loop) |
-| **CPU Multi-core** | primes/s | All logical cores in parallel + scaling factor vs. 1 core |
-| **Memory** | MB/s | Memory copy bandwidth (large buffer `memmove`) |
-| **Disk** | MB/s | Sequential write (with `fsync`) and read on a real file |
+| Test | Unit | Stresses |
+|------|------|----------|
+| CPU Integer | primes/s | Integer ALU, branch prediction |
+| CPU Float | iters/s | FPU / libm |
+| CPU Multi-core | primes/s | All cores + scaling factor |
+| Compression | MB/s | zlib round-trip (mixed real-world load) |
+| Hashing | MB/s | SHA-256 — reaches hardware crypto (ARM crypto ext., x86 SHA-NI) |
+| JSON parse | MB/s | Parser/allocator throughput |
+| Memory | MB/s | Sustained copy bandwidth |
+| Cache sweep | MB/s | Bandwidth vs. working-set size → cache tiers |
+| Disk | MB/s + IOPS | Sequential write/read **and** 4 KiB random reads |
 
-### Reliability notes
+The native engine adds **multi-threaded CPU** and **pointer-chase memory
+latency**, which maps the cache hierarchy precisely:
 
-- Each test runs multiple **repeats** and reports the **median** plus standard
-  deviation — the median resists one-off outliers (e.g. thermal spikes,
-  background load).
-- The disk test **`fsync`s** after writing and best-effort drops the OS page
-  cache before reading (`posix_fadvise` on Linux); read numbers can still be
-  cache-influenced on some platforms, so treat them as a floor.
-- No single failing probe aborts the run — it's recorded as an error in the
-  output and the rest continue.
-
-### The composite score
-
-Every measured rate is normalized against a fixed baseline (baseline = 100),
-and the composite is their geometric mean. The baselines are **arbitrary but
-stable constants**, so a score is comparable across machines and across
-versions of this tool. Higher is better. They are **not** an endorsement of any
-particular reference machine — just a common yardstick.
-
-## Chip architecture
-
-The tool reports both the raw `platform.machine()` value and a normalized
-**ISA family**, so results from different OSes line up (Windows calls a chip
-`AMD64` where Linux calls it `x86_64` — both map to `x86-64`). Recognized
-families include `x86-64`, `x86-32`, `ARM64`, `ARM32`, `RISC-V 64/32`,
-`PowerPC 64`, `IBM Z`, and `MIPS`. On Linux ARM single-board computers it also
-reads the device-tree model (e.g. `Raspberry Pi 5`).
-
-## The native (C) engine
-
-By default `benchmark.py` looks for `native_engine.c`, compiles it with any
-available `cc`/`clang`/`gcc` (`-O2`), runs it, and shows its numbers under
-"Native (C) Engine". This lets you compare interpreter-level throughput against
-compiler-optimized native code on the same machine. If no compiler is present,
-that section is simply skipped — the Python benchmarks still run.
-
-Build it yourself if you like:
-
-```bash
-# POSIX (macOS / Linux)
-cc -O2 native_engine.c -o native_engine -lm
-
-# Windows, MinGW
-gcc -O2 native_engine.c -o native_engine.exe
-
-# Windows, MSVC (Developer Command Prompt)
-cl /O2 native_engine.c
-
-./native_engine --json --seconds 5 --repeats 5
+```
+   16 KB :    0.92 ns     ← L1
+  256 KB :    3.46 ns     ← L2
+   16 MB :   12.56 ns
+   64 MB :   76.23 ns     ← DRAM
 ```
 
-## Output files
+## Exit codes
 
-- `results/benchmark_<host>_<timestamp>.json` — full structured result per run
-  (system info, every raw sample, native numbers, scores).
-- `results/benchmarks.csv` — one appended row per run; open in any spreadsheet
-  to compare machines side by side.
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `2` | Invalid arguments |
+| `3` | Refused: machine state would distort results (use `--force`) |
+| `4` | **Validation failure — hardware may be unstable** |
+
+## Native engine
+
+Auto-compiled on first run. Build manually if you prefer:
+
+```bash
+cc -O2 native_engine.c -o native_engine -lm -lpthread    # macOS / Linux
+gcc -O2 native_engine.c -o native_engine.exe             # Windows, MinGW
+cl /O2 native_engine.c                                   # Windows, MSVC
+```
+
+No compiler? That section is skipped; everything else still runs.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+64 tests, standard library only.
 
 ## Documentation
 
-Full reference docs live in [`docs/`](docs/README.md):
+Full reference docs in [`docs/`](docs/README.md):
 
-- [architecture.md](docs/architecture.md) — design, execution flow, data model
+- [architecture.md](docs/architecture.md) — design, module layout, data flow
 - [technical.md](docs/technical.md) — methodology, units, statistics, scoring
 - [functions.md](docs/functions.md) — per-function reference
 - [packages.md](docs/packages.md) — dependencies, toolchain, CLI
@@ -152,6 +198,5 @@ Full reference docs live in [`docs/`](docs/README.md):
 
 ## Requirements
 
-- **Python 3.8+** (standard library only; `psutil` optional).
-- A C compiler is **optional** — only needed for the native engine.
-```
+- **Python 3.8+** (standard library only; `psutil` optional for richer detection)
+- A C compiler is **optional** — only for the native engine

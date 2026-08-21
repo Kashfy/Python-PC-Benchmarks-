@@ -1,143 +1,159 @@
 # Architecture
 
-How the PC Benchmark & Diagnostics tool is put together, and why.
+How the tool is put together, and why.
 
-## Overview
-
-The project is deliberately small and dependency-free. It has two executable
-components and a documentation set:
+## Layout
 
 ```
 Python-PC-Benchmarks-/
-├── benchmark.py        # primary tool (Python, stdlib only)
-├── native_engine.c     # optional native engine (C, compiled on demand)
-├── README.md
-├── docs/               # this folder
-└── results/            # generated output (git-ignored)
+├── benchmark.py        # zero-install launcher (python3 benchmark.py)
+├── pyproject.toml      # installable package, `pcbench` entry point
+├── native_engine.c     # optional native engine, compiled on demand
+├── pcbench/
+│   ├── core.py         # timing, statistics, warm-up, validation
+│   ├── system.py       # hardware inventory + volatile machine state
+│   ├── workloads.py    # every benchmark
+│   ├── sustained.py    # thermal / sustained-load mode
+│   ├── scoring.py      # baselines, subscores, composite
+│   ├── report.py       # console / JSON / CSV / HTML output
+│   ├── compare.py      # cross-device ranking from CSV history
+│   ├── native.py       # build + run the C engine
+│   └── cli.py          # argument parsing and orchestration
+├── tests/              # 64 stdlib unittest cases
+└── docs/
 ```
 
-### Two-tier design
+The package split exists so the pieces can be unit tested in isolation:
+`core`, `scoring`, `compare`, and `system.arch_family` are pure functions with
+no I/O, which is where most of the test suite aims.
+
+### Why a package *and* a `benchmark.py` shim
+
+Being able to copy one file onto a strange machine and run it is a genuine
+virtue for this kind of tool, and the package structure would normally cost
+that. [`benchmark.py`](../benchmark.py) preserves it: it inserts the repo root
+on `sys.path` and calls the CLI, so a bare checkout still works with
+`python3 benchmark.py` — no install, no `PYTHONPATH`.
+
+## Two-tier design
 
 ```
-                 ┌──────────────────────────────────────────┐
-                 │              benchmark.py                  │
-                 │  (orchestration, hardware inventory,       │
-                 │   scoring, JSON/CSV output, console UI)    │
-                 └───────────────┬───────────────┬───────────┘
-                                 │               │
-              runs Python        │               │  subprocess + JSON
-              workloads in-proc  │               │
-                                 ▼               ▼
-                    ┌──────────────────┐   ┌──────────────────────┐
-                    │  Python workloads │   │   native_engine.c     │
-                    │  cpu/mem/disk     │   │ compiled with cc -O2  │
-                    │  + multiprocessing│   │ (compiler-optimized)  │
-                    └──────────────────┘   └──────────────────────┘
+                 ┌────────────────────────────────────────────┐
+                 │                  cli.py                     │
+                 │  orchestration · state guard · payload      │
+                 └───────┬────────────────────────┬───────────┘
+                         │                        │
+      in-process         │                        │  subprocess + JSON
+      Python workloads   ▼                        ▼
+        ┌────────────────────────┐   ┌──────────────────────────┐
+        │  workloads.py           │   │  native_engine.c          │
+        │  cpu · memory · disk    │   │  cc -O2                   │
+        │  real-world · sweep     │   │  threads · pointer chase  │
+        │  multiprocessing pool   │   │                           │
+        └────────────────────────┘   └──────────────────────────┘
 ```
 
-`benchmark.py` is the **control plane**: it detects hardware, runs the Python
-workloads, optionally shells out to the compiled C engine, normalizes
-everything into scores, and writes the reports. `native_engine.c` is an
-**optional data plane** that produces compiler-optimized numbers for the same
-workloads so you can compare interpreter-level throughput against native code
-on the same machine.
+`cli.py` is the control plane. The C engine is an optional data plane that
+measures two things Python cannot express meaningfully:
+
+- **True multi-threaded scaling** — real threads with no GIL and no process
+  spawn cost, showing the hardware's parallel ceiling.
+- **Memory latency** — a dependent-load pointer chase. An L1 hit is ~1 ns while
+  CPython's overhead per bytecode is tens of ns, so in Python the signal is
+  buried; in C the L1/L2/L3/DRAM steps are unmistakable.
 
 ## Design principles
 
-1. **Zero required dependencies.** `benchmark.py` imports only the standard
-   library, so it drops onto any machine with Python 3.8+ and runs. `psutil`
-   is used *if present* but never required. A C compiler is *optional* — its
-   absence just skips the native section.
+1. **Zero required dependencies.** Standard library only. `psutil` is used when
+   present but never required; a C compiler is optional.
 
-2. **Portable by construction.** Every OS-specific probe has a branch for
-   Windows, macOS, and Linux, and a graceful fallback if all else fails. The
-   C engine has `#if defined(_WIN32)` branches for timing and temp files so it
-   builds on MSVC/MinGW as well as POSIX.
+2. **Portable by construction.** Every OS-specific probe branches for Windows,
+   macOS, and Linux with a fallback. The C engine has `_WIN32` branches for
+   timing, threads, and temp files.
 
-3. **Fail soft, never abort.** Each benchmark is wrapped so that one failing
-   probe (e.g. disk full) is recorded as an `{"error": ...}` entry while the
-   rest of the run continues.
+3. **Fail soft.** One failing probe is recorded as an error entry; the run
+   continues.
 
-4. **Comparable, stable numbers.** Results are reported in real units and
-   normalized against fixed baseline constants, so a score means the same
-   thing across machines and across versions of the tool.
+4. **Refuse to produce misleading numbers.** Two mechanisms:
+   - the **state guard** stops a run that would be distorted by battery power
+     or existing load (exit 3),
+   - **validation** treats a wrong computed answer as a hardware finding
+     (exit 4), not a crash.
+
+5. **Report honestly.** Where a measurement can't be trusted — e.g. the page
+   cache could not be bypassed on this platform — the output says so rather
+   than presenting the number as clean.
 
 ## Execution flow
 
-`main()` in `benchmark.py` drives the whole run:
-
 ```
 parse_args()
+   ├─ --compare?  → render CSV history and exit
+   ├─ --quick presets, validate --only/--skip, parse --sustained duration
    │
-   ├─ apply --quick preset if set
-   ├─ validate --only test list
-   ├─ create the disk scratch directory
-   │
-gather_system_info()          ← hardware / OS / arch inventory
+inventory() + machine_state() + state_warnings()
+   └─ warnings and not --force  → print and exit 3
    │
 for each selected test:
-   runners[name]()            ← bench_cpu_integer / _float / _multicore /
-   │                             bench_memory / bench_disk
-   └─ exceptions captured as {"error": ...}
+     runners[name]()
+       ├─ ValidationError → {"validation_failed": True}   (exit 4 later)
+       └─ Exception       → {"error": ...}                (run continues)
    │
-run_native_engine()           ← compile (if stale) + run native_engine.c,
-   │                             parse its JSON  (unless --no-native)
-compute_scores()              ← normalize rates vs. BASELINES, geometric mean
+native.run()            unless --no-native
+run_sustained()         if --sustained
+compute_scores()        normalize vs BASELINES, geometric mean
    │
-build `payload` dict
-   │
-   ├─ --json-stdout → print payload as JSON
-   └─ else          → print_console_report()
-   │
-unless --no-save:
-   ├─ save_json()             ← results/benchmark_<host>_<ts>.json
-   └─ append_csv()            ← results/benchmarks.csv
+build payload  →  console report | --json-stdout
+   └─ save_json() · append_csv() · save_html()
 ```
 
 ## Data model
 
-Every run produces a single `payload` dictionary, which is exactly what lands
-in the JSON file:
+One `payload` dict per run, written verbatim to JSON:
 
 ```jsonc
 {
-  "tool": "pc-benchmark",
-  "version": "2.0",
-  "timestamp_utc": "2026-08-21T01:11:19Z",
-  "config":  { "seconds": 3.0, "repeats": 3, "tests": [...], ... },
-  "system":  { "os": "...", "arch_family": "ARM64", "cpu_model": "...", ... },
-  "results": { "cpu_int": {...}, "cpu_float": {...}, "memory": {...}, ... },
-  "native":  { "engine": "native-c", "results": [ ... ] } | null,
-  "scores":  { "subscores": { ... }, "composite": 576.4 }
+  "tool": "pcbench", "version": "3.0",
+  "timestamp_utc": "2026-08-21T02:08:29Z",
+  "config":    { "seconds": 3.0, "repeats": 3, "tests": [...] },
+  "system":    { "arch_family": "ARM64", "cpu_model": "Apple M4", ... },
+  "state":     { "on_ac_power": true, "load_average": [...], "thermal": "..." },
+  "warnings":  [],
+  "results":   { "cpu_int": {...}, "disk": {...}, "cache_sweep": {...} },
+  "native":    { "results": [...], "latency": [...] },
+  "sustained": { "peak_rate": ..., "droop_percent": 13.4, ... },
+  "scores":    { "subscores": {...}, "composite": 349.0 }
 }
 ```
 
-The CSV is a **flattened projection** of the same payload: one row per run with
-the headline rate for each test plus the composite score, for spreadsheet
-comparison across many machines.
+The CSV is a **flattened projection** of that payload — one row per run.
+Because the schema grew in v3, `append_csv` compares the existing header and
+archives a mismatched file to `benchmarks.csv.v2.bak` rather than appending
+misaligned rows.
 
 ## Cross-process concerns
 
-The multi-core CPU test uses `multiprocessing` with the **`spawn`** start
-method explicitly (`mp.get_context("spawn")`) so behavior is identical on
-macOS, Windows, and Linux. Because `spawn` re-imports the module in each
-worker, the worker function (`_multicore_worker`) is defined at **module top
-level** and is picklable, and `mp.freeze_support()` is called under
-`__main__` for Windows/frozen builds. Each worker times *itself* for the
-target duration rather than sharing a clock, avoiding cross-process
-`perf_counter` epoch differences.
+The multi-core test uses the **`spawn`** start method explicitly so behavior is
+identical on all three platforms. `spawn` re-imports the module in each worker,
+so `_multicore_worker` lives at module top level and stays picklable, and
+`mp.freeze_support()` runs under `__main__` for frozen Windows builds. Each
+worker times *itself* — `perf_counter` epochs are per-process, so a shared
+deadline would be meaningless.
 
-## Native engine integration contract
+The sustained mode creates its pool **once** and reuses it across sampling
+windows, so spawn cost isn't charged to the measurement and the load stays
+continuous — a pause between windows would let the chip cool and mask the
+throttling the test exists to find.
 
-`run_native_engine()` and `native_engine.c` agree on a small contract:
+## Native engine contract
 
-- Python invokes: `native_engine[.exe] --json --seconds N --repeats M`.
-- The engine prints a single JSON object to **stdout** with an `engine` field
-  and a `results` array of `{name, unit, rate, stdev}` objects.
-- Non-zero exit or unparseable output is captured as an error and reported,
-  never fatal.
-- The binary is rebuilt only when missing or older than the `.c` source
-  (mtime check), so repeated runs are fast.
+- Python invokes `native_engine[.exe] --json --seconds N --repeats M --threads T`.
+- The engine prints one JSON object with `results` (array of
+  `{name, unit, rate, stdev}`), `latency` (array of `{label, bytes, ns}`), and
+  `validated`.
+- Non-zero exit or unparseable output becomes an `{"error": ...}` entry — never
+  fatal.
+- The binary rebuilds only when missing or older than the source.
 
-See [functions.md](functions.md) for the per-function reference and
-[technical.md](technical.md) for measurement methodology.
+See [functions.md](functions.md) for the API and [technical.md](technical.md)
+for methodology.
