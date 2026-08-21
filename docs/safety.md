@@ -101,6 +101,25 @@ The only files removed are:
 This is covered by tests asserting that a file named
 `my_important_data.bin` sitting in the same directory is left untouched.
 
+## The optional-package installer
+
+`install.py` is the one part of this project that downloads and runs code from
+the internet, so it is deliberately conservative:
+
+| Property | Behaviour |
+|----------|-----------|
+| **Never automatic** | Nothing is installed unless you run `install.py` yourself and confirm at the prompt. The benchmark never installs anything. |
+| **Shows its work first** | Prints every package, its purpose, and its approximate size before asking. `--list` previews without installing. |
+| **Isolated by default** | Creates a project-local `./.venv`. Your system Python is untouched unless you pass `--here`. |
+| **Standard sources only** | Plain `pip install <name>` from PyPI. No custom indexes, no scripts fetched and executed, no `sudo`. |
+| **Failure is contained** | Packages install one at a time, so an unavailable wheel (`pyopencl` on some platforms) does not abort the rest — and a failed tier simply stays unavailable. |
+
+Packages are ordinary, widely used libraries: numpy, scipy, cryptography,
+psutil and similar. Installing them carries the same trust assumption as any
+`pip install` — you are trusting PyPI and those projects. If that is not
+acceptable in your environment, the standard-library core runs without any of
+them and loses nothing else.
+
 ## Privilege and network
 
 - The tool runs as a **normal user**. Nothing requires root.
@@ -144,3 +163,4 @@ is the point; the tool is not what caused it.
 | File deletion | Own `mkstemp` files only; user data verified untouched |
 | Thread/process cleanup | Verified no leaks |
 | Network | Loopback only, no external traffic |
+| Package installs | Opt-in, confirmed, into a venv, from PyPI only |

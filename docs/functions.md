@@ -372,6 +372,164 @@ Human-readable summary with ▲/▼ markers.
 
 ---
 
+## `pcbench.limits` — hardware-safety caps
+
+Prevents the tool harming the machine it measures. See [safety.md](safety.md).
+
+#### `safe_mem_mb(requested_mb, total_ram_bytes) -> (allowed_mb, notice)`
+Clamps the memory buffer to 1/8 of RAM. The test allocates two buffers, so the
+footprint stays under a quarter of RAM — clear of swap, which would stall the
+machine and write heavily to the SSD.
+
+#### `safe_disk_mb(requested_mb, free_bytes, repeats) -> (allowed_mb, notice)`
+Clamps for free-space headroom (1.5x) and cumulative flash wear (16 GB per run
+across all repeats).
+
+#### `total_write_mb(file_mb, repeats) -> int`
+Bytes this run will write, so wear is always disclosed.
+
+#### `thermal_should_abort(thermal) -> (bool, reason)`
+Whether a sustained run should stop early: throttled below 40% of nominal, or
+above 100 °C.
+
+---
+
+## `pcbench.thermal` — temperatures, fans, battery
+
+#### `read(script_dir=".") -> dict`
+Current temperatures in **Celsius**. macOS builds and runs `sensors_engine`
+(unprivileged IOHID); Linux reads `hwmon`/`thermal` plus fan tachometers;
+Windows queries WMI. Returns `{}` when nothing is readable — a temperature is
+never invented.
+
+#### `cpu_celsius(script_dir) -> float | None` · `describe(temps) -> str`
+The headline value, and a one-line summary such as `51.8 °C (normal)`.
+Thresholds: warm at 75 °C, hot at 90 °C.
+
+#### `battery_health() -> dict`
+Charge cycles and capacity against design capacity. macOS reads
+`AppleSmartBattery` via `ioreg`; Linux reads `/sys/class/power_supply`;
+Windows uses WMI.
+
+---
+
+## `pcbench.cores` — per-core scaling analysis
+
+#### `scaling_curve(seconds, max_workers) -> list[dict]`
+Aggregate throughput at 1..N workers with each worker's marginal gain. Rate is
+computed from the workers' own timed duration, not wall time, because pool
+creation grows with worker count and would understate the higher counts.
+
+#### `classify_cores(points) -> dict`
+Reports how far scaling stays near-linear, whether the machine is hybrid, and
+the fast/slow group ratio. **Deliberately does not report exact P/E core
+counts** — see [technical.md](technical.md#core-scaling-analysis) for the
+measurement that showed why.
+
+#### `per_core_map(seconds) -> list[dict] | None`
+Pins a worker to each core for an exact measurement. Returns `None` on macOS,
+which exposes no thread-affinity API.
+
+#### `analyze(seconds, max_workers) -> dict`
+Curve, classification, and per-core map together.
+
+---
+
+## `pcbench.sysbench` — compilation, OS latency, CPU frequency
+
+#### `bench_compile(repeats) -> dict`
+Times a full C compile at `-O2` of a fixed source. One untimed compile runs
+first so the compiler and headers are cached; otherwise the first result
+measures the filesystem.
+
+#### `bench_syscall_latency(iterations) -> float`
+Nanoseconds per trivial syscall (`os.getpid`, which CPython does not cache).
+
+#### `bench_context_switch(iterations) -> float`
+Nanoseconds per thread context switch, via a two-thread ping-pong.
+
+#### `bench_process_spawn(iterations) -> float`
+Milliseconds to create and reap a child process.
+
+#### `bench_latency_suite() -> dict` · `cpu_frequency_mhz() -> float | None`
+All latency figures together, and the live clock where the OS exposes it
+(Linux `cpufreq`, Windows WMI; `None` on Apple silicon without root).
+
+---
+
+## `pcbench.optional` — optional-package registry
+
+The single source of truth for tiers, consumed by `install.py` and mirrored by
+the `pyproject.toml` extras.
+
+#### `TIERS: dict` · `HEAVY: list[Package]`
+Tier definitions, each package carrying its import name, pip name, purpose,
+approximate size, and whether it is critical to its tier.
+
+#### `status() -> dict`
+Which packages are installed, per tier, with `complete` and `usable` flags.
+
+#### `missing(tier_names=None) -> list[Package]` · `have(module) -> bool`
+What still needs installing, and a cheap availability check used by benchmark
+modules before importing. Uses `find_spec`, so heavyweight packages are never
+imported merely to test for them.
+
+#### `version_of(module) -> str | None` · `summary_line() -> str`
+
+---
+
+## `pcbench.numeric` — BLAS / LAPACK (needs numpy, scipy)
+
+#### `bench_matmul(seconds, repeats) -> dict`
+Dense N x N multiply (2*N^3 FLOPs) in FP64 and FP32 through the platform BLAS,
+which it names. The headline rate is FP64.
+
+#### `bench_fft(seconds, repeats) -> dict`
+Complex FFT throughput (~5*N*log2 N FLOPs) — memory-bound rather than
+arithmetic-bound, so it probes a different limit from matmul.
+
+#### `bench_lapack(seconds) -> dict`
+Cholesky, SVD, and eigenvalue decompositions per second.
+
+#### `run(seconds, repeats) -> dict` · `extract_rates(payload) -> dict`
+
+---
+
+## `pcbench.cryptobench` — hardware crypto and modern codecs
+
+#### `bench_aes(seconds, repeats) -> dict`
+AES-256-GCM throughput via OpenSSL, which dispatches to AES-NI or the ARMv8
+crypto extensions. Validates an encrypt/decrypt round trip first.
+
+#### `bench_zstd` · `bench_lz4` · `bench_blake3`
+Zstandard and LZ4 throughput with compression ratios, and BLAKE3 hashing. Each
+validates a round trip or digest before timing.
+
+#### `run(seconds, repeats) -> dict` · `extract_rates(payload) -> dict`
+Individual failures are captured per codec, so one missing package never loses
+the others.
+
+---
+
+## `pcbench.gpucompute` — cross-platform GPU (needs pyopencl)
+
+#### `devices() -> list[dict]`
+Enumerates OpenCL devices — name, platform, type, compute units, memory, clock
+— without benchmarking them.
+
+#### `run(seconds) -> dict`
+Benchmarks every OpenCL device: FMA throughput in GFLOPS and copy bandwidth in
+MB/s, using kernels mirroring the Metal engine so the numbers are comparable.
+Cross-validated on an M4: Metal 2,369 GFLOPS vs OpenCL 2,281.
+
+#### `nvidia_telemetry() -> list[dict]`
+NVIDIA temperature, power draw, fan, VRAM, and utilisation via `pynvml`. Each
+metric is fetched independently so a card omitting one does not lose the rest.
+
+#### `extract_rates(payload) -> dict`
+
+---
+
 ## `pcbench.cli`
 
 #### `build_parser() -> ArgumentParser` · `main(argv=None) -> int` · `entry()`

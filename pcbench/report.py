@@ -334,6 +334,74 @@ def print_accelerators(inv: dict | None, accel: dict | None) -> None:
         print(f"  note: {note}")
 
 
+def print_numeric(n: dict | None) -> None:
+    """BLAS/LAPACK results — the CPU's real numeric ceiling."""
+    if not n or not n.get("available"):
+        return
+    hr("Numerics — BLAS / LAPACK (numpy, scipy)")
+    mm = n.get("matmul") or {}
+    if mm.get("rate"):
+        _row("Matrix multiply FP64", fmt(mm["fp64"]),
+             f" GFLOPS  (N={mm.get('matrix_n')})")
+        _row("Matrix multiply FP32", fmt(mm["fp32"]), " GFLOPS")
+        if mm.get("blas"):
+            print(f"      BLAS: {mm['blas']}")
+    fft = n.get("fft") or {}
+    if fft.get("rate"):
+        _row("FFT", fmt(fft["rate"]),
+             f" GFLOPS  ({fft.get('points', 0):,} points)")
+    lp = n.get("lapack") or {}
+    if lp.get("rate") and not lp.get("skipped"):
+        _row("Cholesky", fmt(lp["cholesky_per_s"]), " /s")
+        _row("SVD", fmt(lp["svd_per_s"]), " /s")
+        _row("Eigenvalues", fmt(lp["eigenvalues_per_s"]), " /s")
+
+
+def print_crypto(c: dict | None) -> None:
+    if not c or not c.get("available"):
+        return
+    hr("Crypto & Compression")
+    for key, label in (("aes", "AES-256-GCM"), ("zstd", "Zstandard"),
+                       ("lz4", "LZ4"), ("blake3", "BLAKE3")):
+        e = c.get(key)
+        if not isinstance(e, dict):
+            continue
+        if e.get("error"):
+            _row(label, "FAILED", f"  {e['error'][:44]}")
+            continue
+        suffix = " MB/s"
+        if e.get("ratio"):
+            suffix += f"   ({e['ratio']}x compression)"
+        elif key == "aes":
+            suffix += "   (hardware AES)"
+        _row(label, fmt(e["rate"]), suffix)
+
+
+def print_opencl(g: dict | None) -> None:
+    if not g:
+        return
+    if not g.get("available"):
+        if g.get("nvidia"):
+            hr("GPU telemetry (NVIDIA)")
+            for d in g["nvidia"]:
+                _kv(d.get("name", f"GPU {d.get('index')}"),
+                    ", ".join(f"{k}={v}" for k, v in d.items()
+                              if k not in ("name", "index")))
+        return
+    hr("GPU compute — OpenCL (cross-platform)")
+    for d in g.get("devices", []):
+        if d.get("error"):
+            _row(d.get("name", "?"), "FAILED", f"  {d['error'][:44]}")
+            continue
+        _row(d["name"], fmt(d.get("fp32_gflops")),
+             f" GFLOPS  ({d.get('compute_units')} CUs, "
+             f"{d.get('bandwidth_mb_s', 0):,.0f} MB/s)")
+    for d in g.get("nvidia", []):
+        bits = [f"{k}={v}" for k, v in d.items()
+                if k not in ("name", "index")]
+        _kv(d.get("name", f"GPU {d.get('index')}"), ", ".join(bits))
+
+
 def print_npu_onnx(npu: dict | None) -> None:
     """Cross-vendor NPU results from ONNX Runtime execution providers."""
     if not npu:
@@ -481,6 +549,9 @@ def print_report(payload: dict) -> None:
     print_results(payload["results"])
     print_native(payload.get("native"))
     print_accelerators(payload.get("accelerators"), payload.get("accel"))
+    print_numeric(payload.get("numeric"))
+    print_crypto(payload.get("crypto"))
+    print_opencl(payload.get("opencl"))
     print_npu_onnx(payload.get("npu_onnx"))
     print_ai(payload.get("ml_framework"))
     print_network(payload.get("network"))

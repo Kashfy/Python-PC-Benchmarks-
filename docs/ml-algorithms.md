@@ -8,8 +8,15 @@ The tool measures ML at three levels:
 | Tier | Module | Dependencies | Answers |
 |------|--------|--------------|---------|
 | **1. Pure Python** | `mlbench.py` | none | What can this machine do out of the box? |
-| **2. Accelerator** | `npu.py`, `accel_engine.m` | onnxruntime / Apple frameworks | Does the NPU/GPU work, and is it faster? |
-| **3. Framework** | `mlframework.py` | PyTorch (optional) | What does a real ML stack achieve? |
+| **2. Numeric** | `numeric.py` | numpy, scipy | What can the CPU do through a real BLAS? |
+| **3. Accelerator** | `npu.py`, `accel_engine.m`, `gpucompute.py` | onnxruntime / Apple frameworks / pyopencl | Does the NPU/GPU work, and is it faster? |
+| **4. Framework** | `mlframework.py` | PyTorch (optional) | What does a real ML stack achieve? |
+
+**Why more than one tier.** Tier 1 measures CPython, not silicon: on an Apple
+M4 it reaches ~113 MFLOPS while the same chip does ~450 GFLOPS FP64 through
+BLAS. Tier 1 numbers are still directly comparable *between* machines running
+the same Python, which is what makes them useful; the higher tiers show what
+the hardware can actually do.
 
 ---
 
@@ -421,6 +428,41 @@ forward only under `torch.no_grad()`, which skips building the gradient graph.
 
 ---
 
+## Tier 2 — BLAS numerics
+
+## 8. Dense matrix multiply, FFT, and LAPACK
+
+**File:** `pcbench/numeric.py` · **Requires:** numpy (scipy for LAPACK)
+
+Every algorithm above ultimately reduces to linear algebra, so measuring it
+directly — through the platform's tuned BLAS — gives the CPU's real numeric
+ceiling.
+
+**Matrix multiply.** A dense N x N product is `2·N³` FLOPs:
+
+```
+Cᵢⱼ = Σₖ Aᵢₖ · Bₖⱼ
+```
+
+Measured at N = 1536 in FP64 and FP32. The BLAS in use is named in the report
+(Accelerate, OpenBLAS, or MKL).
+
+**FFT.** An N-point complex transform costs about `5·N·log₂N` FLOPs. Unlike
+matrix multiply it is bound by memory access rather than arithmetic, so it
+probes a different limit.
+
+**LAPACK decompositions** — the operations behind regression, PCA, and
+simulation:
+
+| Routine | Computes | Used for |
+|---------|----------|----------|
+| Cholesky | `A = L·Lᵀ` for symmetric positive-definite `A` | Solving systems ~2x faster than general factorization |
+| SVD | `A = U·Σ·Vᵀ` | PCA, least squares, recommendation systems |
+| Eigenvalues | `A·v = λ·v` | Stability analysis, vibration, PCA |
+
+The test matrix is made symmetric positive-definite (`A·Aᵀ + n·I`) because
+Cholesky requires it and it keeps the eigenvalue problem well-conditioned.
+
 ## Summary
 
 | # | Algorithm | Type | Measures | Tier |
@@ -432,6 +474,7 @@ forward only under `torch.no_grad()`, which skips building the gradient graph.
 | 5 | MatMul stack | Inference | Any vendor NPU/GPU | ONNX Runtime |
 | 6 | Dense GEMM | Raw compute | GPU matrix throughput | Metal |
 | 7 | CNN training | Supervised, training | Real framework training | PyTorch |
+| 8 | GEMM / FFT / LAPACK | Raw numerics | CPU's real BLAS ceiling | numpy, scipy |
 
 Every Tier 1 workload validates its own output — loss decreasing, clusters
 converging, points being their own nearest neighbour — so a wrong answer is

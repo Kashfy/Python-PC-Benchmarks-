@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcbench"
-version = "7.0"
+version = "8.0"
 description = "Cross-platform PC benchmark and diagnostics tool"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -28,7 +28,23 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Slightly richer hardware detection; the tool falls back to native OS probes.
+# Tiers mirror pcbench/optional.py and install.py. None are required: the
+# standard-library core runs without any of them.
+compute = ["numpy>=1.24", "scipy>=1.10", "numba>=0.58"]
+gpu = ["pyopencl>=2023.1", "nvidia-ml-py>=12.0"]
+crypto = ["cryptography>=41.0", "zstandard>=0.21", "lz4>=4.0", "blake3>=0.4"]
+system = ["psutil>=5.9", "py-cpuinfo>=9.0", "rich>=13.0",
+          "matplotlib>=3.7", "scikit-learn>=1.3"]
+# Large and hardware-specific; install deliberately.
+ml = ["torch>=2.0", "onnxruntime>=1.16"]
+all = [
+    "numpy>=1.24", "scipy>=1.10", "numba>=0.58",
+    "pyopencl>=2023.1", "nvidia-ml-py>=12.0",
+    "cryptography>=41.0", "zstandard>=0.21", "lz4>=4.0", "blake3>=0.4",
+    "psutil>=5.9", "py-cpuinfo>=9.0", "rich>=13.0",
+    "matplotlib>=3.7", "scikit-learn>=1.3",
+]
+# Backwards-compatible alias for the previous single extra.
 extras = ["psutil>=5.9"]
 
 [project.scripts]

@@ -196,6 +196,39 @@ sudo chown -R $(whoami) results
 Or write elsewhere with `--output-dir ~/bench-results`, or skip saving with
 `--no-save`.
 
+## A package failed to install
+
+The installer installs one package at a time precisely so this is not fatal —
+everything else still installs, and pcbench skips whatever is absent.
+
+**`pyopencl`** is the usual culprit: it often has no prebuilt wheel and needs
+system OpenCL headers.
+
+```bash
+# Debian / Ubuntu
+sudo apt install opencl-headers ocl-icd-opencl-dev
+# Fedora
+sudo dnf install opencl-headers ocl-icd-devel
+# macOS: OpenCL ships with the OS; no extra packages needed
+```
+
+**`numba`** pins specific numpy versions and can conflict; it is optional
+within its tier, so `numpy` and `scipy` alone still give you BLAS and LAPACK.
+
+Retry a single tier with `python3 install.py --tier compute`.
+
+## Optional benchmarks do not appear after installing
+
+The packages went into `./.venv`, but you are running the system Python. Use
+the environment's interpreter:
+
+```bash
+.venv/bin/python benchmark.py          # macOS / Linux
+.venv\Scripts\python.exe benchmark.py   # Windows
+```
+
+Confirm what the tool can see with `python3 install.py --list`.
+
 ## Temperature shows "unavailable"
 
 | Platform | Requirement |

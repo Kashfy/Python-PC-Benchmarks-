@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from . import __version__
 from . import accel as accel_mod
 from . import cores as cores_mod
+from . import cryptobench
+from . import gpucompute
+from . import numeric
+from . import optional
 from . import mlbench
 from . import mlframework
 from . import npu as npu_mod
@@ -123,6 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip run-over-run regression detection")
     g.add_argument("--regression-threshold", type=float, default=10.0,
                    help="Percent change that counts as a regression")
+
+    g.add_argument("--no-optional", action="store_true",
+                   help="Skip all benchmarks that need optional packages")
 
     g = p.add_argument_group("other")
     g.add_argument("--no-native", action="store_true",
@@ -360,6 +367,33 @@ def main(argv=None) -> int:
             print("  measuring power ...", flush=True)
         power_info = power.measure_under_load(info.get("cpu_model", ""))
 
+    # Optional-package tiers: BLAS numerics, hardware crypto, OpenCL GPU.
+    # Each is skipped silently when its packages are absent.
+    numeric_result = crypto_result = opencl_result = None
+    if not args.no_optional:
+        if numeric.available()["numpy"]:
+            if not quiet:
+                print("  running BLAS/LAPACK numerics ...", flush=True)
+            numeric_result = numeric.run(min(args.seconds, 1.5),
+                                         max(1, min(args.repeats, 2)))
+            for key, value in numeric.extract_rates(numeric_result).items():
+                results[key] = {"rate": value}
+
+        if any(cryptobench.available().values()):
+            if not quiet:
+                print("  running crypto / compression ...", flush=True)
+            crypto_result = cryptobench.run(min(args.seconds, 1.0),
+                                            max(1, min(args.repeats, 2)))
+            for key, value in cryptobench.extract_rates(crypto_result).items():
+                results[key] = {"rate": value}
+
+        if not args.no_gpu and gpucompute.available()["pyopencl"]:
+            if not quiet:
+                print("  running OpenCL GPU compute ...", flush=True)
+            opencl_result = gpucompute.run(min(args.seconds, 1.5))
+            for key, value in gpucompute.extract_rates(opencl_result).items():
+                results[key] = {"rate": value}
+
     # Cross-vendor NPU via ONNX Runtime (Intel / AMD / Qualcomm / DirectML).
     npu_result = None
     if not args.no_accel and not args.no_npu:
@@ -403,6 +437,10 @@ def main(argv=None) -> int:
         "accel": accel,
         "ml_framework": ml,
         "npu_onnx": npu_result,
+        "numeric": numeric_result,
+        "crypto": crypto_result,
+        "opencl": opencl_result,
+        "optional_packages": optional.status(),
         "network": net,
         "power": power_info,
         "perf_per_watt": ppw,

@@ -65,6 +65,34 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `struct` | Packing weights into the Core ML and ONNX protobufs |
 | `glob` | Sensor, power-supply, and hwmon enumeration |
 
+## Optional package tiers
+
+The core is standard-library only. Optional tiers lift ceilings the standard
+library genuinely cannot:
+
+```bash
+python3 install.py --list          # what exists and what is installed
+python3 install.py                 # all tiers, into ./.venv, after confirming
+python3 install.py --tier compute  # one tier only
+python3 install.py --here          # current interpreter instead of a venv
+```
+
+Or with pip extras: `pip install -e ".[compute]"` … `".[all]"`.
+
+| Tier | Packages | Unlocks |
+|------|----------|---------|
+| `compute` | numpy, scipy, numba | BLAS matmul (FP64/FP32), FFT, LAPACK SVD/Cholesky/eigenvalues |
+| `gpu` | pyopencl, nvidia-ml-py | GPU compute on NVIDIA/AMD/Intel/Apple; NVIDIA temp, power, VRAM |
+| `crypto` | cryptography, zstandard, lz4, blake3 | AES-256-GCM via AES-NI, modern compression and hashing |
+| `system` | psutil, py-cpuinfo, rich, matplotlib, scikit-learn | Sensors on Windows/Linux, charts, tables, reference ML |
+
+**Why a venv by default.** Installing into a system interpreter risks
+permission problems and leaves packages that are awkward to remove. The
+installer creates `./.venv`, prints exactly what it will install and the
+approximate size, and does nothing until you confirm. Packages are installed
+one at a time so a single unavailable wheel — `pyopencl` has none on some
+platforms — does not abort the batch.
+
 ## Optional dependency: an ML framework (AI tier only)
 
 The AI training/inference benchmark uses **PyTorch** if installed, or **ONNX
@@ -214,6 +242,7 @@ Apple-only (Metal + Core ML); see
 | `--no-power` | off | Skip power / perf-per-watt |
 | `--no-network` | off | Skip the loopback network benchmark |
 | `--no-regression` | off | Skip run-over-run regression detection |
+| `--no-optional` | off | Skip every benchmark that needs an optional package |
 | `--regression-threshold P` | `10` | Percent change counting as a regression |
 
 For real measured power on macOS, run the whole tool with `sudo`.
@@ -260,7 +289,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-185 cases, standard library only — no pytest, no test dependencies.
+204 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

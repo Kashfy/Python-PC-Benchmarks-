@@ -104,6 +104,51 @@ See [ml-algorithms.md](ml-algorithms.md) for how each algorithm actually works.
 
 ---
 
+## Numerical computing
+
+| Term | Stands for | What it means |
+|------|-----------|---------------|
+| **BLAS** | **B**asic **L**inear **A**lgebra **S**ubprograms | The standard low-level matrix/vector library. Every platform ships a tuned one — Accelerate on macOS, OpenBLAS or MKL elsewhere — and nearly all numeric performance rests on it. |
+| **LAPACK** | **L**inear **A**lgebra **PACK**age | Higher-level routines built on BLAS: solving systems, decompositions, eigenvalues. |
+| **SVD** | **S**ingular **V**alue **D**ecomposition | Factors a matrix into rotation–scale–rotation. Underlies PCA, recommendation systems, and least-squares fitting. |
+| **Cholesky** | (named after André-Louis Cholesky) | Factors a symmetric positive-definite matrix into `L·Lᵀ`. About twice as fast as general factorization, so it is preferred wherever it applies. |
+| **Eigenvalues** | — | The scaling factors along a matrix's characteristic directions. Central to stability analysis, vibration, and PCA. |
+| **FFT** | **F**ast **F**ourier **T**ransform | Converts a signal between time and frequency. Costs ~5·N·log₂N operations and is memory-bound rather than arithmetic-bound, so it stresses a different limit from matrix multiply. |
+| **SPD** | **S**ymmetric **P**ositive-**D**efinite | A matrix property required by Cholesky and one that makes eigenvalue problems well-conditioned. |
+| **FP32 / FP64** | 32- / 64-bit **f**loating **p**oint | Single and double precision. FP64 is more accurate and usually slower; consumer GPUs are often far weaker at it. |
+| **JIT** | **J**ust-**I**n-**T**ime compilation | Compiling code at runtime rather than ahead of time. What `numba` does to Python. |
+
+---
+
+## Cryptography and compression
+
+| Term | Stands for | What it means |
+|------|-----------|---------------|
+| **AES** | **A**dvanced **E**ncryption **S**tandard | The dominant symmetric cipher. Modern CPUs implement it in hardware. |
+| **GCM** | **G**alois/**C**ounter **M**ode | An AES mode giving both encryption and authentication in one pass. What TLS and disk encryption typically use. |
+| **Zstandard (zstd)** | — | A modern compression codec from 2016 offering far better speed *and* ratio than zlib. |
+| **LZ4** | **L**empel-**Z**iv 4 | A compression codec optimized for raw speed over ratio. |
+| **BLAKE3** | — | A modern cryptographic hash, heavily parallel and much faster than SHA-256 in software. |
+| **Compression ratio** | — | Original size ÷ compressed size. 7.29× means the output is about one-seventh the input. |
+| **Round trip** | — | Compress-then-decompress, or encrypt-then-decrypt. Used here to validate that data survives intact. |
+
+---
+
+## GPU compute and packaging
+
+| Term | Stands for | What it means |
+|------|-----------|---------------|
+| **OpenCL** | **Open** **C**omputing **L**anguage | A vendor-neutral GPU/accelerator compute API implemented by NVIDIA, AMD, Intel, and Apple. How this tool benchmarks GPUs portably. |
+| **Kernel** (GPU) | — | A small program run by thousands of GPU threads at once. Unrelated to an OS kernel. |
+| **CU** | **C**ompute **U**nit | An OpenCL device's independent processing block — roughly a GPU "core cluster". |
+| **Work item / global size** | — | One GPU thread, and the total number launched. |
+| **QD** | **Q**ueue **D**epth | How many I/O requests are outstanding at once. QD1 measures latency; higher depths reveal a drive's real ceiling. |
+| **venv** | **v**irtual **env**ironment | An isolated Python installation. The installer uses one so packages never touch your system Python. |
+| **Wheel** | — | A prebuilt Python package. When none exists for your platform, pip must compile from source, which often fails without system libraries. |
+| **pip extras** | — | Optional dependency groups, e.g. `pip install pcbench[compute]`. |
+
+---
+
 ## AI software stacks
 
 | Term | Stands for | What it means |

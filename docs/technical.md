@@ -519,6 +519,56 @@ crypto instructions that make such a benchmark meaningful — it would measure
 table lookups instead. Reporting nothing is better than reporting the wrong
 thing. SHA-256 already covers hardware crypto.
 
+## Optional-package benchmarks
+
+Three ceilings the standard library cannot lift, and what removes each.
+
+### The interpreter ceiling
+
+Pure-Python arithmetic measures CPython, not silicon. On an Apple M4 the
+Python neural-net benchmark reaches **113 MFLOPS** while a BLAS matrix multiply
+on the same chip reaches **450 GFLOPS FP64 / 1,873 GFLOPS FP32** — a factor of
+several thousand. The Python-tier numbers remain comparable *between* machines,
+but only a real BLAS shows what the hardware can do.
+
+`numpy` calls whatever BLAS the platform ships (Accelerate on macOS, OpenBLAS
+or MKL elsewhere) and the report names it. `scipy` adds LAPACK decompositions —
+SVD, Cholesky, eigenvalues — which stress the BLAS differently from a plain
+multiply: more dependent operations and less regular access, so a machine can
+be strong at one and mediocre at the other.
+
+### The crypto ceiling
+
+There is no AES primitive in the standard library, and a pure-Python
+implementation would never reach AES-NI or the ARMv8 crypto extensions — it
+would measure table lookups. `cryptography` binds to OpenSSL, which does
+dispatch to them: measured here, **AES-256-GCM at 8,794 MB/s**.
+
+Modern codecs matter too. `zlib` dates from 1995; Zstandard achieved
+**910 MB/s at a 7.29x ratio** against zlib's 47 MB/s, and LZ4 **1,020 MB/s** at
+a lower ratio — the speed-versus-ratio trade-off made visible.
+
+### The portable-GPU ceiling
+
+Metal is Apple-only, which is why GPU benchmarking was too. OpenCL is
+implemented by NVIDIA, AMD, Intel, and Apple, so one set of kernels covers all
+of them.
+
+The two paths cross-validate: on the same M4 GPU the native Metal engine
+measured **2,369 GFLOPS** and the OpenCL path **2,281 GFLOPS** — within 4%.
+Two independent implementations agreeing is good evidence the portable path is
+correct on hardware that cannot be tested here.
+
+`pynvml` additionally reports NVIDIA temperature, power draw, VRAM, and
+utilisation, which no portable API exposes.
+
+### Degradation contract
+
+Every optional benchmark obeys the same rules: nothing is imported at module
+load, absence returns `{"available": False, "note": ...}` rather than raising,
+and absent capabilities are **omitted** from the composite rather than scored
+as zero — so a machine without numpy is not penalised for lacking it.
+
 ## Statistics
 
 Each test runs `--repeats` times; the headline `rate` is the **median**, which
