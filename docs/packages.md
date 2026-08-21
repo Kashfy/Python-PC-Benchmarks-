@@ -164,7 +164,11 @@ pcbench [options]          #  or:  python3 benchmark.py [options]
 | `--mem-mb K` | `64` | Memory buffer size |
 
 Test names: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`,
-`json`, `memory`, `cache_sweep`, `disk`, `nn_training`, `kmeans`, `knn`.
+`json`, `memory`, `mem_scaling`, `cache_sweep`, `disk`, `nn_training`,
+`kmeans`, `knn`, `cores`, `compile`, `latency`.
+
+Profiles select curated subsets: `--profile quick|cpu|ai|dev|storage|
+laptop|server`.
 
 The three ML workloads (`nn_training`, `kmeans`, `knn`) need no dependencies —
 they are pure standard library.
@@ -256,7 +260,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-163 cases, standard library only — no pytest, no test dependencies.
+185 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

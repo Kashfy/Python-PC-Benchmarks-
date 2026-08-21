@@ -148,6 +148,18 @@ def print_results(results: dict) -> None:
         scale = f"  →  {r['rate'] / single:.1f}x vs 1 core" if single else ""
         _row(f"Multi-core ({r['workers']} workers)", fmt(r["rate"]),
              f" primes/s{scale}")
+    c = results.get("cores")
+    if isinstance(c, dict) and c.get("points"):
+        cls = c.get("classes", {})
+        _row("Core scaling", f"{c['scaling_factor']}x",
+             f" on {c['logical_cores']} cores")
+        print(f"      {cls.get('note', '')}")
+        peak = max(p["marginal_rate"] for p in c["points"]) or 1
+        for pt in c["points"]:
+            bar = "█" * max(0, int(max(0, pt["marginal_rate"]) / peak * 24))
+            print(f"      {pt['workers']:>2}w  {bar:<24} "
+                  f"{pt['aggregate_rate']:>12,.0f}/s")
+
     _metric(results, "compression", "Compression (zlib)", "MB/s")
     _metric(results, "hashing", "Hashing (SHA-256)", "MB/s")
     _metric(results, "json", "JSON parse", "MB/s")
@@ -160,9 +172,15 @@ def print_results(results: dict) -> None:
         _metric(results, "knn", "K-NN search", "comparisons/s")
 
     # ---- Memory ----
-    if "memory" in results or "cache_sweep" in results:
+    if any(k in results for k in ("memory", "mem_scaling",
+                                  "cache_sweep")):
         _sub("Memory")
         _metric(results, "memory", "Copy bandwidth", "MB/s")
+        ms = results.get("mem_scaling")
+        if isinstance(ms, dict) and ms.get("points"):
+            _row("Peak bandwidth", fmt(ms["rate"]),
+                 f" MB/s at {ms['peak_processes']} procs "
+                 f"({ms['scaling']}x single)")
         sweep = results.get("cache_sweep")
         if isinstance(sweep, dict) and sweep.get("points"):
             print("\n    Bandwidth by working-set size (cache hierarchy):")
@@ -186,6 +204,23 @@ def print_results(results: dict) -> None:
             _row("Sequential write", fmt(r["write_rate"]), " MB/s")
             _row("Sequential read", fmt(r["read_rate"]), " MB/s")
             _row("Random read (4K)", fmt(r["random_read_iops"]), " IOPS")
+            lat = r.get("random_read_latency")
+            if lat:
+                _row("Random read latency", f"{lat['p50_us']:.2f}",
+                     f" us p50   (p99 {lat['p99_us']:.1f} us)")
+            qd = r.get("queue_depth_sweep")
+            if qd and qd.get("points"):
+                print("\n    Random-read IOPS by queue depth "
+                      "(how many requests are in flight):")
+                peak = max(pt["iops"] for pt in qd["points"]) or 1
+                for pt in qd["points"]:
+                    bar = "█" * max(1, int(pt["iops"] / peak * 28))
+                    print(f"      QD{pt['queue_depth']:>2}  {bar:<28} "
+                          f"{pt['iops']:>10,.0f} IOPS")
+                print(f"      peak {qd['peak_iops']:,.0f} IOPS at "
+                      f"QD{qd['peak_queue_depth']} — {qd['scaling']}x the "
+                      f"queue-depth-1 figure\n")
+
             if r.get("total_written_mb"):
                 # Flash wear should never be invisible to the user.
                 print(f"      wrote {r['total_written_mb']:,} MB to storage "
@@ -194,6 +229,32 @@ def print_results(results: dict) -> None:
                 print(f"      safety: {r['safety_notice']}")
             if not r.get("cache_bypassed"):
                 print(f"      note: {r['note']}")
+
+    print_system_bench(results)
+
+
+def print_system_bench(results: dict) -> None:
+    """Compilation and OS latency — how a machine *feels*, not just computes."""
+    comp = results.get("compile")
+    lat = results.get("latency")
+    if not isinstance(comp, dict) and not isinstance(lat, dict):
+        return
+    _sub("System (compilation and OS latency)")
+
+    if isinstance(comp, dict):
+        if comp.get("skipped"):
+            _row("Compile (C, -O2)", "skipped", f"  {comp.get('error', '')[:40]}")
+        else:
+            _row("Compile (C, -O2)", f"{comp['seconds_per_compile']:.3f}",
+                 f" s each  ({comp['rate']:.0f}/min, {comp['compiler']})")
+
+    if isinstance(lat, dict):
+        if lat.get("syscall_ns"):
+            _row("Syscall latency", f"{lat['syscall_ns']:.1f}", " ns")
+        if lat.get("context_switch_ns"):
+            _row("Context switch", f"{lat['context_switch_ns']:,.0f}", " ns")
+        if lat.get("process_spawn_ms"):
+            _row("Process spawn", f"{lat['process_spawn_ms']:.2f}", " ms")
 
 
 def print_native(native: dict | None) -> None:

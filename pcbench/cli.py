@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from . import __version__
 from . import accel as accel_mod
+from . import cores as cores_mod
 from . import mlbench
 from . import mlframework
 from . import npu as npu_mod
@@ -19,6 +20,7 @@ from . import native as native_mod
 from . import network
 from . import power
 from . import regression
+from . import sysbench
 from . import report as report_mod
 from . import workloads as wl
 from .compare import load_history, render_table
@@ -27,9 +29,23 @@ from .scoring import compute_scores
 from .sustained import run_sustained
 from .system import inventory, machine_state, state_warnings
 
-TESTS = ["cpu_int", "cpu_float", "cpu_multi", "compression", "hashing",
-         "json", "memory", "cache_sweep", "disk",
-         "nn_training", "kmeans", "knn"]
+TESTS = ["cpu_int", "cpu_float", "cpu_multi", "cores", "compression",
+         "hashing", "json", "memory", "mem_scaling", "cache_sweep", "disk",
+         "nn_training", "kmeans", "knn", "compile", "latency"]
+
+# Curated subsets for common situations, so a user does not have to know
+# which of sixteen tests matter for their machine.
+PROFILES = {
+    "quick": ["cpu_int", "cpu_multi", "memory", "disk"],
+    "cpu": ["cpu_int", "cpu_float", "cpu_multi", "cores", "compression",
+            "hashing", "json"],
+    "ai": ["cpu_multi", "nn_training", "kmeans", "knn", "memory"],
+    "dev": ["cpu_int", "cpu_multi", "compile", "disk", "latency", "json"],
+    "storage": ["disk"],
+    "laptop": ["cpu_int", "cpu_multi", "cores", "memory", "disk", "latency"],
+    "server": ["cpu_multi", "cores", "memory", "mem_scaling", "disk",
+               "latency", "compression"],
+}
 DEFAULT_TESTS = list(TESTS)
 
 
@@ -48,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Repeats per test (median is reported)")
     g.add_argument("--only", default="",
                    help="Comma-separated subset of: " + ",".join(TESTS))
+    g.add_argument("--profile", default="", metavar="NAME",
+                   help="Preset test selection: " + ", ".join(PROFILES))
     g.add_argument("--skip", default="",
                    help="Comma-separated tests to exclude")
     g.add_argument("--quick", action="store_true",
@@ -164,6 +182,12 @@ def _runners(args, info, disk_dir) -> dict:
         "nn_training": lambda: mlbench.bench_nn_training(s, r),
         "kmeans": lambda: mlbench.bench_kmeans(s, r),
         "knn": lambda: mlbench.bench_knn(s, r),
+        "cores": lambda: cores_mod.analyze(min(s, 0.6),
+                                           info["cpu_cores_logical"]),
+        "mem_scaling": lambda: wl.bench_memory_scaling(
+            min(s, 0.5), 64, info.get("ram_total_bytes", 0)),
+        "compile": lambda: sysbench.bench_compile(max(1, min(r, 3))),
+        "latency": lambda: sysbench.bench_latency_suite(),
     }
 
 
@@ -218,6 +242,14 @@ def main(argv=None) -> int:
         args.seconds, args.repeats, args.disk_mb = 1.0, 2, 64
 
     try:
+        if args.profile:
+            if args.profile not in PROFILES:
+                raise ValueError(
+                    f"unknown profile: {args.profile!r}. "
+                    f"Valid: {', '.join(PROFILES)}")
+            if args.only:
+                raise ValueError("--profile and --only are mutually exclusive")
+            args.only = ",".join(PROFILES[args.profile])
         selected = select_tests(args.only, args.skip)
         sustained_seconds = (parse_duration(args.sustained)
                              if args.sustained else None)

@@ -45,6 +45,11 @@ BASELINES = {
     "nn_training": 400.0,          # MLP training steps/s
     "kmeans": 1_000_000.0,         # point-centroid distances/s
     "knn": 1_000_000.0,            # neighbour comparisons/s
+    # System-level and depth-aware measurements.
+    "disk_iops_peak": 100_000.0,   # peak random-read IOPS across queue depths
+    "mem_scaling": 20_000.0,       # peak multi-process copy bandwidth MB/s
+    "compile": 300.0,              # compiles per minute
+    "syscall": 20_000_000.0,       # syscalls/s (i.e. 50 ns each)
 }
 
 # Which result key and field each score is derived from.
@@ -71,6 +76,10 @@ _SOURCES = [
     ("nn_training", "nn_training", "rate"),
     ("kmeans", "kmeans", "rate"),
     ("knn", "knn", "rate"),
+    ("disk_iops_peak", "disk", "peak_iops"),
+    ("mem_scaling", "mem_scaling", "rate"),
+    ("compile", "compile", "rate"),
+    ("syscall", "latency", "rate"),
 ]
 
 
@@ -101,8 +110,9 @@ def category_scores(subscores: dict) -> dict:
     groups = {
         "cpu": ["cpu_int", "cpu_float", "cpu_multi", "compression",
                 "hashing", "json"],
-        "memory": ["memory"],
-        "disk": ["disk_write", "disk_read", "disk_iops"],
+        "memory": ["memory", "mem_scaling"],
+        "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
+        "system": ["compile", "syscall"],
         "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
                 "gpu_matmul_fp32", "gpu_matmul_fp16"],
         "npu": ["npu", "npu_onnx"],

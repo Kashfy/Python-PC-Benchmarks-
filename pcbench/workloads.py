@@ -275,6 +275,70 @@ def bench_memory(seconds: float, repeats: int, buf_mb: int = 64,
     return out
 
 
+def _memcopy_worker(args) -> int:
+    """Copy a private buffer pair for `seconds`; returns bytes moved.
+
+    Must be module-level to survive pickling under the "spawn" start method.
+    """
+    buf_bytes, seconds = args
+    src = bytearray(b"\xa5") * buf_bytes
+    dst = bytearray(buf_bytes)
+    moved = 0
+    start = clock()
+    while clock() - start < seconds:
+        dst[:] = src
+        moved += buf_bytes
+    return moved
+
+
+def bench_memory_scaling(seconds: float = 0.4, buf_mb: int = 64,
+                         ram_bytes: int = 0) -> dict:
+    """Copy bandwidth as concurrency rises, revealing the memory ceiling.
+
+    A single core rarely saturates a memory controller, so single-threaded
+    bandwidth can understate the machine. Sweeping concurrency shows where the
+    controller — rather than the core — becomes the limit.
+
+    **Processes, not threads.** CPython does not release the GIL during
+    ``bytearray`` slice assignment, so a threaded version serializes: measured
+    here it reported a flat 40 GB/s at every thread count, which is the GIL
+    speaking rather than the memory subsystem. Separate processes contend for
+    real bandwidth.
+    """
+    cores = os.cpu_count() or 1
+    counts = sorted({1, 2, max(1, cores // 2), cores})
+
+    # The buffer must exceed last-level cache or this measures cache, not
+    # memory. Footprint is 2 buffers per process at peak concurrency, so the
+    # per-process size is derived from the total safe budget divided by that.
+    budget_mb, _ = limits.safe_mem_mb(1 << 20, ram_bytes or 0)   # 1/8 of RAM
+    per_proc_mb = max(1, budget_mb // (2 * max(1, cores)))
+    buf_mb = max(32, min(buf_mb, per_proc_mb))
+    n = buf_mb * MB
+
+    ctx = mp.get_context("spawn")
+    points = []
+    for procs in counts:
+        with ctx.Pool(processes=procs) as pool:
+            moved = sum(pool.map(_memcopy_worker, [(n, seconds)] * procs))
+        # Each process ran for `seconds` concurrently, so divide by that
+        # rather than wall time, which would include pool spawn cost.
+        points.append({"processes": procs,
+                       "mb_per_s": round(moved / seconds / MB, 1)})
+
+    peak = max(points, key=lambda p: p["mb_per_s"])
+    single = points[0]["mb_per_s"] or 1
+    return {
+        "unit": "MB/s",
+        "rate": peak["mb_per_s"],
+        "points": points,
+        "peak_processes": peak["processes"],
+        "single_mb_per_s": points[0]["mb_per_s"],
+        "scaling": round(peak["mb_per_s"] / single, 2),
+        "buffer_mb": buf_mb,
+    }
+
+
 # Working-set sizes for the cache sweep. The sweep starts at 128 KB because
 # below that a single copy completes faster than the interpreter overhead of
 # issuing it, which flattens and then inverts the curve — measuring Python
@@ -392,6 +456,8 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
     buf = b"\xc3" * block
     writes, reads, iops = [], [], []
     bypassed = False
+    latency: dict | None = None
+    qd_sweep: dict | None = None
 
     for _ in range(repeats):
         fd, path = tempfile.mkstemp(prefix="pcbench_", suffix=".bin",
@@ -422,6 +488,11 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
 
             # ---- 4 KiB random reads ----
             iops.append(_random_read_iops(fd, total, min(seconds, 2.0)))
+            if latency is None:
+                latency = _random_read_latency(fd, total)
+            if qd_sweep is None:
+                qd_sweep = _queue_depth_sweep(fd, total,
+                                              min(seconds, 1.0))
         except OSError as e:
             return {"skipped": True, "error": f"disk I/O failed: {e}"}
         finally:
@@ -440,6 +511,9 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
         "write_rate": w["median"],
         "read_rate": r["median"],
         "random_read_iops": io["median"],
+        "random_read_latency": latency,
+        "queue_depth_sweep": qd_sweep,
+        "peak_iops": (qd_sweep or {}).get("peak_iops", 0.0),
         "cache_bypassed": bypassed,
         "write": w,
         "read": r,
@@ -480,7 +554,7 @@ def clock_wall() -> float:
 
 
 def _random_read_iops(fd: int, size: int, budget: float) -> float:
-    """4 KiB reads at random offsets; returns operations per second."""
+    """4 KiB reads at random offsets, one at a time (queue depth 1)."""
     page = 4 * KB
     max_off = max(0, size - page)
     rnd = random.Random(4242)
@@ -493,3 +567,97 @@ def _random_read_iops(fd: int, size: int, budget: float) -> float:
                      if max_off else 0)
         ops += 64
     return ops / (clock() - start)
+
+
+def _random_read_latency(fd: int, size: int, samples: int = 3000) -> dict:
+    """Per-operation latency for 4 KiB random reads, in microseconds.
+
+    Tail latency is what users feel: a drive with a good median but a poor p99
+    produces visible stalls. Throughput alone cannot show this.
+    """
+    page = 4 * KB
+    max_off = max(0, size - page)
+    rnd = random.Random(99)
+    times = []
+    for _ in range(samples):
+        offset = rnd.randrange(0, max_off + 1, page) if max_off else 0
+        t0 = clock()
+        os.pread(fd, page, offset)
+        times.append((clock() - t0) * 1e6)
+    times.sort()
+    n = len(times)
+    return {
+        "p50_us": round(times[n // 2], 2),
+        "p99_us": round(times[min(n - 1, int(n * 0.99))], 2),
+        "max_us": round(times[-1], 2),
+    }
+
+
+def _random_read_iops_qd(fd: int, size: int, budget: float,
+                         queue_depth: int) -> float:
+    """4 KiB random reads with ``queue_depth`` requests outstanding.
+
+    Queue depth is the difference between a drive looking mediocre and looking
+    fast. At depth 1 each read waits for the previous one to complete, so the
+    result is bounded by latency rather than the device: an NVMe SSD that
+    sustains hundreds of thousands of IOPS measures only tens of thousands.
+    Real workloads keep many requests in flight, so the depth sweep shows the
+    drive's actual ceiling.
+
+    Threads are used rather than async I/O because ``os.pread`` releases the
+    GIL for the duration of the syscall, so they genuinely overlap.
+    """
+    import threading
+
+    page = 4 * KB
+    max_off = max(0, size - page)
+    stop = threading.Event()
+    counts = [0] * queue_depth
+
+    def reader(slot: int) -> None:
+        rnd = random.Random(1000 + slot)
+        local = 0
+        while not stop.is_set():
+            for _ in range(16):
+                os.pread(fd, page,
+                         rnd.randrange(0, max_off + 1, page) if max_off else 0)
+            local += 16
+        counts[slot] = local
+
+    threads = [threading.Thread(target=reader, args=(i,), daemon=True)
+               for i in range(queue_depth)]
+    start = clock()
+    for t in threads:
+        t.start()
+    # Wait on the event rather than spinning: a busy-wait loop here would hold
+    # the GIL and starve the very reader threads being measured, collapsing
+    # the result to a fraction of the single-threaded figure.
+    stop.wait(budget)
+    stop.set()
+    for t in threads:
+        t.join(timeout=5.0)
+    elapsed = clock() - start
+    return sum(counts) / elapsed if elapsed > 0 else 0.0
+
+
+# Queue depths swept to find where a drive stops scaling.
+QUEUE_DEPTHS = (1, 4, 16, 32)
+
+
+def _queue_depth_sweep(fd: int, size: int, budget: float) -> dict:
+    """Random-read IOPS across increasing queue depths."""
+    points = []
+    for qd in QUEUE_DEPTHS:
+        iops = (_random_read_iops(fd, size, budget) if qd == 1
+                else _random_read_iops_qd(fd, size, budget, qd))
+        points.append({"queue_depth": qd, "iops": round(iops, 1),
+                       "mb_per_s": round(iops * 4 / 1024, 1)})
+    best = max(points, key=lambda p: p["iops"])
+    return {
+        "points": points,
+        "peak_iops": best["iops"],
+        "peak_queue_depth": best["queue_depth"],
+        "qd1_iops": points[0]["iops"],
+        "scaling": (round(best["iops"] / points[0]["iops"], 1)
+                    if points[0]["iops"] else None),
+    }

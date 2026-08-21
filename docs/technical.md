@@ -427,6 +427,98 @@ hardware never drags the composite down. Power and network are reported but
 kept **out** of the composite — power is an efficiency axis, and loopback
 network is a diagnostic rather than a comparative performance metric.
 
+## Core scaling analysis
+
+Aggregate multi-core throughput hides a chip's shape. The tool measures
+aggregate throughput at 1, 2, … N workers and examines the *marginal* gain of
+each added worker.
+
+**What is reported:** how far scaling stays near-linear, whether the machine is
+hybrid, and the throughput ratio between the fast and slow groups. All three
+are stable across runs.
+
+**What is deliberately not reported:** exact performance/efficiency core
+counts. An earlier version estimated them and the estimate proved unreliable —
+the last performance core shares cache and memory bandwidth with its siblings,
+so its marginal contribution falls to roughly the level of the first efficiency
+core. On an Apple M4 (truly 4P + 6E) the sorted gains are
+
+```
+4.42, 4.27, 4.22, 2.56 | 2.23, 1.40, 1.38, 1.26, 0.81  M primes/s
+```
+
+and the real boundary between 2.56 and 2.23 is indistinguishable from ordinary
+scaling loss; successive runs "detected" 4/6, 3/7 and 8/2. `per_core_map` pins
+work to each core for an exact answer on Linux and Windows, which expose thread
+affinity; macOS does not.
+
+Two measurement details mattered. Aggregate rate is computed from the workers'
+own timed duration rather than wall time, because wall time includes pool
+creation, which grows with worker count and would understate exactly the higher
+counts the analysis depends on. And a monotonic envelope was tried and
+rejected: clamping dips upward introduced artificial zero marginals that
+shifted the analysis further.
+
+## Storage queue depth
+
+Issuing one 4 KiB read at a time bounds the result by *latency*, not by the
+device. Measured on an Apple M4 SSD:
+
+| Queue depth | IOPS |
+|-------------|------|
+| 1 | 49,405 |
+| 4 | 152,413 |
+| 16 | 225,912 |
+| 32 | 231,746 |
+
+The single-request figure understates the drive **4.7×**. Concurrency is
+produced with threads rather than async I/O because `os.pread` releases the GIL
+for the duration of the syscall, so they genuinely overlap.
+
+One implementation detail was load-bearing: the main thread must *wait on an
+event*, not spin. An initial busy-wait loop held the GIL and starved the reader
+threads, collapsing QD4 to 624 IOPS — an eightieth of the correct value.
+
+Latency percentiles (p50/p99/max) are reported alongside, because a drive with
+a good median and a poor tail produces visible stalls that throughput cannot
+show.
+
+## Memory bandwidth scaling
+
+A single core rarely saturates a memory controller. The tool sweeps
+concurrency and reports the peak.
+
+**Processes, not threads.** CPython does not release the GIL during
+`bytearray` slice assignment, so a threaded version serializes: it reported a
+flat 40 GB/s at every thread count, which was the GIL speaking rather than the
+memory subsystem. With processes an M4 shows 39.7 GB/s at one process rising
+to 56.6 GB/s at five — **1.43×**, confirming one core does not saturate it.
+
+The buffer must also exceed last-level cache, or the test measures cache
+bandwidth instead; per-process size is derived from the safe memory budget
+divided by peak concurrency, with a 32 MB floor.
+
+## System-level benchmarks
+
+Throughput misses a class of behaviour: a machine can post excellent FLOPS and
+still feel sluggish.
+
+| Measurement | Unit | Why it matters |
+|-------------|------|----------------|
+| **Compile** (C at `-O2`) | seconds | Exercises preprocessor, optimiser, and linker together — the most relatable number for a developer |
+| **Syscall latency** | ns | The floor for every I/O the machine performs |
+| **Context switch** | ns | Shows up as poor responsiveness under load |
+| **Process spawn** | ms | Dominates build systems, shell scripting, and CI |
+
+The compile benchmark runs one untimed compile first so the compiler binary and
+headers are cached; otherwise the first run measures the filesystem.
+
+**Not included: AES throughput.** Python's standard library has no AES
+primitive, and a pure-Python implementation would never reach the AES-NI or ARM
+crypto instructions that make such a benchmark meaningful — it would measure
+table lookups instead. Reporting nothing is better than reporting the wrong
+thing. SHA-256 already covers hardware crypto.
+
 ## Statistics
 
 Each test runs `--repeats` times; the headline `rate` is the **median**, which

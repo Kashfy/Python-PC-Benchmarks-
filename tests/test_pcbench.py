@@ -18,7 +18,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcbench import (accel, cli, compare, core, coreml_model,  # noqa: E402
+from pcbench import (accel, cli, compare, core, coreml_model, cores,  # noqa: E402
+                     sysbench,
                      limits, mlbench, mlframework, network, npu, onnx_model,
                      power, regression, report, scoring, sustained, system,
                      thermal, workloads)
@@ -1231,3 +1232,122 @@ class TestOutputWritabilityGuard(unittest.TestCase):
                 self.assertIn("chown", problem)
             finally:
                 os.chmod(sub, 0o700)
+
+
+# --------------------------------------------------------------------------- #
+class TestCoreScaling(unittest.TestCase):
+    """Core analysis reports only what it can measure reliably."""
+
+    def _points(self, marginals):
+        pts, agg = [], 0.0
+        for i, m in enumerate(marginals, 1):
+            agg += m
+            pts.append({"workers": i, "aggregate_rate": agg,
+                        "marginal_rate": m,
+                        "scaling_vs_one": (agg / marginals[0]
+                                           if marginals[0] else 0.0)})
+        return pts
+
+    def test_detects_hybrid_layout(self):
+        # Apple M4 shape: fast cores then much slower ones.
+        c = cores.classify_cores(self._points(
+            [4.42e6, 4.27e6, 4.22e6, 2.56e6, 2.23e6, 1.40e6, 1.38e6,
+             1.26e6, 0.81e6, 0.9e6]))
+        self.assertTrue(c["hybrid"])
+        self.assertLess(c["slow_relative"], 0.65)
+
+    def test_uniform_cores_not_called_hybrid(self):
+        c = cores.classify_cores(self._points([4.0e6] * 8))
+        self.assertFalse(c["hybrid"])
+
+    def test_linear_scaling_count_is_reported(self):
+        c = cores.classify_cores(self._points(
+            [4.0e6, 4.0e6, 3.9e6, 1.0e6, 1.0e6, 1.0e6]))
+        self.assertEqual(c["linear_up_to_workers"], 3)
+
+    def test_does_not_claim_exact_core_counts(self):
+        # Exact P/E counts proved unreliable and must not be reported.
+        c = cores.classify_cores(self._points([4e6, 4e6, 2.5e6, 1e6, 1e6]))
+        self.assertNotIn("estimated_fast_cores", c)
+        self.assertNotIn("fast_cores", c)
+
+    def test_handles_degenerate_input(self):
+        self.assertIn("note", cores.classify_cores([]))
+        self.assertIn("note", cores.classify_cores(self._points([0.0])))
+
+
+class TestSysbench(unittest.TestCase):
+    def test_compile_benchmark(self):
+        r = sysbench.bench_compile(1)
+        if r.get("skipped"):
+            self.skipTest(f"no compiler: {r.get('error')}")
+        self.assertGreater(r["rate"], 0)
+        self.assertGreater(r["seconds_per_compile"], 0)
+        self.assertEqual(r["unit"], "compiles/min")
+
+    def test_syscall_latency_plausible(self):
+        ns = sysbench.bench_syscall_latency(20_000)
+        self.assertGreater(ns, 0)
+        self.assertLess(ns, 100_000)       # 100 us would be absurd
+
+    def test_latency_suite_shape(self):
+        r = sysbench.bench_latency_suite()
+        self.assertIn("syscall_ns", r)
+        self.assertIn("rate", r)
+        self.assertGreater(r["rate"], 0)
+
+    def test_cpu_frequency_type(self):
+        f = sysbench.cpu_frequency_mhz()
+        self.assertTrue(f is None or f > 0)
+
+
+class TestDiskDepthAndLatency(unittest.TestCase):
+    def test_queue_depth_sweep_beats_qd1(self):
+        # The whole point: QD1 understates a real SSD.
+        with tempfile.TemporaryDirectory() as d:
+            r = workloads.bench_disk(0.3, 1, file_mb=64, out_dir=d)
+            if r.get("skipped"):
+                self.skipTest("disk test skipped")
+            qd = r["queue_depth_sweep"]
+            self.assertEqual([p["queue_depth"] for p in qd["points"]],
+                             list(workloads.QUEUE_DEPTHS))
+            self.assertGreater(qd["peak_iops"], 0)
+            self.assertGreaterEqual(qd["peak_iops"], qd["qd1_iops"] * 0.9)
+
+    def test_latency_percentiles_ordered(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = workloads.bench_disk(0.3, 1, file_mb=64, out_dir=d)
+            if r.get("skipped"):
+                self.skipTest("disk test skipped")
+            lat = r["random_read_latency"]
+            self.assertLessEqual(lat["p50_us"], lat["p99_us"])
+            self.assertLessEqual(lat["p99_us"], lat["max_us"])
+
+
+class TestMemoryScaling(unittest.TestCase):
+    def test_uses_processes_not_threads(self):
+        # Threads would be GIL-serialized and report flat scaling.
+        import inspect
+        src = inspect.getsource(workloads.bench_memory_scaling)
+        self.assertIn("Pool", src)
+        self.assertIn("GIL", src)
+
+    def test_scaling_result_shape(self):
+        r = workloads.bench_memory_scaling(0.15, 64, 16 * 1024 ** 3)
+        self.assertGreater(r["rate"], 0)
+        self.assertGreaterEqual(r["scaling"], 0.5)
+        self.assertGreaterEqual(r["buffer_mb"], 32)   # must exceed cache
+
+
+class TestProfiles(unittest.TestCase):
+    def test_every_profile_lists_valid_tests(self):
+        for name, tests in cli.PROFILES.items():
+            for t in tests:
+                self.assertIn(t, cli.TESTS, f"{name} references unknown {t}")
+
+    def test_profile_selects_its_tests(self):
+        args = cli.build_parser().parse_args(["--profile", "storage"])
+        self.assertEqual(args.profile, "storage")
+
+    def test_unknown_profile_rejected(self):
+        self.assertEqual(cli.main(["--profile", "nonsense", "--no-save"]), 2)

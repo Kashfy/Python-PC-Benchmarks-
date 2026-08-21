@@ -92,6 +92,42 @@ Benchmark Results
      128 MB  ███████████████████                   41,914 MB/s
 ```
 
+## Depth-aware storage testing
+
+Measuring random reads one at a time (queue depth 1) understates a modern SSD
+by roughly **5×** — real workloads keep many requests in flight. The tool
+sweeps queue depth and reports latency percentiles:
+
+```
+  Random read (4K)          :         37,917 IOPS
+  Random read latency       :           1.79 us p50   (p99 97.9 us)
+
+    Random-read IOPS by queue depth (how many requests are in flight):
+      QD 1  █████                            49,405 IOPS
+      QD 4  ██████████████████              152,413 IOPS
+      QD16  ███████████████████████████     225,912 IOPS
+      QD32  ████████████████████████████    231,746 IOPS
+      peak 231,746 IOPS at QD32 — 4.7x the queue-depth-1 figure
+```
+
+## Core scaling and hybrid CPUs
+
+Modern chips mix fast and slow cores, which is why "10 cores" rarely means 10×.
+The tool measures the marginal gain from each added worker:
+
+```
+  Core scaling              :          5.43x on 10 cores
+      scales near-linearly to 3 worker(s); beyond that each added worker
+      contributes about 38% as much, indicating a hybrid design
+       1w  ████████████████████████    4,490,000/s
+       4w  ███████████████            15,888,000/s
+      10w  ████                       24,398,000/s
+```
+
+It deliberately reports *how far scaling stays linear* rather than exact P/E
+core counts — see [technical.md](docs/technical.md#core-scaling-analysis) for
+why that estimate proved unreliable.
+
 ## Thermal / sustained-load testing
 
 A three-second benchmark only measures *burst* speed. Thin and fanless laptops
@@ -136,6 +172,7 @@ python3 benchmark.py --compare
 | `--seconds N` | `3.0` | Duration per test, per repeat |
 | `--repeats M` | `3` | Repeats per test (median reported) |
 | `--only a,b` | all | Subset of tests (see below) |
+| `--profile NAME` | — | Preset selection: `quick`, `cpu`, `ai`, `dev`, `storage`, `laptop`, `server` |
 | `--skip a,b` | none | Exclude tests |
 | `--quick` | off | Fast pass (1s × 2 repeats) |
 | `--disk-mb K` | `256` | Disk test file size |
@@ -163,7 +200,8 @@ python3 benchmark.py --compare
 | `--force` | off | Run despite distorting machine state |
 
 Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
-`memory`, `cache_sweep`, `disk`, `nn_training`, `kmeans`, `knn`.
+`memory`, `mem_scaling`, `cache_sweep`, `disk`, `nn_training`, `kmeans`,
+`knn`, `cores`, `compile`, `latency`.
 
 ## What each test measures
 
@@ -178,6 +216,10 @@ Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
 | Memory | MB/s | Sustained copy bandwidth |
 | Cache sweep | MB/s | Bandwidth vs. working-set size → cache tiers |
 | Disk | MB/s + IOPS | Sequential write/read **and** 4 KiB random reads |
+| Core scaling | curve | Marginal gain per added worker — exposes hybrid P/E designs |
+| Memory scaling | MB/s | Bandwidth vs. process count — finds the memory-controller ceiling |
+| Compile | s / compiles-per-min | Real C compilation at `-O2` |
+| OS latency | ns / ms | Syscall, context-switch, and process-spawn cost |
 | Neural net training | steps/s | **Real** MLP forward + backprop + SGD, pure Python |
 | K-means clustering | distances/s | Lloyd's algorithm — the canonical unsupervised workload |
 | K-NN search | comparisons/s | Brute-force similarity search (vector-DB style) |
@@ -371,7 +413,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-163 tests, standard library only.
+185 tests, standard library only.
 
 ## Documentation
 
