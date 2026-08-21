@@ -4,11 +4,12 @@ A reliable, cross-platform benchmark and hardware-diagnostics tool for
 **Windows, macOS, and Linux** on **x86-64, ARM64, and other** CPU
 architectures.
 
-It measures CPU, memory, disk, **GPU, and NPU** (including the **Apple Neural
-Engine**) in meaningful, comparable units, detects **thermal throttling** under
-sustained load, **validates** that the hardware computes correct results,
-gathers a full hardware inventory, and records everything to JSON/CSV/HTML so
-you can compare machines over time.
+It measures CPU, memory, disk, **GPU, NPU** (including the **Apple Neural
+Engine**), and **AI training/inference** in meaningful, comparable units;
+measures **power and perf-per-watt**; detects **thermal throttling** and
+**run-over-run regressions**; **validates** that the hardware computes correct
+results; benchmarks the **network stack**; and records everything to
+JSON/CSV/HTML so you can compare machines over time.
 
 - **Pure Python standard library** — runs on any machine with Python 3.8+,
   **no `pip install` required**.
@@ -132,6 +133,13 @@ python3 benchmark.py --compare
 | `--no-gpu` | off | Skip GPU compute benchmarks |
 | `--no-npu` | off | Skip NPU / Neural Engine benchmarks |
 | `--no-accel` | off | Skip all accelerator benchmarks (inventory still shown) |
+| `--ai` | off | Force the AI framework benchmark (auto-runs if torch/onnx installed) |
+| `--no-ai` | off | Skip the AI framework benchmark |
+| `--ai-batch N` | `64` | Batch size for the AI framework benchmark |
+| `--no-power` | off | Skip power / perf-per-watt |
+| `--no-network` | off | Skip the loopback network benchmark |
+| `--no-regression` | off | Skip run-over-run regression detection |
+| `--regression-threshold P` | `10` | Percent change that counts as a regression |
 | `--force` | off | Run despite distorting machine state |
 
 Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
@@ -188,6 +196,64 @@ Requires only the Command Line Tools: the Metal shaders are compiled at
 **runtime**, avoiding the offline `metal` compiler that ships only with full
 Xcode.
 
+### Matrix-multiply TFLOPS (the AI-compute metric)
+
+The GPU section reports dense **GEMM throughput** via MetalPerformanceShaders —
+the single operation that dominates neural-network compute. On an M4: **2.8
+TFLOPS FP32 / 3.2 TFLOPS FP16**. It also reports Neural Engine **tail latency**
+(p50/p99), which is what governs interactive/real-time inference.
+
+## AI training & inference (optional framework tier)
+
+Real *training* needs backprop and an optimizer, which needs a real ML
+framework. This is the **only** part of the tool that will use a third-party
+dependency — and only if you already have one installed:
+
+```bash
+pip install torch          # or: pip install onnxruntime
+python3 benchmark.py --ai
+```
+
+When PyTorch is present it trains a small CNN and reports **training
+samples/sec** and **inference samples/sec**, automatically using CUDA (NVIDIA),
+ROCm (AMD), MPS (Apple), or CPU — so this path also covers non-Apple GPUs that
+the Metal engine cannot. ONNX Runtime is used as an inference-only fallback.
+Without any framework the section is skipped with a one-line install hint; the
+rest of the run is unaffected.
+
+## Power & perf-per-watt
+
+Two chips can post the same throughput while one draws triple the power. The
+tool samples package power **under load** and reports **score-per-watt**:
+
+- **macOS**: real watts via `powermetrics` (run with `sudo`), else a labelled
+  TDP estimate.
+- **Linux**: real watts via RAPL (`/sys/class/powercap`).
+- Otherwise: a clearly-labelled TDP-class estimate — never presented as a
+  measurement.
+
+## Regression detection
+
+Run it more than once and it becomes a monitor. Each run is compared against
+**this machine's own history** (median of prior runs) and flags any metric that
+moved beyond a threshold:
+
+```
+Regression Check
+  Compared against 6 prior run(s) on this machine (threshold ±10.0%):
+    ▼ Disk write          -34.2%  (5,120 → 3,370)
+  ⚠ 1 metric(s) regressed. Check cooling, background load, or hardware health.
+```
+
+Catches a failing SSD, a clogged cooler, or a driver regression that a single
+run would never show.
+
+## Network stack
+
+A TCP **loopback** throughput + latency (p50/p99) benchmark — characterizes the
+OS network stack with **no external traffic**. A slow number points at CPU
+saturation or an intercepting security agent.
+
 ## Native engine extras
 
 The native C engine adds **multi-threaded CPU** and **pointer-chase memory
@@ -227,7 +293,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-84 tests, standard library only.
+101 tests, standard library only.
 
 ## Documentation
 

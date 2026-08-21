@@ -272,7 +272,7 @@ def inventory(cpu_model: str = "") -> dict:
 # --------------------------------------------------------------------------- #
 def _frameworks() -> list[str]:
     return ["-framework", "Foundation", "-framework", "Metal",
-            "-framework", "CoreML"]
+            "-framework", "MetalPerformanceShaders", "-framework", "CoreML"]
 
 
 def build(src: str, exe: str) -> tuple[bool, str]:
@@ -356,6 +356,10 @@ def extract_rates(payload: dict | None) -> dict:
             rates["gpu_fp16"] = float(value)
         elif name == "GPU memory bandwidth":
             rates["gpu_bandwidth"] = float(value)
+        elif name == "GPU matmul FP32 (GEMM)":
+            rates["gpu_matmul_fp32"] = float(value)  # TFLOPS
+        elif name == "GPU matmul FP16 (GEMM)":
+            rates["gpu_matmul_fp16"] = float(value)  # TFLOPS
         elif name == "Neural Engine throughput":
             rates["npu"] = float(value)
     return rates

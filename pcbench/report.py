@@ -9,6 +9,7 @@ import os
 import re
 
 from .core import stability_note
+from .regression import render as regression_render
 from .scoring import category_scores
 from .sustained import sparkline
 
@@ -208,6 +209,72 @@ def print_accelerators(inv: dict | None, accel: dict | None) -> None:
         print(f"  note: {note}")
 
 
+def print_ai(ml: dict | None) -> None:
+    if not ml:
+        return
+    hr("AI Framework — training & inference")
+    if not ml.get("available"):
+        print(f"  {ml.get('note', 'no ML framework installed')}")
+        return
+    if ml.get("error"):
+        print(f"  {ml['framework']}: {ml['error']}")
+        return
+    _kv("Framework", f"{ml['framework']} {ml.get('framework_version', '')}")
+    _kv("Device", f"{ml.get('device_name', ml.get('device', '?'))}")
+    if ml.get("model_params"):
+        _kv("Model params", f"{ml['model_params']:,}")
+    print()
+    if ml.get("train_samples_per_s"):
+        _row("Training throughput", fmt(ml["train_samples_per_s"]),
+             " samples/s")
+    if ml.get("infer_samples_per_s"):
+        _row("Inference throughput", fmt(ml["infer_samples_per_s"]),
+             " samples/s")
+    if ml.get("note"):
+        print(f"  note: {ml['note']}")
+
+
+def print_network(net: dict | None) -> None:
+    if not net or net.get("error"):
+        if net and net.get("error"):
+            print(f"\n  (network: {net['error']})")
+        return
+    hr("Network (loopback stack)")
+    _row("Loopback throughput", fmt(net.get("loopback_mb_s")), " MB/s")
+    lat = net.get("latency") or {}
+    if lat:
+        _row("Loopback latency p50", fmt(lat.get("p50_us")), " us")
+        _row("Loopback latency p99", fmt(lat.get("p99_us")), " us")
+
+
+def print_power(power: dict | None, ppw: dict | None) -> None:
+    if not power:
+        return
+    hr("Power & Efficiency")
+    watts = power.get("package_w")
+    if watts:
+        tag = " (estimated)" if power.get("estimated") else " (measured)"
+        _row("Package power", fmt(watts), f" W{tag}")
+        for key, label in (("cpu_w", "CPU power"), ("gpu_w", "GPU power"),
+                           ("ane_w", "ANE power")):
+            if power.get(key):
+                _row(label, fmt(power[key]), " W")
+    else:
+        print(f"  Power: {power.get('source', 'unavailable')}")
+    if ppw:
+        _row("Perf-per-watt", fmt(ppw["score_per_watt"]),
+             " score/W" + (" (est.)" if ppw.get("estimated") else ""))
+    if power.get("hint") and power.get("estimated"):
+        print(f"  hint: {power['hint']}")
+
+
+def print_regression(reg: dict | None) -> None:
+    if not reg:
+        return
+    hr("Regression Check")
+    print(regression_render(reg))
+
+
 def print_sustained(s: dict | None) -> None:
     if not s or s.get("error"):
         return
@@ -242,8 +309,12 @@ def print_report(payload: dict) -> None:
     print_results(payload["results"])
     print_native(payload.get("native"))
     print_accelerators(payload.get("accelerators"), payload.get("accel"))
+    print_ai(payload.get("ml_framework"))
+    print_network(payload.get("network"))
+    print_power(payload.get("power"), payload.get("perf_per_watt"))
     print_sustained(payload.get("sustained"))
     print_scores(payload["scores"])
+    print_regression(payload.get("regression"))
     _print_validation(payload["results"])
 
 
@@ -279,7 +350,10 @@ CSV_FIELDS = [
     "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
     "disk_write_mb_s", "disk_read_mb_s", "disk_iops", "disk_cache_bypassed",
     "gpu_name", "gpu_fp32_gflops", "gpu_fp16_gflops", "gpu_bandwidth_mb_s",
+    "gpu_matmul_fp32_tflops", "gpu_matmul_fp16_tflops",
     "npu_name", "npu_gflops", "npu_speedup_vs_cpu",
+    "ml_train_samples_s", "ml_infer_samples_s",
+    "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
     "sustained_droop_pct", "composite_score",
 ]
 
@@ -299,18 +373,14 @@ def _rate(results: dict, key: str, field: str = "rate") -> float:
     return 0.0
 
 
-def append_csv(payload: dict, out_dir: str) -> str:
-    """Append one flattened row, rotating the file if the schema changed.
-
-    Appending new columns to a file written by an older version would silently
-    misalign every row, so a header mismatch archives the old file instead.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "benchmarks.csv")
+def flatten_row(payload: dict) -> dict:
+    """Project the nested payload into one flat CSV/regression row."""
     info, results = payload["system"], payload["results"]
     sus = payload.get("sustained") or {}
+    ppw = payload.get("perf_per_watt") or {}
+    power = payload.get("power") or {}
 
-    row = {
+    return {
         "timestamp_utc": payload["timestamp_utc"],
         "tool_version": payload["version"],
         "hostname": info["hostname"],
@@ -342,9 +412,29 @@ def append_csv(payload: dict, out_dir: str) -> str:
         "npu_speedup_vs_cpu": round(
             ((payload.get("accel") or {}).get("ane") or {})
             .get("speedup_vs_cpu", 0) or 0, 2),
+        "gpu_matmul_fp32_tflops": _rate(results, "gpu_matmul_fp32"),
+        "gpu_matmul_fp16_tflops": _rate(results, "gpu_matmul_fp16"),
+        "ml_train_samples_s": _rate(results, "ml_train"),
+        "ml_infer_samples_s": _rate(results, "ml_infer"),
+        "net_loopback_mb_s": round(
+            (payload.get("network") or {}).get("loopback_mb_s", 0) or 0, 1),
+        "power_watts": power.get("package_w") or "",
+        "power_estimated": power.get("estimated", ""),
+        "score_per_watt": ppw.get("score_per_watt", "") if ppw else "",
         "sustained_droop_pct": sus.get("droop_percent", ""),
         "composite_score": payload["scores"]["composite"],
     }
+
+
+def append_csv(payload: dict, out_dir: str) -> str:
+    """Append one flattened row, rotating the file if the schema changed.
+
+    Appending new columns to a file written by an older version would silently
+    misalign every row, so a header mismatch archives the old file instead.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "benchmarks.csv")
+    row = flatten_row(payload)
 
     if os.path.isfile(path):
         with open(path, newline="", encoding="utf-8") as f:
@@ -497,6 +587,45 @@ def save_html(payload: dict, out_dir: str) -> str:
                 f"<p class='note {cls}'>Neural Engine {state} — "
                 f"{ane.get('speedup_vs_cpu', 0):.2f}x vs CPU-only Core ML.</p>")
         parts.append("</div>")
+
+    ml = payload.get("ml_framework")
+    if ml and ml.get("available") and not ml.get("error"):
+        parts.append("<div class='card'><h2>AI framework</h2><table>")
+        parts.append(f"<tr><td>Framework</td><td class='num'>"
+                     f"{e(str(ml.get('framework', '')))} "
+                     f"{e(str(ml.get('framework_version', '')))}</td></tr>")
+        parts.append(f"<tr><td>Device</td><td class='num'>"
+                     f"{e(str(ml.get('device_name', ml.get('device', '?'))))}"
+                     f"</td></tr>")
+        if ml.get("train_samples_per_s"):
+            parts.append(f"<tr><td>Training</td><td class='num'>"
+                         f"{ml['train_samples_per_s']:,.0f} samples/s</td></tr>")
+        if ml.get("infer_samples_per_s"):
+            parts.append(f"<tr><td>Inference</td><td class='num'>"
+                         f"{ml['infer_samples_per_s']:,.0f} samples/s</td></tr>")
+        parts.append("</table></div>")
+
+    power = payload.get("power") or {}
+    ppw = payload.get("perf_per_watt") or {}
+    if power.get("package_w"):
+        tag = "estimated" if power.get("estimated") else "measured"
+        parts.append("<div class='card'><h2>Power & efficiency</h2><table>")
+        parts.append(f"<tr><td>Package power</td><td class='num'>"
+                     f"{power['package_w']:,.1f} W ({tag})</td></tr>")
+        if ppw:
+            parts.append(f"<tr><td>Perf-per-watt</td><td class='num'>"
+                         f"{ppw['score_per_watt']:,.1f} score/W</td></tr>")
+        parts.append("</table></div>")
+
+    reg = payload.get("regression")
+    if reg and reg.get("findings"):
+        parts.append("<div class='card'><h2>Regression vs. history</h2><table>")
+        for f in reg["findings"]:
+            cls = "bad" if f["direction"] == "slower" else "good"
+            parts.append(
+                f"<tr><td>{e(str(f['metric']))}</td><td class='num {cls}'>"
+                f"{f['change_pct']:+.1f}%</td></tr>")
+        parts.append("</table></div>")
 
     sus = payload.get("sustained")
     if sus and not sus.get("error"):

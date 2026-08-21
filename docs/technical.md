@@ -217,12 +217,92 @@ effective GFLOPS = inferences/s x total FLOPs / 1e9
 
 At 2,535 inferences/s over 3.62 GFLOP that is ~9,190 GFLOPS effective.
 
+### Matrix multiply (GEMM) — the AI-compute number
+
+Dense matrix multiply is what every fully-connected and convolution layer
+reduces to, so its sustained TFLOPS is the most meaningful single "AI
+performance" figure for a GPU. The engine uses `MPSMatrixMultiplication` (a
+vendor-tuned kernel), so it measures the hardware, not our shader-writing.
+A dense N×N×N multiply is 2·N³ FLOPs; several are batched per command buffer so
+submission overhead doesn't dominate. Reported for FP32 and FP16 (measured 2.8
+/ 3.2 TFLOPS on an M4).
+
+### Neural Engine tail latency
+
+Alongside throughput the ANE path records **p50 and p99 per-inference
+latency**. Tail latency is what governs real-time inference: a good average
+with a bad p99 still produces visible stutter in interactive use.
+
+## AI training & inference (optional framework tier)
+
+Raw compute (matmul, Core ML inference) is measured with zero dependencies. But
+real **training** — forward pass, backpropagation, optimizer step — cannot be
+expressed without an ML framework. Rather than fake it, the tool runs a real
+one *if the user has it installed*:
+
+- **PyTorch** (preferred): trains a small but representative CNN and reports
+  **training samples/s** and **inference samples/s**. It auto-selects the best
+  backend — CUDA (NVIDIA), ROCm (AMD), MPS (Apple), or CPU — so this is also
+  the only path that benchmarks non-Apple GPUs.
+- **ONNX Runtime** (fallback): inference only (it does not train), reported
+  honestly as such.
+- **Neither installed**: the section is skipped with a one-line `pip install`
+  hint; nothing else is affected.
+
+GPU frameworks are asynchronous, so each measured region ends with a device
+`synchronize()` — otherwise the timer would measure how fast work is *queued*,
+not how fast it *runs*. A warm-up pass covers cuDNN/Metal autotuning.
+
+This is the **only** third-party dependency the tool will ever use, and never
+without the user opting in by installing a framework.
+
+## Power & perf-per-watt
+
+Two chips at equal throughput can differ threefold in power, so efficiency is
+often the real story. Power is sampled **under load** (a background CPU burn
+runs while the reading is taken) because idle draw is uninteresting.
+
+| Source | Platform | Confidence |
+|--------|----------|-----------|
+| `powermetrics` (CPU/GPU/ANE watts) | macOS, **needs sudo** | measured |
+| RAPL (`/sys/class/powercap`) | Linux (Intel/AMD) | measured |
+| Package-TDP lookup | any | **estimated**, always labelled |
+
+`score_per_watt` is the composite score divided by watts. An estimate is never
+presented as a measurement — the `source` field and an `(estimated)`/
+`(measured)` tag always say which.
+
+## Regression detection
+
+Run once and you have a number; run repeatedly and you have a monitor. Each run
+is compared against the **median of this machine's prior runs** (same hostname
+only — cross-machine differences belong in `compare`). Any metric that moves
+more than the threshold (default ±10%, `--regression-threshold`) is flagged,
+regressions first. The median baseline resists a single noisy prior run
+becoming a false reference, and the current run is excluded from its own
+baseline. This is what turns the tool into a health check: a failing SSD,
+clogged cooler, or driver regression shows up as a slowdown against the
+machine's own past.
+
+## Network stack
+
+A TCP **loopback** (127.0.0.1) benchmark: bulk throughput plus ping/pong
+round-trip latency (p50/p99) with `TCP_NODELAY` set so Nagle's algorithm
+doesn't hide per-message latency. It deliberately sends nothing off-box — it
+characterizes the OS network stack, socket buffers, and scheduler, which is a
+real reproducible machine property, without depending on an internet connection
+or contacting third parties. A slow loopback number is itself diagnostic (CPU
+saturation, or a security agent intercepting local traffic).
+
 ### Accelerator scoring
 
-GPU and NPU results feed the same baseline-relative scoring as everything else
-and roll up into `GPU` and `NPU` category scores. Machines **without** a GPU or
-NPU simply omit those subscores rather than scoring zero, so absent hardware
-never drags the composite down.
+GPU, NPU, matmul, and (when present) AI-framework results feed the same
+baseline-relative scoring as everything else and roll up into `GPU`, `NPU`, and
+an `AI` category (matmul + ANE + framework). Machines **without** a given piece
+of hardware simply omit those subscores rather than scoring zero, so absent
+hardware never drags the composite down. Power and network are reported but
+kept **out** of the composite — power is an efficiency axis, and loopback
+network is a diagnostic rather than a comparative performance metric.
 
 ## Statistics
 

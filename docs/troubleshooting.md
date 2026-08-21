@@ -135,6 +135,57 @@ design; see [technical.md](technical.md#what-is-and-isnt-covered).
 Skip accelerators entirely with `--no-accel`, or individually with `--no-gpu` /
 `--no-npu`.
 
+## "no ML framework found" / AI section missing
+
+Expected unless PyTorch or ONNX Runtime is installed — the AI training/inference
+tier is opt-in precisely so the tool stays zero-dependency. To enable it:
+
+```bash
+pip install torch          # training + inference (CUDA/ROCm/MPS/CPU)
+pip install onnxruntime    # inference-only fallback
+python3 benchmark.py --ai
+```
+
+If a framework *is* installed but errors, the section shows the framework and
+the error message; the rest of the run is unaffected.
+
+## Power shows "(estimated)" instead of real watts
+
+Real power metering is privileged:
+
+- **macOS**: run the whole tool with `sudo` (`powermetrics` is root-only):
+  `sudo python3 benchmark.py`. Without it you get a TDP-class estimate, clearly
+  labelled.
+- **Linux**: needs Intel/AMD RAPL at `/sys/class/powercap`; absent in many VMs
+  and on ARM boards.
+- **Windows**: no per-package metering is exposed, so only a TDP estimate is
+  available.
+
+The estimate is never presented as a measurement — the label always says which.
+
+## Regression check says "first run on this machine"
+
+There's no history for this hostname yet. Run the benchmark a few times (saving
+each time) and subsequent runs will compare against the median of the prior
+ones. Regression compares a machine only against **itself**; cross-machine
+comparison is `--compare`.
+
+## A regression was flagged but the machine is fine
+
+Benchmarks are noisy. If a one-off background task slowed a run, re-run when
+idle. Raise the sensitivity threshold if your environment is inherently
+variable:
+
+```bash
+python3 benchmark.py --regression-threshold 20
+```
+
+## Network benchmark shows very high throughput
+
+Loopback throughput (often >10 GB/s) is normal — it never touches a real NIC;
+it measures the OS stack copying between two sockets in RAM. It's a diagnostic
+of stack health, not your internet or LAN speed.
+
 ## GPU shows as "unknown" or is missing
 
 - **Linux**: install `pciutils` for `lspci`, or the NVIDIA driver for

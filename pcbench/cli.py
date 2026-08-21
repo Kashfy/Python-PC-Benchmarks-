@@ -12,7 +12,11 @@ from datetime import datetime, timezone
 
 from . import __version__
 from . import accel as accel_mod
+from . import mlframework
 from . import native as native_mod
+from . import network
+from . import power
+from . import regression
 from . import report as report_mod
 from . import workloads as wl
 from .compare import load_history, render_table
@@ -81,6 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-accel", action="store_true",
                    help="Skip all accelerator benchmarks (inventory still "
                         "reported)")
+
+    g = p.add_argument_group("AI / efficiency / monitoring")
+    g.add_argument("--ai", action="store_true",
+                   help="Force the ML-framework training/inference benchmark "
+                        "(auto-runs when PyTorch/ONNX is installed)")
+    g.add_argument("--no-ai", action="store_true",
+                   help="Skip the ML-framework benchmark even if installed")
+    g.add_argument("--ai-batch", type=int, default=64,
+                   help="Batch size for the ML-framework benchmark")
+    g.add_argument("--no-power", action="store_true",
+                   help="Skip power / perf-per-watt measurement")
+    g.add_argument("--no-network", action="store_true",
+                   help="Skip the loopback network benchmark")
+    g.add_argument("--no-regression", action="store_true",
+                   help="Skip run-over-run regression detection")
+    g.add_argument("--regression-threshold", type=float, default=10.0,
+                   help="Percent change that counts as a regression")
 
     g = p.add_argument_group("other")
     g.add_argument("--no-native", action="store_true",
@@ -224,6 +245,34 @@ def main(argv=None) -> int:
             for key, value in accel_mod.extract_rates(accel).items():
                 results[key] = {"rate": value}
 
+    # AI framework tier — only touches a third-party dependency, and only when
+    # the user has one installed (or forces it).
+    ml = None
+    ml_detected = mlframework.detect()
+    if not args.no_ai and (args.ai or ml_detected["available"]):
+        if ml_detected["available"]:
+            if not quiet:
+                print("  running AI framework benchmark ...", flush=True)
+            ml = mlframework.run(args.seconds, args.ai_batch)
+            for key, value in mlframework.extract_rates(ml).items():
+                results[key] = {"rate": value}
+        elif args.ai:
+            ml = mlframework.run(args.seconds)  # returns the "not found" note
+
+    # Local network stack.
+    net = None
+    if not args.no_network:
+        if not quiet:
+            print("  running network benchmark ...", flush=True)
+        net = network.run(min(args.seconds, 2.0))
+
+    # Power / perf-per-watt, sampled under load.
+    power_info = None
+    if not args.no_power:
+        if not quiet:
+            print("  measuring power ...", flush=True)
+        power_info = power.measure_under_load(info.get("cpu_model", ""))
+
     sustained = None
     if sustained_seconds:
         workers = args.sustained_workers or info["cpu_cores_logical"]
@@ -234,6 +283,9 @@ def main(argv=None) -> int:
                                   workers)
 
     scores = compute_scores(results)
+    ppw = power.perf_per_watt(scores["composite"], power_info) if power_info \
+        else None
+
     payload = {
         "tool": "pcbench",
         "version": __version__,
@@ -250,9 +302,20 @@ def main(argv=None) -> int:
         "native": native,
         "accelerators": accel_inv,
         "accel": accel,
+        "ml_framework": ml,
+        "network": net,
+        "power": power_info,
+        "perf_per_watt": ppw,
         "sustained": sustained,
         "scores": scores,
     }
+
+    # Regression check against this machine's own history.
+    if not args.no_regression:
+        history = load_history(os.path.join(args.output_dir, "benchmarks.csv"))
+        current_row = report_mod.flatten_row(payload)
+        payload["regression"] = regression.analyze(
+            current_row, history, args.regression_threshold / 100.0)
 
     if args.json_stdout:
         print(json.dumps(payload, indent=2, default=str))

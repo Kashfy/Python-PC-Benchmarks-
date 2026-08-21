@@ -61,6 +61,19 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `winreg` | Windows CPU model (lazy import) |
 | `zlib` | Compression workload |
 | `struct` | Packing float weights into the Core ML protobuf |
+| `socket` / `threading` | Loopback network benchmark |
+
+## Optional dependency: an ML framework (AI tier only)
+
+The AI training/inference benchmark uses **PyTorch** if installed, or **ONNX
+Runtime** as an inference-only fallback. Neither is required — the section is
+skipped otherwise. This is the only place the tool uses a heavy dependency, and
+only when you opt in by installing it:
+
+```bash
+pip install torch          # real training + inference, CUDA/ROCm/MPS/CPU
+pip install onnxruntime    # inference-only fallback
+```
 
 ## Optional dependency: `psutil`
 
@@ -156,6 +169,20 @@ GPU/NPU **inventory** works on all platforms. Compute **benchmarking** is
 Apple-only (Metal + Core ML); see
 [technical.md](technical.md#gpu-and-npu-benchmarking) for why.
 
+### AI / efficiency / monitoring
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ai` | off | Force the AI framework benchmark (auto-runs if installed) |
+| `--no-ai` | off | Skip it even if a framework is installed |
+| `--ai-batch N` | `64` | Batch size for the AI framework benchmark |
+| `--no-power` | off | Skip power / perf-per-watt |
+| `--no-network` | off | Skip the loopback network benchmark |
+| `--no-regression` | off | Skip run-over-run regression detection |
+| `--regression-threshold P` | `10` | Percent change counting as a regression |
+
+For real measured power on macOS, run the whole tool with `sudo`.
+
 ### Other
 
 | Flag | Description |
@@ -197,7 +224,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-84 cases, standard library only — no pytest, no test dependencies.
+101 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

@@ -257,6 +257,63 @@ file.
 
 ---
 
+## `pcbench.mlframework` — optional AI training/inference
+
+The only module that may import a third-party framework, and only if installed.
+
+#### `detect() -> dict`
+`{pytorch, onnxruntime, available}` — versions if importable, without running
+anything.
+
+#### `run(seconds=3.0, batch=64) -> dict`
+Prefers PyTorch (trains a small CNN, reports `train_samples_per_s` and
+`infer_samples_per_s`, auto-selecting CUDA/ROCm/MPS/CPU); falls back to ONNX
+Runtime (inference only). Returns `{"available": False, ...}` when neither is
+present. Each timed region ends with a device `synchronize()` so async GPU work
+is actually captured.
+
+#### `extract_rates(payload) -> dict`
+Pulls `ml_train` / `ml_infer` for scoring.
+
+---
+
+## `pcbench.power` — power & perf-per-watt
+
+#### `estimate_tdp(cpu_model) -> int | None`
+Rough package-TDP lookup by chip family.
+
+#### `measure(cpu_model="") -> dict`
+A reading with its `source` and an `estimated` flag: `powermetrics` (macOS,
+sudo), RAPL (Linux), else a labelled TDP estimate.
+
+#### `measure_under_load(cpu_model="", load_s=1.5) -> dict`
+Samples power while a background thread burns all cores — active draw, not idle.
+
+#### `perf_per_watt(composite_score, power) -> dict | None`
+`score_per_watt`, or None when power is unknown.
+
+---
+
+## `pcbench.network` — loopback stack
+
+#### `run(duration=1.0) -> dict`
+TCP loopback throughput (MB/s) plus ping/pong latency (`p50_us`, `p99_us`).
+Sends nothing off-box. Never raises.
+
+---
+
+## `pcbench.regression` — run-over-run monitoring
+
+#### `analyze(current_row, history, threshold=0.10) -> dict`
+Compares the current flattened row against the median of this hostname's prior
+runs (excluding itself). Returns `status` (`ok` / `regression` / `no_baseline`)
+and per-metric `findings`, regressions first.
+
+#### `render(result) -> str`
+Human-readable summary with ▲/▼ markers.
+
+---
+
 ## `pcbench.cli`
 
 #### `build_parser() -> ArgumentParser` · `main(argv=None) -> int` · `entry()`

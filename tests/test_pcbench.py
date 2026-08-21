@@ -17,7 +17,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcbench import (accel, cli, compare, core, coreml_model, report,  # noqa: E402
+from pcbench import (accel, cli, compare, core, coreml_model,  # noqa: E402
+                     mlframework, network, power, regression, report,
                      scoring, system, workloads)
 
 
@@ -583,3 +584,136 @@ class TestAcceleratorScoring(unittest.TestCase):
             {"cpu_int": {"rate": scoring.BASELINES["cpu_int"]}})
         self.assertAlmostEqual(with_cpu["composite"], 100.0, places=4)
         self.assertNotIn("gpu_fp32", with_cpu["subscores"])
+
+
+# --------------------------------------------------------------------------- #
+class TestMLFramework(unittest.TestCase):
+    def test_detect_shape(self):
+        d = mlframework.detect()
+        for k in ("pytorch", "onnxruntime", "available"):
+            self.assertIn(k, d)
+
+    def test_run_without_framework_is_graceful(self):
+        d = mlframework.detect()
+        if d["available"]:
+            self.skipTest("a framework is installed; skip the absent-path test")
+        r = mlframework.run(0.1)
+        self.assertFalse(r["available"])
+        self.assertIn("note", r)
+
+    def test_extract_rates(self):
+        r = mlframework.extract_rates(
+            {"available": True, "train_samples_per_s": 500.0,
+             "infer_samples_per_s": 2000.0})
+        self.assertEqual(r["ml_train"], 500.0)
+        self.assertEqual(r["ml_infer"], 2000.0)
+
+    def test_extract_rates_ignores_unavailable_and_error(self):
+        self.assertEqual(mlframework.extract_rates(
+            {"available": False}), {})
+        self.assertEqual(mlframework.extract_rates(
+            {"available": True, "error": "boom"}), {})
+        self.assertEqual(mlframework.extract_rates(None), {})
+
+
+class TestPower(unittest.TestCase):
+    def test_estimate_tdp_known_chips(self):
+        self.assertEqual(power.estimate_tdp("Apple M4"), 18)
+        self.assertEqual(power.estimate_tdp("Intel Core i7-9750H"), 45)
+        self.assertEqual(power.estimate_tdp("AMD Ryzen 9 7950X"), 65)
+
+    def test_estimate_tdp_unknown(self):
+        self.assertIsNone(power.estimate_tdp("Some Mystery CPU"))
+
+    def test_measure_returns_source(self):
+        p = power.measure("Apple M4")
+        self.assertIn("source", p)
+        self.assertIn("estimated", p)
+
+    def test_perf_per_watt(self):
+        ppw = power.perf_per_watt(200.0, {"package_w": 20.0, "estimated": True})
+        self.assertEqual(ppw["score_per_watt"], 10.0)
+        self.assertTrue(ppw["estimated"])
+
+    def test_perf_per_watt_none_when_no_power(self):
+        self.assertIsNone(power.perf_per_watt(200.0, {"package_w": None}))
+        self.assertIsNone(power.perf_per_watt(0, {"package_w": 20.0}))
+
+
+class TestNetwork(unittest.TestCase):
+    def test_run_returns_throughput_and_latency(self):
+        r = network.run(0.3)
+        if r.get("error"):
+            self.skipTest(f"network unavailable in this env: {r['error']}")
+        self.assertGreater(r["loopback_mb_s"], 0)
+        self.assertIn("p50_us", r["latency"])
+        self.assertGreater(r["latency"]["p99_us"], 0)
+
+
+class TestRegression(unittest.TestCase):
+    HIST = [
+        {"hostname": "h", "timestamp_utc": "t1", "composite_score": "100",
+         "cpu_int_primes_s": "2000", "disk_write_mb_s": "500"},
+        {"hostname": "h", "timestamp_utc": "t2", "composite_score": "104",
+         "cpu_int_primes_s": "2100", "disk_write_mb_s": "510"},
+    ]
+
+    def test_no_baseline_for_new_host(self):
+        cur = {"hostname": "newhost", "timestamp_utc": "t9",
+               "composite_score": "100"}
+        self.assertEqual(regression.analyze(cur, self.HIST)["status"],
+                         "no_baseline")
+
+    def test_detects_regression(self):
+        cur = {"hostname": "h", "timestamp_utc": "t3",
+               "composite_score": "80", "cpu_int_primes_s": "1500",
+               "disk_write_mb_s": "505"}
+        res = regression.analyze(cur, self.HIST)
+        self.assertEqual(res["status"], "regression")
+        self.assertGreaterEqual(res["regression_count"], 1)
+        # The disk metric barely moved and must not be flagged.
+        cols = [f["column"] for f in res["findings"]]
+        self.assertIn("cpu_int_primes_s", cols)
+        self.assertNotIn("disk_write_mb_s", cols)
+
+    def test_stable_run_is_ok(self):
+        cur = {"hostname": "h", "timestamp_utc": "t3",
+               "composite_score": "102", "cpu_int_primes_s": "2050",
+               "disk_write_mb_s": "505"}
+        self.assertEqual(regression.analyze(cur, self.HIST)["status"], "ok")
+
+    def test_improvement_is_not_a_regression(self):
+        cur = {"hostname": "h", "timestamp_utc": "t3",
+               "composite_score": "150", "cpu_int_primes_s": "3000"}
+        res = regression.analyze(cur, self.HIST)
+        self.assertEqual(res["status"], "ok")
+        self.assertTrue(all(f["direction"] == "faster"
+                            for f in res["findings"]))
+
+    def test_excludes_current_run_from_baseline(self):
+        # A row with the current timestamp must not become its own baseline.
+        cur = {"hostname": "h", "timestamp_utc": "t2",
+               "composite_score": "104", "cpu_int_primes_s": "2100"}
+        res = regression.analyze(cur, self.HIST)
+        self.assertEqual(res["baseline_runs"], 1)  # only t1 remains
+
+    def test_render_is_string(self):
+        cur = {"hostname": "h", "timestamp_utc": "t3",
+               "composite_score": "80", "cpu_int_primes_s": "1500"}
+        out = regression.render(regression.analyze(cur, self.HIST))
+        self.assertIn("%", out)
+
+
+class TestAIScoring(unittest.TestCase):
+    def test_matmul_and_ml_score_and_roll_into_ai(self):
+        results = {
+            "gpu_matmul_fp32": {"rate": scoring.BASELINES["gpu_matmul_fp32"]},
+            "npu": {"rate": scoring.BASELINES["npu"]},
+            "ml_train": {"rate": scoring.BASELINES["ml_train"] * 2},
+        }
+        s = scoring.compute_scores(results)
+        self.assertAlmostEqual(s["subscores"]["gpu_matmul_fp32"], 100.0,
+                               places=3)
+        self.assertAlmostEqual(s["subscores"]["ml_train"], 200.0, places=3)
+        cats = scoring.category_scores(s["subscores"])
+        self.assertIn("ai", cats)

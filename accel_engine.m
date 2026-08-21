@@ -24,6 +24,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <CoreML/CoreML.h>
 #import <mach/mach_time.h>
 
@@ -85,6 +86,64 @@ static void add_result(NSString *name, NSString *unit, double value) {
     [g_results addObject:@{@"name": name, @"unit": unit, @"value": @(value)}];
 }
 static void add_note(NSString *note) { [g_notes addObject:note]; }
+
+/* --------------------------- Matrix multiply (AI compute) -------------- */
+/* Dense GEMM is the operation that dominates neural-network compute — every
+ * fully-connected and convolution layer reduces to it — so its sustained
+ * TFLOPS is the single most meaningful "AI performance" number for a GPU.
+ * MetalPerformanceShaders provides a hand-tuned kernel, so this measures the
+ * hardware rather than our shader-writing. */
+static double run_matmul(id<MTLDevice> dev, id<MTLCommandQueue> queue,
+                         int N, MPSDataType dtype, double seconds) {
+    @autoreleasepool {
+        size_t elem = (dtype == MPSDataTypeFloat16) ? 2 : 4;
+        MPSMatrixDescriptor *desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:N columns:N
+                                                 rowBytes:N * elem
+                                                 dataType:dtype];
+        id<MTLBuffer> ba = [dev newBufferWithLength:(NSUInteger)N * N * elem
+                                  options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> bb = [dev newBufferWithLength:(NSUInteger)N * N * elem
+                                  options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> bc = [dev newBufferWithLength:(NSUInteger)N * N * elem
+                                  options:MTLResourceStorageModePrivate];
+        if (!ba || !bb || !bc) return 0.0;
+        MPSMatrix *A = [[MPSMatrix alloc] initWithBuffer:ba descriptor:desc];
+        MPSMatrix *B = [[MPSMatrix alloc] initWithBuffer:bb descriptor:desc];
+        MPSMatrix *C = [[MPSMatrix alloc] initWithBuffer:bc descriptor:desc];
+        MPSMatrixMultiplication *mm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:dev
+                transposeLeft:NO transposeRight:NO resultRows:N
+                resultColumns:N interiorColumns:N alpha:1.0 beta:0.0];
+
+        for (int i = 0; i < 3; ++i) {          /* warm up */
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            [mm encodeToCommandBuffer:cb leftMatrix:A rightMatrix:B
+                         resultMatrix:C];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+
+        double start = now_seconds(), elapsed = 0;
+        long long count = 0;
+        do {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            /* Batch several multiplies per command buffer so submission
+             * overhead does not dominate at small N. */
+            for (int b = 0; b < 8; ++b)
+                [mm encodeToCommandBuffer:cb leftMatrix:A rightMatrix:B
+                             resultMatrix:C];
+            [cb commit];
+            [cb waitUntilCompleted];
+            count += 8;
+            elapsed = now_seconds() - start;
+        } while (elapsed < seconds);
+
+        /* A dense NxN multiply is 2*N^3 FLOPs (one multiply + one add each). */
+        double flops = (double)count * 2.0 * (double)N * N * N;
+        return flops / elapsed / 1e12;      /* TFLOPS */
+    }
+}
 
 /* --------------------------- GPU benchmarks ---------------------------- */
 static NSDictionary *run_gpu(double seconds) { @autoreleasepool {
@@ -150,6 +209,17 @@ static NSDictionary *run_gpu(double seconds) { @autoreleasepool {
         /* 4 independent chains x 2 FLOPs per fma x inner trips x threads */
         double flops = (double)dispatches * threads * inner * 4.0 * 2.0;
         add_result(labels[k], @"GFLOPS", flops / elapsed / 1e9);
+    }
+
+    /* ---- Matrix-multiply throughput (the core AI-compute metric) ---- */
+    {
+        const int N = 2048;                    /* large enough to saturate */
+        double f32 = run_matmul(dev, queue, N, MPSDataTypeFloat32,
+                                MAX(seconds * 0.5, 0.5));
+        double f16 = run_matmul(dev, queue, N, MPSDataTypeFloat16,
+                                MAX(seconds * 0.5, 0.5));
+        if (f32 > 0) add_result(@"GPU matmul FP32 (GEMM)", @"TFLOPS", f32);
+        if (f16 > 0) add_result(@"GPU matmul FP16 (GEMM)", @"TFLOPS", f16);
     }
 
     /* ---- Device memory bandwidth ---- */
@@ -221,10 +291,29 @@ static NSDictionary *run_gpu(double seconds) { @autoreleasepool {
 } }
 
 /* --------------------------- Neural Engine ----------------------------- */
-/* Runs the model under one MLComputeUnits setting; returns inferences/sec. */
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* Percentile (0..100) of an unsorted array of per-inference milliseconds.
+ * Tail latency (p99) matters for interactive AI: a good average with a bad
+ * p99 still produces visible stutter. */
+static double percentile(double *v, long n, double p) {
+    if (n <= 0) return 0.0;
+    qsort(v, n, sizeof(double), cmp_double);
+    long idx = (long)(p / 100.0 * (n - 1) + 0.5);
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    return v[idx];
+}
+
+/* Runs the model under one MLComputeUnits setting; returns inferences/sec.
+ * When `lat_ms` is non-NULL it also records each inference's latency (ms) so
+ * the caller can compute p50/p99. */
 static double run_coreml(NSURL *compiled, MLComputeUnits units,
                          NSArray<NSNumber *> *shape, double seconds,
-                         BOOL *ok) {
+                         BOOL *ok, NSMutableArray<NSNumber *> *lat_ms) {
     @autoreleasepool {
         NSError *err = nil;
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
@@ -256,10 +345,13 @@ static double run_coreml(NSURL *compiled, MLComputeUnits units,
         long long n = 0;
         do {
             @autoreleasepool {
+                double t0 = now_seconds();
                 if (![model predictionFromFeatures:feed error:&err]) {
                     *ok = NO;
                     return 0.0;
                 }
+                if (lat_ms)
+                    [lat_ms addObject:@((now_seconds() - t0) * 1000.0)];
             }
             ++n;
             elapsed = now_seconds() - start;
@@ -292,15 +384,16 @@ static NSDictionary *run_ane(NSString *modelPath, double seconds,
 
         BOOL ok = NO;
         double cpu = run_coreml(compiled, MLComputeUnitsCPUOnly, shape,
-                                seconds, &ok);
+                                seconds, &ok, nil);
         if (!ok) { add_note(@"Core ML CPU-only run failed"); return nil; }
 
+        NSMutableArray<NSNumber *> *aneLat = [NSMutableArray array];
         double ane = run_coreml(compiled, MLComputeUnitsCPUAndNeuralEngine,
-                                shape, seconds, &ok);
+                                shape, seconds, &ok, aneLat);
         if (!ok) { add_note(@"Core ML ANE run failed"); ane = 0.0; }
 
         double all = run_coreml(compiled, MLComputeUnitsAll, shape,
-                                seconds, &ok);
+                                seconds, &ok, nil);
         if (!ok) all = 0.0;
 
         add_result(@"Core ML CPU-only", @"inferences/s", cpu);
@@ -309,6 +402,19 @@ static NSDictionary *run_ane(NSString *modelPath, double seconds,
         if (ane > 0)
             add_result(@"Neural Engine throughput", @"GFLOPS",
                        ane * flopsPerInference / 1e9);
+
+        /* Tail latency on the ANE path. */
+        double p50 = 0, p99 = 0;
+        long nl = (long)aneLat.count;
+        if (nl > 0) {
+            double *tmp = (double *)malloc(sizeof(double) * nl);
+            for (long i = 0; i < nl; ++i) tmp[i] = aneLat[i].doubleValue;
+            p50 = percentile(tmp, nl, 50.0);
+            p99 = percentile(tmp, nl, 99.0);
+            free(tmp);
+            add_result(@"Neural Engine latency p50", @"ms", p50);
+            add_result(@"Neural Engine latency p99", @"ms", p99);
+        }
 
         double speedup = (cpu > 0) ? ane / cpu : 0.0;
         /* Core ML never reports placement directly, so the speedup over a
@@ -323,6 +429,8 @@ static NSDictionary *run_ane(NSString *modelPath, double seconds,
                  @"ane_ips": @(ane),
                  @"best_ips": @(all),
                  @"speedup_vs_cpu": @(speedup),
+                 @"latency_p50_ms": @(p50),
+                 @"latency_p99_ms": @(p99),
                  @"engaged": @(engaged)};
     }
 }

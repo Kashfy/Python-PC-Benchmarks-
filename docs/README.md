@@ -20,3 +20,5 @@ project [README](../README.md) for a quick start, then dive in here.
 - **What is the composite score?** → [technical: scoring](technical.md#scoring)
 - **Why didn't the Neural Engine engage?** → [troubleshooting: ANE](troubleshooting.md#neural-engine-did-not-engage)
 - **Why no GPU benchmark on Windows/Linux?** → [technical: coverage](technical.md#what-is-and-isnt-covered)
+- **How do I get real AI training numbers?** → [technical: AI framework tier](technical.md#ai-training--inference-optional-framework-tier)
+- **Is the power number real or estimated?** → [technical: power](technical.md#power--perf-per-watt)

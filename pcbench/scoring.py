@@ -33,7 +33,12 @@ BASELINES = {
     "gpu_fp32": 1_000.0,           # GFLOPS
     "gpu_fp16": 1_500.0,           # GFLOPS
     "gpu_bandwidth": 100_000.0,    # MB/s
+    "gpu_matmul_fp32": 1.0,        # TFLOPS (dense GEMM — the AI-compute metric)
+    "gpu_matmul_fp16": 2.0,        # TFLOPS
     "npu": 2_000.0,                # GFLOPS effective
+    # AI framework tier (optional; only when torch/onnxruntime present).
+    "ml_train": 500.0,             # training samples/s
+    "ml_infer": 2_000.0,           # inference samples/s
 }
 
 # Which result key and field each score is derived from.
@@ -51,7 +56,11 @@ _SOURCES = [
     ("gpu_fp32", "gpu_fp32", "rate"),
     ("gpu_fp16", "gpu_fp16", "rate"),
     ("gpu_bandwidth", "gpu_bandwidth", "rate"),
+    ("gpu_matmul_fp32", "gpu_matmul_fp32", "rate"),
+    ("gpu_matmul_fp16", "gpu_matmul_fp16", "rate"),
     ("npu", "npu", "rate"),
+    ("ml_train", "ml_train", "rate"),
+    ("ml_infer", "ml_infer", "rate"),
 ]
 
 
@@ -84,8 +93,11 @@ def category_scores(subscores: dict) -> dict:
                 "hashing", "json"],
         "memory": ["memory"],
         "disk": ["disk_write", "disk_read", "disk_iops"],
-        "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth"],
+        "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
+                "gpu_matmul_fp32", "gpu_matmul_fp16"],
         "npu": ["npu"],
+        "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu",
+               "ml_train", "ml_infer"],
     }
     out = {}
     for name, keys in groups.items():
