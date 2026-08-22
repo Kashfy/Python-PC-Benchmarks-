@@ -771,36 +771,269 @@ droop     = (1 - sustained/peak) × 100
 
 ## Scoring
 
-Each rate is normalized against a fixed baseline (**baseline = 100**):
+Every raw rate is turned into a score against a fixed baseline, so that figures
+in wildly different units — primes per second, MB/s, IOPS, TFLOPS — can be
+compared and combined at all.
+
+### The two formulas
 
 ```
 subscore  = 100 × measured_rate / baseline_rate
-composite = exp( mean( ln(subscore_i) ) )        # geometric mean
+
+category  = exp( mean( ln(subscore) for subscores in that category ) )
+composite = exp( mean( ln(subscore) for ALL subscores ) )
 ```
 
-The geometric mean prevents any single category from dominating — a machine
-must be well-rounded to score highly — and stays meaningful when subscores span
-very different magnitudes. Subscores also roll up into CPU / MEMORY / DISK
-category scores.
+Both rollups are **geometric** means. Note what the composite is *not*: it is
+not an average of the category scores. It averages every subscore directly, so a
+category with six members (`gpu`) carries more weight in the composite than one
+with two (`memory`). Averaging the categories instead would silently make a
+two-metric category as important as a six-metric one.
+
+A score of **100 is the baseline machine**, 200 is twice as fast, 50 is half.
+
+### Worked example
+
+From a real run on an Apple M1 Max, using its own reported numbers:
+
+**One subscore** — `cpu_int` measured 2,268,000 primes/s against a baseline of
+2,000,000:
+
+```
+100 × 2,268,000 / 2,000,000  =  113.4
+```
+
+**One category** — `memory` averages `memory` (761.2) and `mem_scaling`
+(494.7):
+
+```
+exp( (ln 761.2 + ln 494.7) / 2 )  =  613.6
+```
+
+**The composite** — the geometric mean of all 38 subscores that run produced:
+
+```
+exp( (ln 113.4 + ln 270.4 + … + ln 266.5) / 38 )  =  226.2
+```
+
+### Why geometric rather than arithmetic
+
+On that same run the arithmetic mean of the 38 subscores is **285.0** against a
+geometric mean of **226.2** — 26% higher. The gap is almost entirely two
+outliers, `disk_write` at 1405.6 and `gpu_matmul_fp32` at 809.4.
+
+An arithmetic mean lets one exceptional subsystem hide several weak ones,
+because adding 1000 to one metric raises the average as much as adding 100 to
+ten metrics. A geometric mean multiplies ratios instead of adding magnitudes, so
+halving any one subscore reduces the composite by the same proportion no matter
+which one it is. A machine has to be well-rounded to score highly, which is the
+property the number is meant to have.
+
+It also makes the composite independent of the units each metric happens to use:
+scoring `disk_read` in GB/s rather than MB/s would change an arithmetic mean and
+leaves a geometric one untouched.
+
+### What is included, excluded, and skipped
+
+**Absent hardware is omitted, never scored as zero.** A machine with no GPU
+simply has no `gpu_*` subscores, and its composite is the geometric mean of what
+it does have. Scoring a missing GPU as 0 would drive the composite to zero (any
+zero term collapses a geometric mean), and scoring it as some low number would
+penalise a machine for lacking hardware it was never asked to have. The same
+applies to every optional tier — no NumPy means no `blas_matmul`, and the
+composite is computed from the rest.
+
+This is worth remembering when comparing two machines: **a composite is only
+comparable to another composite built from the same set of subscores.** A run
+with the GPU tier and one without are not measuring the same thing. The full
+subscore list is printed above every composite for exactly this reason, and the
+JSON payload records each one.
+
+**`fsync` is measured and reported but deliberately never scored.** Durable
+commit latency is the single most useful storage diagnostic here, but the
+operation being timed is not the same across platforms: macOS needs
+`F_FULLFSYNC` to reach the medium where Linux's `fsync` suffices, and the two
+differ by two orders of magnitude on identical hardware. Folding that into a
+cross-platform composite would measure the operating system's flush semantics
+rather than the drive.
+
+**Plugins join like any built-in.** A plugin declares its own baseline, is
+scored the same way, and enters the composite — `plugin_example_pi` at 266.5 is
+one of the 38 terms in the worked example above. Excluding the plugin from that
+run gives 225.2 instead of 226.2.
+
+**A failed or skipped test contributes nothing** rather than a penalty. A
+validation failure is reported separately and sets the exit code; it does not
+quietly drag the score down.
 
 ### Baseline constants
 
-| Metric | Baseline |
-|--------|----------|
-| `cpu_int` | 2,000,000 primes/s |
-| `cpu_float` | 3,000,000 iters/s |
-| `cpu_multi` | 8,000,000 primes/s |
-| `compression` | 60 MB/s |
-| `hashing` | 500 MB/s |
-| `json` | 80 MB/s |
-| `memory` | 6,000 MB/s |
-| `disk_write` | 500 MB/s |
-| `disk_read` | 1,000 MB/s |
-| `disk_iops` | 20,000 IOPS |
+The baselines are **arbitrary but stable** — roughly a mid-range 2020-era
+laptop. Their only job is to be a fixed yardstick, so **changing one invalidates
+every previously recorded comparison**, and they are treated as frozen.
 
-These are arbitrary but **stable** — roughly a mid-range 2020-era laptop core.
-Their only job is to be a fixed yardstick, so changing one invalidates
-comparisons against previously recorded runs.
+They are calibrated so the reference machine scores exactly 100 on each metric;
+a unit test asserts this, so a baseline cannot drift from its documented value
+without failing the suite.
+
+**CPU (single- and multi-core)**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `cpu_int` | 2,000,000 | primes/s, single core |
+| `cpu_float` | 3,000,000 | iters/s, single core |
+| `cpu_multi` | 8,000,000 | primes/s, all cores |
+| `compression` | 60 | MB/s zlib round-trip |
+| `hashing` | 500 | MB/s SHA-256 |
+| `json` | 80 | MB/s parse |
+
+**Memory**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `memory` | 6,000 | MB/s copy |
+| `mem_scaling` | 20,000 | peak multi-process copy bandwidth MB/s |
+
+**Storage**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `disk_write` | 500 | MB/s |
+| `disk_read` | 1,000 | MB/s |
+| `disk_iops` | 20,000 | 4 KiB random read ops/s |
+| `disk_iops_peak` | 100,000 | peak random-read IOPS across queue depths |
+
+**System / OS**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `compile` | 300 | compiles per minute |
+| `syscall` | 20,000,000 | syscalls/s (i.e. 50 ns each) |
+
+**Application workloads**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `sqlite` | 50,000 | SQLite OLTP transactions/s |
+| `raytrace` | 150 | ray-traced frames/s |
+| `image` | 2.5 | megapixels/s through a separable blur |
+| `logparse` | 80 | MB/s of regex log parsing |
+| `video` | 70 | H.264 1080p encode fps (needs ffmpeg) |
+
+**Reference standards**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `stream_triad` | 30,000 | MB/s, STREAM's 1e6-byte convention |
+| `coremark_style` | 18,000 | iterations/s |
+| `linpack` | 45 | GFLOPS, HPL operation count |
+
+**Classic ML (pure Python)**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `nn_training` | 400 | MLP training steps/s |
+| `kmeans` | 1,000,000 | point-centroid distances/s |
+| `knn` | 1,000,000 | neighbour comparisons/s |
+
+**Numerics (needs NumPy/SciPy)**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `blas_matmul` | 100 | GFLOPS fp64 via BLAS |
+| `fft` | 5 | GFLOPS |
+| `lapack` | 500 | Cholesky decompositions/s |
+
+**Crypto & compression (optional)**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `aes` | 2,000 | MB/s AES-256-GCM |
+| `zstd` | 400 | MB/s Zstandard |
+| `lz4` | 800 | MB/s LZ4 |
+| `blake3` | 1,000 | MB/s BLAKE3 |
+
+**GPU**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `gpu_fp32` | 1,000 | GFLOPS |
+| `gpu_fp16` | 1,500 | GFLOPS |
+| `gpu_bandwidth` | 100,000 | MB/s |
+| `gpu_matmul_fp32` | 1 | TFLOPS (dense GEMM — the AI-compute metric) |
+| `gpu_matmul_fp16` | 2 | TFLOPS |
+| `gpu_opencl` | 1,000 | GFLOPS via OpenCL |
+
+**NPU**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `npu` | 2,000 | GFLOPS effective |
+| `npu_onnx` | 500 | GFLOPS on the fastest engaged accelerator |
+
+**AI frameworks (needs PyTorch/ONNX)**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `ml_train` | 500 | training samples/s |
+| `ml_infer` | 2,000 | inference samples/s |
+
+**Data science**
+
+| Subscore | Baseline (= 100) | Meaning |
+|---|---:|---|
+| `llm_prefill` | 2,400 | tokens/s, compute-bound phase |
+| `llm_decode` | 120 | tokens/s, bandwidth-bound phase |
+| `dataloader` | 800 | samples/s through the input pipeline |
+| `dataframe` | 11 | four-query suite completions/s |
+
+
+
+### Category rollups
+
+Categories are geometric means of whichever of their members were measured.
+Two are special:
+
+- **`ai`** is a cross-cutting roll-up of GPU, NPU, framework and LLM subscores
+  that already appear in other categories. It is therefore **excluded from
+  bottleneck analysis**, where counting it would double-count those metrics and
+  distort the median every other category is judged against.
+- **`ml`** covers the pure-Python workloads. They measure the interpreter
+  running on the CPU rather than an independent subsystem — measured on real
+  hardware they track `cpu_int` to within 2-4% — so the bottleneck analysis
+  attributes a weak `ml` to single-core CPU throughput instead of naming it as
+  a separate finding. It still contributes to the composite, because
+  pure-Python ML speed is a real thing to care about if that is what you run.
+
+#### Category membership
+
+| Category | Subscores averaged |
+|---|---|
+| **cpu** | `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json` |
+| **numeric** | `blas_matmul`, `fft`, `lapack` |
+| **crypto** | `aes`, `zstd`, `lz4`, `blake3` |
+| **memory** | `memory`, `mem_scaling` |
+| **disk** | `disk_write`, `disk_read`, `disk_iops`, `disk_iops_peak` |
+| **system** | `compile`, `syscall` |
+| **apps** | `sqlite`, `raytrace`, `image`, `logparse`, `video` |
+| **standards** | `stream_triad`, `coremark_style`, `linpack` |
+| **datascience** | `llm_prefill`, `llm_decode`, `dataloader`, `dataframe` |
+| **gpu** | `gpu_fp32`, `gpu_fp16`, `gpu_bandwidth`, `gpu_matmul_fp32`, `gpu_matmul_fp16`, `gpu_opencl` |
+| **npu** | `npu`, `npu_onnx` |
+| **ml** | `nn_training`, `kmeans`, `knn` |
+| **ai** | `gpu_matmul_fp32`, `gpu_matmul_fp16`, `npu`, `npu_onnx`, `ml_train`, `ml_infer`, `nn_training`, `kmeans`, `knn`, `llm_prefill`, `llm_decode` |
+
+### Reading the score
+
+The composite is a single number and hides everything interesting. Two things
+in the report exist to put it in context:
+
+- **Bottleneck analysis** compares categories against this machine's own median,
+  answering "what is weak *for this machine*" — which is what decides whether an
+  upgrade would help.
+- **Performance class** places the composite in a named band and checks it
+  against the machine's own single-core anchor, so a single run is interpretable
+  with no history to compare against.
 
 ## Chip-architecture normalization
 

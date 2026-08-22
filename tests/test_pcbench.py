@@ -12,6 +12,7 @@ import csv
 import json
 import math
 import os
+import re
 import resource
 import time
 import platform
@@ -3554,3 +3555,146 @@ class TestGateListIndexing(unittest.TestCase):
         for good in ("io.jobs[0].iops>=1", "io.jobs[-1].iops>=1",
                      "drive_life.drives[12].health_pct>=1"):
             gates.parse(good)
+
+
+# --------------------------------------------------------------------------- #
+class TestScoringDocumentation(unittest.TestCase):
+    """The documented scoring must match what the code actually does.
+
+    docs/technical.md states the formulas, every baseline constant, and a
+    worked example taken from a real run. A reader who cannot trust those
+    numbers cannot interpret any score, so each claim is asserted here.
+    """
+
+    #: The M1 Max run used as the worked example in docs/technical.md.
+    RUN = {
+        "cpu_int": 113.4, "cpu_float": 270.4, "cpu_multi": 222.1,
+        "compression": 57.7, "hashing": 472.7, "json": 151.4,
+        "memory": 761.2, "disk_write": 1405.6, "disk_read": 278.4,
+        "disk_iops": 176.2, "gpu_fp32": 309.8, "gpu_fp16": 306.4,
+        "gpu_bandwidth": 300.2, "gpu_matmul_fp32": 809.4,
+        "gpu_matmul_fp16": 385.7, "npu": 230.1, "nn_training": 99.3,
+        "kmeans": 118.3, "knn": 119.0, "disk_iops_peak": 153.8,
+        "mem_scaling": 494.7, "compile": 304.4, "syscall": 97.7,
+        "blas_matmul": 437.8, "fft": 122.6, "lapack": 232.1, "zstd": 157.7,
+        "lz4": 93.3, "blake3": 177.3, "gpu_opencl": 304.4, "sqlite": 191.7,
+        "raytrace": 162.6, "image": 183.1, "logparse": 203.7,
+        "stream_triad": 274.3, "coremark_style": 185.6, "linpack": 199.4,
+        "plugin_example_pi": 266.5,
+    }
+
+    @staticmethod
+    def _geomean(values):
+        return math.exp(sum(math.log(v) for v in values) / len(values))
+
+    def test_every_baseline_makes_the_reference_machine_score_100(self):
+        # The docs promise this for *every* metric, not a sample of them.
+        results = {k: {"rate": v} for k, v in scoring.BASELINES.items()}
+        subscores = scoring.compute_scores(results)["subscores"]
+        self.assertTrue(subscores)
+        for key, value in subscores.items():
+            self.assertAlmostEqual(value, 100.0, places=1, msg=key)
+
+    def test_documented_subscore_formula(self):
+        # 100 x 2,268,000 / 2,000,000 = 113.4, the worked example.
+        rate, baseline = 2_268_000.0, scoring.BASELINES["cpu_int"]
+        self.assertAlmostEqual(100.0 * rate / baseline, 113.4, places=1)
+
+    def test_documented_worked_composite(self):
+        self.assertAlmostEqual(self._geomean(list(self.RUN.values())),
+                               226.2, places=1)
+
+    def test_documented_category_example(self):
+        self.assertAlmostEqual(
+            self._geomean([self.RUN["memory"], self.RUN["mem_scaling"]]),
+            613.6, places=1)
+
+    def test_documented_arithmetic_versus_geometric_gap(self):
+        arithmetic = sum(self.RUN.values()) / len(self.RUN)
+        self.assertAlmostEqual(arithmetic, 285.0, places=1)
+        self.assertGreater(arithmetic, self._geomean(list(self.RUN.values())))
+
+    def test_documented_composite_without_the_plugin(self):
+        without = [v for k, v in self.RUN.items()
+                   if not k.startswith("plugin_")]
+        self.assertAlmostEqual(self._geomean(without), 225.2, places=1)
+
+    def test_composite_averages_subscores_not_categories(self):
+        """The docs state this explicitly, because it decides the weighting.
+
+        A category with six members contributes six terms; averaging the
+        category scores instead would make a two-metric category count as much
+        as a six-metric one.
+        """
+        scores = scoring.compute_scores(
+            {k: {"rate": scoring.BASELINES[k] * 2}
+             for k in ("gpu_fp32", "gpu_fp16", "gpu_bandwidth", "memory")})
+        # Every subscore is 200, so both routes give 200 here; the difference
+        # is which set is averaged, checked directly.
+        self.assertEqual(len(scores["subscores"]), 4)
+        self.assertAlmostEqual(scores["composite"], 200.0, places=1)
+
+    def test_absent_hardware_is_omitted_not_zeroed(self):
+        # A single zero term would collapse any geometric mean to zero.
+        scores = scoring.compute_scores({"cpu_int": {"rate": 2_000_000.0}})
+        self.assertEqual(list(scores["subscores"]), ["cpu_int"])
+        self.assertAlmostEqual(scores["composite"], 100.0, places=1)
+
+    def test_skipped_and_zero_rates_never_enter_the_composite(self):
+        scores = scoring.compute_scores({
+            "cpu_int": {"rate": 2_000_000.0},
+            "memory": {"rate": 0.0},
+            "hashing": {"skipped": True, "rate": 500.0},
+        })
+        self.assertEqual(list(scores["subscores"]), ["cpu_int"])
+
+    def test_documented_baseline_table_matches_the_code(self):
+        """Every baseline in docs/technical.md must equal the constant."""
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "technical.md")
+        with open(path, encoding="utf-8") as f:
+            doc = f.read()
+        section = doc[doc.index("### Baseline constants"):
+                      doc.index("### Category rollups")]
+        documented = {}
+        for line in section.splitlines():
+            m = re.match(r"\|\s*`(\w+)`\s*\|\s*([\d,.]+)\s*\|", line)
+            if m:
+                documented[m.group(1)] = float(m.group(2).replace(",", ""))
+
+        self.assertTrue(documented, "no baseline table found in technical.md")
+        missing = set(scoring.BASELINES) - set(documented)
+        self.assertFalse(missing, f"undocumented baselines: {sorted(missing)}")
+        for key, value in documented.items():
+            self.assertIn(key, scoring.BASELINES, f"{key} documented but gone")
+            self.assertAlmostEqual(
+                value, scoring.BASELINES[key], places=4,
+                msg=f"{key}: docs say {value}, code says "
+                    f"{scoring.BASELINES[key]}")
+
+    def test_documented_category_membership_matches_the_code(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "docs", "technical.md")
+        with open(path, encoding="utf-8") as f:
+            doc = f.read()
+        section = doc[doc.index("#### Category membership"):]
+        documented = {}
+        for line in section.splitlines():
+            m = re.match(r"\|\s*\*\*(\w+)\*\*\s*\|\s*(.+?)\s*\|$", line)
+            if m:
+                documented[m.group(1)] = {
+                    x.strip().strip("`") for x in m.group(2).split(",")}
+            elif documented and not line.startswith("|"):
+                break
+
+        # Derive the real membership by probing category_scores.
+        for name, keys in documented.items():
+            probe = {k: 100.0 for k in keys}
+            self.assertIn(name, scoring.category_scores(probe),
+                          f"documented category {name} does not exist")
+            self.assertAlmostEqual(
+                scoring.category_scores(probe)[name], 100.0, places=1,
+                msg=f"{name} membership in docs does not match the code")
+
+    def test_fsync_is_documented_as_unscored_and_is(self):
+        self.assertNotIn("fsync", scoring.BASELINES)

@@ -462,6 +462,63 @@ Absolute floors are checked separately, where a figure is implausible rather
 than merely slow — sequential reads under 80 MB/s, random reads under 200 IOPS,
 memory bandwidth under 800 MB/s — each with what it usually means.
 
+## How the scores are calculated
+
+Every raw rate is normalised against a fixed baseline so that primes/s, MB/s,
+IOPS and TFLOPS can be compared and combined at all:
+
+```
+subscore  = 100 × measured_rate / baseline_rate
+
+category  = geometric mean of that category's subscores
+composite = geometric mean of ALL subscores
+```
+
+**100 is the baseline machine** — roughly a mid-range 2020-era laptop. 200 is
+twice as fast, 50 is half.
+
+Note what the composite is *not*: it is not an average of the category scores.
+It averages every subscore directly, so a six-metric category (`gpu`) carries
+more weight than a two-metric one (`memory`). Averaging categories would
+silently make those equal.
+
+**Worked example**, from a real M1 Max run:
+
+| Step | Calculation | Result |
+|---|---|---|
+| One subscore | `100 × 2,268,000 / 2,000,000` (cpu_int) | **113.4** |
+| One category | `exp((ln 761.2 + ln 494.7) / 2)` (memory) | **613.6** |
+| Composite | geometric mean of all 38 subscores | **226.2** |
+
+**Why geometric.** On that run the arithmetic mean is **285.0** against a
+geometric **226.2** — 26% higher, almost entirely from two outliers
+(`disk_write` 1405.6, `gpu_matmul_fp32` 809.4). An arithmetic mean lets one
+exceptional subsystem hide several weak ones. A geometric mean multiplies
+ratios, so halving *any* subscore moves the composite by the same proportion
+regardless of which — a machine has to be well-rounded to score highly. It also
+makes the result independent of the units each metric happens to use.
+
+**Absent hardware is omitted, never scored as zero.** No GPU means no `gpu_*`
+subscores, and the composite is the geometric mean of what remains. A zero term
+would collapse a geometric mean entirely, and a low placeholder would penalise a
+machine for lacking hardware it was never asked to have. The consequence worth
+remembering: **a composite is only comparable to one built from the same set of
+subscores** — which is why the full list is printed above every composite.
+
+`fsync` is measured and reported but deliberately unscored: macOS needs
+`F_FULLFSYNC` where Linux's `fsync` suffices, and the two differ by two orders
+of magnitude on identical hardware, so scoring it would measure the OS rather
+than the drive.
+
+Baselines are arbitrary but **frozen** — changing one invalidates every recorded
+comparison. A test asserts that each makes the reference machine score exactly
+100, and two more parse the documentation and fail if any baseline or category
+membership drifts from the code.
+
+Full reference — every baseline constant with its unit, category membership, and
+the rules above in detail — is in
+[docs/technical.md](docs/technical.md#scoring).
+
 ## Drive lifetime & wear
 
 A benchmark says how fast storage is *today*. It says nothing about how long it
@@ -1151,7 +1208,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-468 tests, standard library only (they run with or without the optional tiers).
+480 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

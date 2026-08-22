@@ -623,6 +623,13 @@ def print_scores(scores: dict) -> None:
             print(f"  {k.upper():<16}: {v:>9.1f}")
     print(f"  {'-' * 27}")
     print(f"  {'COMPOSITE':<16}: {scores['composite']:>9.1f}")
+    # Without this the reader cannot tell what the number is a mean *of*, and
+    # the answer matters: absent hardware is omitted rather than scored zero,
+    # so two composites are only comparable across the same set of subscores.
+    print(f"      subscore = 100 x rate / baseline; composite = geometric "
+          f"mean of all {len(scores['subscores'])} subscores above")
+    print(f"      (absent hardware is omitted, not scored as zero — see "
+          f"docs/technical.md#scoring)")
 
 
 def print_apps(results: dict) -> None:
