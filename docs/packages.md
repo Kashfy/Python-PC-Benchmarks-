@@ -242,6 +242,12 @@ Apple-only (Metal + Core ML); see
 | `--no-power` | off | Skip power / perf-per-watt |
 | `--no-network` | off | Skip the loopback network benchmark |
 | `--no-regression` | off | Skip run-over-run regression detection |
+| `--health` | off | RAM integrity + drive SMART checks |
+| `--health-mb N` | `256` | Memory covered by the RAM integrity test |
+| `--spec-sheet` | off | Write a one-page Markdown spec sheet |
+| `--no-plugins` | off | Skip benchmarks in `plugins/` |
+| `--network-host H` | none | Measure real latency to a host (**sends external traffic**) |
+| `--network-url U` | none | Measure download throughput (**sends external traffic**) |
 | `--no-optional` | off | Skip every benchmark that needs an optional package |
 | `--regression-threshold P` | `10` | Percent change counting as a regression |
 
@@ -289,7 +295,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-204 cases, standard library only — no pytest, no test dependencies.
+238 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

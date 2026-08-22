@@ -57,6 +57,63 @@ def latest_per_host(rows: list[dict]) -> list[dict]:
                   reverse=True)
 
 
+# Metrics that are pure-Python loops, and so reflect the interpreter as well
+# as the hardware. Comparing these across CPython versions is not valid.
+_INTERPRETER_BOUND = {
+    "cpu_int_primes_s", "cpu_multi_primes_s", "nn_train_steps_s",
+    "kmeans_dist_s", "knn_cmp_s", "composite_score",
+}
+
+# Two machines whose composite scores differ by less than this are treated as
+# indistinguishable. Benchmarks carry a few percent of run-to-run noise, so a
+# smaller gap is not evidence of a real difference.
+SIGNIFICANCE_THRESHOLD = 0.05
+
+
+def _interpreter_warning(entries: list[dict], shown: list[str]) -> str | None:
+    """Warn when compared runs used different Python versions.
+
+    Names the specific columns affected, since the hardware-bound ones
+    (SHA-256, disk, BLAS, GPU) remain perfectly valid across versions — only
+    the pure-Python loops do not.
+    """
+    versions = {r.get("python_version", "") for r in entries
+                if r.get("python_version")}
+    if len(versions) <= 1:
+        return None
+    affected = [c for c in shown if c in _INTERPRETER_BOUND]
+    listed = ", ".join(sorted(versions))
+    text = (f"  !  Runs used different Python versions ({listed}). "
+            f"Pure-Python benchmarks\n     depend on the interpreter, which "
+            f"differs by tens of percent between\n     CPython releases.")
+    if affected:
+        text += (f"\n     Affected here: {', '.join(affected)}."
+                 f"\n     Hardware-bound columns are unaffected.")
+    return text
+
+
+def _spread_by_host(rows: list[dict]) -> dict:
+    """Observed composite-score spread per host, from repeated runs.
+
+    A machine's own run-to-run variation is the fairest yardstick for deciding
+    whether a gap to another machine is meaningful.
+    """
+    import statistics
+    from collections import defaultdict
+    scores = defaultdict(list)
+    for r in rows:
+        v = _to_float(r.get("composite_score"))
+        if v:
+            scores[r.get("hostname", "?")].append(v)
+    out = {}
+    for host, values in scores.items():
+        if len(values) >= 2:
+            mean = statistics.fmean(values)
+            if mean:
+                out[host] = statistics.stdev(values) / mean
+    return out
+
+
 def render_table(rows: list[dict], all_runs: bool = False) -> str:
     """Render a ranked comparison table as text."""
     if not rows:
@@ -96,7 +153,31 @@ def render_table(rows: list[dict], all_runs: bool = False) -> str:
     lines.append("")
     lines.append(f"  {len(entries)} machine(s). "
                  f"{'All runs' if all_runs else 'Latest run per host'}.")
+
+    # Say plainly when a ranking gap is too small to mean anything.
+    spread = _spread_by_host(rows)
+    if len(entries) >= 2 and top:
+        second = _to_float(entries[1].get("composite_score"))
+        if second:
+            gap = abs(top - second) / top
+            noise = max(spread.get(_host(entries[0]), 0.0),
+                        spread.get(_host(entries[1]), 0.0),
+                        SIGNIFICANCE_THRESHOLD)
+            if gap < noise:
+                lines.append(
+                    f"  Note: the top two differ by {gap * 100:.1f}%, within "
+                    f"the {noise * 100:.0f}% run-to-run noise — "
+                    f"treat them as equivalent.")
+
+    warning = _interpreter_warning(entries, [c[0] for c in present])
+    if warning:
+        lines.append("")
+        lines.append(warning)
     return "\n".join(lines)
+
+
+def _host(row: dict) -> str:
+    return row.get("hostname", "?")
 
 
 def _label(row: dict) -> str:

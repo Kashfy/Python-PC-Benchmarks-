@@ -13,6 +13,10 @@ from datetime import datetime, timezone
 from . import __version__
 from . import accel as accel_mod
 from . import cores as cores_mod
+from . import diagnose
+from . import health
+from . import plugins as plugins_mod
+from . import interference
 from . import cryptobench
 from . import gpucompute
 from . import numeric
@@ -90,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group("output")
     g.add_argument("--output-dir", default="results",
                    help="Directory for JSON/CSV/HTML output")
+    g.add_argument("--spec-sheet", action="store_true",
+                   help="Also write a one-page Markdown spec sheet")
     g.add_argument("--html", action="store_true",
                    help="Also write a self-contained HTML report")
     g.add_argument("--json-stdout", action="store_true",
@@ -121,6 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Batch size for the ML-framework benchmark")
     g.add_argument("--no-power", action="store_true",
                    help="Skip power / perf-per-watt measurement")
+    g.add_argument("--health", action="store_true",
+                   help="Run RAM integrity and drive SMART health checks")
+    g.add_argument("--health-mb", type=int, default=256,
+                   help="Memory to cover in the RAM integrity test")
+    g.add_argument("--network-host", default="", metavar="HOST",
+                   help="Measure real latency to this host (sends external "
+                        "traffic; off by default)")
+    g.add_argument("--network-url", default="", metavar="URL",
+                   help="Measure download throughput from this URL (sends "
+                        "external traffic; off by default)")
+    g.add_argument("--no-plugins", action="store_true",
+                   help="Skip benchmarks found in the plugins/ directory")
     g.add_argument("--no-network", action="store_true",
                    help="Skip the loopback network benchmark")
     g.add_argument("--no-regression", action="store_true",
@@ -304,8 +322,20 @@ def main(argv=None) -> int:
     for name in selected:
         if not quiet:
             print(f"  running {name} ...", flush=True)
+        before = interference.sample(_repo_root())
         try:
             results[name] = runners[name]()
+            # Conditions are checked around each test, not just once at the
+            # start: a run takes minutes and the machine can change underneath
+            # it, which no amount of repetition inside the test would reveal.
+            if isinstance(results[name], dict):
+                verdict = interference.compare_samples(
+                    before, interference.sample(_repo_root()))
+                if verdict["disturbed"]:
+                    results[name]["interference"] = verdict
+                    if not quiet:
+                        for note in verdict["notes"]:
+                            print(f"    ! {name}: {note}", file=sys.stderr)
         except ValidationError as e:
             # A wrong answer is a hardware finding, not a crash.
             results[name] = {"error": str(e), "validation_failed": True}
@@ -359,6 +389,31 @@ def main(argv=None) -> int:
         if not quiet:
             print("  running network benchmark ...", flush=True)
         net = network.run(min(args.seconds, 2.0))
+
+    # User-supplied benchmarks from plugins/, treated like built-ins.
+    plugin_results = None
+    if not args.no_plugins:
+        found = plugins_mod.discover(_repo_root())
+        if found:
+            if not quiet:
+                print(f"  running {len(found)} plugin(s) ...", flush=True)
+            plugin_results = plugins_mod.run_all(
+                found, args.seconds, args.repeats)
+
+    # Hardware health checks — opt-in, since the RAM test takes a while.
+    health_result = None
+    if args.health:
+        if not quiet:
+            print("  running health checks ...", flush=True)
+        health_result = health.run(args.health_mb,
+                                   info.get("ram_total_bytes", 0))
+
+    # External network tests only run when a target was named.
+    if net is not None and (args.network_host or args.network_url):
+        if not quiet:
+            print("  running external network tests ...", flush=True)
+        net["external"] = network.run_external(args.network_host or None,
+                                               args.network_url or None)
 
     # Power / perf-per-watt, sampled under load.
     power_info = None
@@ -416,6 +471,15 @@ def main(argv=None) -> int:
                                   workers, _repo_root())
 
     scores = compute_scores(results)
+    if plugin_results:
+        # Plugins score against their own declared baselines and join the
+        # composite like any built-in metric.
+        scores["subscores"].update(plugins_mod.scores(plugin_results))
+        if scores["subscores"]:
+            import math as _math
+            import statistics as _stats
+            scores["composite"] = round(_math.exp(_stats.fmean(
+                _math.log(v) for v in scores["subscores"].values() if v > 0)), 1)
     ppw = power.perf_per_watt(scores["composite"], power_info) if power_info \
         else None
 
@@ -431,6 +495,7 @@ def main(argv=None) -> int:
         "system": info,
         "state": state,
         "warnings": warnings,
+        "interference": interference.summarize(results),
         "results": results,
         "native": native,
         "accelerators": accel_inv,
@@ -446,6 +511,9 @@ def main(argv=None) -> int:
         "perf_per_watt": ppw,
         "sustained": sustained,
         "scores": scores,
+        "bottleneck": diagnose.analyse(scores),
+        "plugins": plugin_results,
+        "health": health_result,
     }
 
     # Regression check against this machine's own history.
@@ -466,12 +534,16 @@ def main(argv=None) -> int:
             cp = report_mod.append_csv(payload, args.output_dir)
             hp = (report_mod.save_html(payload, args.output_dir)
                   if args.html else None)
+            sp = (report_mod.save_spec_sheet(payload, args.output_dir)
+                  if args.spec_sheet else None)
             if not quiet:
                 report_mod.hr("Saved")
                 print(f"  JSON: {jp}")
                 print(f"  CSV : {cp}")
                 if hp:
                     print(f"  HTML: {hp}")
+                if sp:
+                    print(f"  SPEC: {sp}")
         except OSError as e:
             print(f"  ! could not save results: {e}", file=sys.stderr)
 

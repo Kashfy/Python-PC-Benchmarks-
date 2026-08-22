@@ -27,7 +27,11 @@ Python-PC-Benchmarks-/
 │   ├── mlbench.py      # pure-Python ML: NN training, k-means, k-NN
 │   ├── cores.py        # per-core scaling analysis and hybrid detection
 │   ├── sysbench.py     # compile benchmark, OS latency, CPU frequency
-│   ├── network.py      # loopback network stack
+│   ├── network.py      # loopback stack + opt-in external tests
+│   ├── interference.py # per-test detection of changed conditions
+│   ├── health.py       # RAM integrity, drive SMART (read-only)
+│   ├── diagnose.py     # bottleneck analysis, spec sheet
+│   ├── plugins.py      # discover and run user benchmarks
 │   ├── sustained.py    # thermal / sustained-load mode
 │   │   ── optional-package benchmarks ──
 │   ├── numeric.py      # BLAS matmul, FFT, LAPACK (numpy, scipy)
@@ -45,7 +49,8 @@ Python-PC-Benchmarks-/
 │   ├── report.py       # console / JSON / CSV / HTML output
 │   ├── compare.py      # cross-device ranking from CSV history
 │   └── regression.py   # run-over-run regression detection
-├── tests/              # 204 stdlib unittest cases
+├── plugins/            # drop-in user benchmarks (auto-discovered)
+├── tests/              # 238 stdlib unittest cases
 └── docs/
 ```
 

@@ -155,6 +155,51 @@ It deliberately reports *how far scaling stays linear* rather than exact P/E
 core counts — see [technical.md](docs/technical.md#core-scaling-analysis) for
 why that estimate proved unreliable.
 
+## Bottleneck analysis
+
+Every number is only useful if it answers "so what?". The tool compares each
+subsystem against the machine's **own** median and names the weak one:
+
+```
+Bottleneck Analysis
+    MEMORY    ██████████████████████████████   660.4  ← strongest
+    NPU       ███████████████████              421.6
+    DISK      ██████████████                   322.8
+    CPU       ██████████                       227.9
+    GPU       ███████                          160.0  ← bottleneck
+
+  Verdict: gpu is well below this machine's own average
+    • gpu: graphics and GPU compute are the weak point
+```
+
+`--spec-sheet` writes the same findings as a one-page Markdown summary.
+
+## Plugins — add your own benchmark
+
+Drop a file in `plugins/` and it is discovered, timed, scored, printed, and
+written to the CSV automatically:
+
+```python
+NAME = "My benchmark"
+UNIT = "ops/s"
+BASELINE = 1000.0        # rate corresponding to a score of 100
+
+def run(seconds, repeats):
+    return {"rate": measured_ops_per_second}
+```
+
+See [plugins/example_pi.py](plugins/example_pi.py).
+
+## Hardware health
+
+```bash
+python3 benchmark.py --health
+```
+
+RAM integrity (six adversarial bit patterns) and read-only drive SMART. The RAM
+test always states its scope: it covers only memory this process can allocate,
+so a pass does **not** certify your DIMMs — use MemTest86 for that.
+
 ## Thermal / sustained-load testing
 
 A three-second benchmark only measures *burst* speed. Thin and fanless laptops
@@ -440,7 +485,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-204 tests, standard library only (they run with or without the optional tiers).
+238 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 
