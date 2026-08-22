@@ -3037,35 +3037,83 @@ class TestPowerLoadIsParallel(unittest.TestCase):
         self.assertTrue(callable(power._burn))
         self.assertEqual(power._burn.__module__, "pcbench.power")
 
-    def test_load_saturates_more_than_one_core(self):
+    @staticmethod
+    def _thread_cores(workers: int, seconds: float) -> float:
+        """Cores kept busy by the original thread-based approach."""
+        import threading
+        stop = threading.Event()
+
+        def burn():
+            x = 0
+            while not stop.is_set():
+                for _ in range(10_000):
+                    x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+
+        before = resource.getrusage(resource.RUSAGE_SELF)
+        ts = [threading.Thread(target=burn, daemon=True)
+              for _ in range(workers)]
+        start = time.perf_counter()
+        for t in ts:
+            t.start()
+        time.sleep(seconds)
+        stop.set()
+        for t in ts:
+            t.join(timeout=5.0)
+        wall = time.perf_counter() - start
+        after = resource.getrusage(resource.RUSAGE_SELF)
+        cpu = ((after.ru_utime - before.ru_utime)
+               + (after.ru_stime - before.ru_stime))
+        return cpu / wall if wall else 0.0
+
+    @staticmethod
+    def _process_cores(workers: int, seconds: float) -> float:
+        """Cores kept busy by the process-based replacement."""
         import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        stop = ctx.Event()
+        ready = [ctx.Event() for _ in range(workers)]
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        procs = [ctx.Process(target=power._burn, args=(stop, ready[i]),
+                             daemon=True) for i in range(workers)]
+        for p in procs:
+            p.start()
+        # Spawn returns before the child is running; without waiting for the
+        # readiness signal the timed window includes several hundred
+        # milliseconds of Python startup per worker and the test is flaky.
+        for event in ready:
+            event.wait(timeout=20.0)
+        start = time.perf_counter()
+        time.sleep(seconds)
+        stop.set()
+        for p in procs:
+            p.join(timeout=10.0)
+        wall = time.perf_counter() - start
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        cpu = ((after.ru_utime - before.ru_utime)
+               + (after.ru_stime - before.ru_stime))
+        return cpu / wall if wall else 0.0
+
+    def test_processes_keep_more_cores_busy_than_threads(self):
+        """Processes must beat threads at raising load.
+
+        Asserted as a ratio rather than an absolute core count on purpose: an
+        absolute threshold fails on a busy CI runner or developer machine,
+        where neither approach can reach full speed. Contention scales both
+        measurements down together, so their ratio stays meaningful.
+        """
         cores = os.cpu_count() or 1
         if cores < 2:
             self.skipTest("needs at least 2 cores to detect the difference")
-
-        ctx = mp.get_context("spawn")
-        stop = ctx.Event()
         workers = min(4, cores)
-        before = resource.getrusage(resource.RUSAGE_CHILDREN)
-        procs = [ctx.Process(target=power._burn, args=(stop,), daemon=True)
-                 for _ in range(workers)]
-        for p in procs:
-            p.start()
-        start = time.perf_counter()
-        time.sleep(1.0)
-        stop.set()
-        for p in procs:
-            p.join(timeout=5.0)
-        wall = time.perf_counter() - start
-        after = resource.getrusage(resource.RUSAGE_CHILDREN)
 
-        cpu = ((after.ru_utime - before.ru_utime)
-               + (after.ru_stime - before.ru_stime))
-        # Threads under the GIL give ~1.0. Anything meaningfully above proves
-        # real parallelism; 1.5 leaves room for spawn overhead and a busy host.
-        self.assertGreater(cpu / wall, 1.5,
-                           f"load used only {cpu / wall:.2f} cores — the "
-                           f"power reading would be single-core")
+        threaded = self._thread_cores(workers, 0.7)
+        processed = self._process_cores(workers, 0.7)
+
+        self.assertGreater(
+            processed, threaded * 1.5,
+            f"processes kept {processed:.2f} cores busy against {threaded:.2f} "
+            f"for threads — the GIL fix is not effective, so the power reading "
+            f"would still be single-core")
 
     def test_estimated_power_skips_the_load_entirely(self):
         # A TDP estimate is load-independent, so spawning processes to produce
@@ -3131,3 +3179,112 @@ class TestStreamArraySizing(unittest.TestCase):
         self.assertIsInstance(source, str)
         if size is not None:
             self.assertGreater(size, 0)
+
+
+# --------------------------------------------------------------------------- #
+class TestInterpreterBoundDiagnosis(unittest.TestCase):
+    """Pure-Python categories must not masquerade as independent bottlenecks.
+
+    The `ml` category (nn_training, kmeans, knn) runs in pure Python, so it
+    re-measures the CPU through the interpreter. Measured on real hardware it
+    tracks `cpu_int` to within 2-4% — 111.7 vs 113.5 on an M1 Max, 231.5 vs
+    223.4 on an M4 — so naming it a bottleneck restates the CPU result while
+    implying a separate, fixable weakness.
+    """
+
+    BALANCED = {"cpu_int": 300.0, "cpu_float": 300.0, "compression": 300.0,
+                "hashing": 300.0, "json": 300.0, "memory": 300.0,
+                "gpu_fp32": 300.0, "npu": 300.0, "compile": 300.0,
+                "syscall": 300.0, "blas_matmul": 300.0, "aes": 300.0}
+
+    def test_ml_tracking_cpu_is_recognised(self):
+        self.assertTrue(diagnose.tracks_cpu("ml", 111.7, {"cpu_int": 113.5}))
+        self.assertTrue(diagnose.tracks_cpu("ml", 231.5, {"cpu_int": 223.4}))
+
+    def test_ml_far_below_cpu_is_not_excused(self):
+        self.assertFalse(diagnose.tracks_cpu("ml", 40.0, {"cpu_int": 300.0}))
+
+    def test_non_interpreter_categories_are_never_excused(self):
+        self.assertFalse(diagnose.tracks_cpu("disk", 30.0, {"cpu_int": 30.0}))
+
+    def test_missing_driver_subscore_is_not_excused(self):
+        self.assertFalse(diagnose.tracks_cpu("ml", 100.0, {}))
+
+    def test_verdict_attributes_tracking_ml_to_the_cpu(self):
+        scores = dict(self.BALANCED, nn_training=95.0, kmeans=95.0,
+                      knn=95.0, cpu_int=100.0)
+        verdict = diagnose.analyse({"subscores": scores})["verdict"]
+        self.assertIn("pure-Python", verdict)
+        self.assertNotIn("separate subsystem is weak", verdict.split("not that")[0])
+
+    def test_genuinely_weak_ml_still_reported_plainly(self):
+        scores = dict(self.BALANCED, nn_training=40.0, kmeans=40.0, knn=40.0)
+        result = diagnose.analyse({"subscores": scores})
+        self.assertIn("ml is well below", result["verdict"])
+        self.assertFalse(result["bottlenecks"][0]["restates_cpu"])
+
+    def test_real_bottleneck_is_the_headline_over_tracking_ml(self):
+        scores = dict(self.BALANCED, nn_training=290.0, kmeans=290.0,
+                      knn=290.0, disk_read=30.0, disk_write=30.0,
+                      disk_iops=30.0)
+        verdict = diagnose.analyse({"subscores": scores})["verdict"]
+        self.assertIn("disk", verdict)
+
+    def test_impact_text_points_at_numpy_rather_than_hardware(self):
+        scores = dict(self.BALANCED, nn_training=95.0, kmeans=95.0,
+                      knn=95.0, cpu_int=100.0)
+        result = diagnose.analyse({"subscores": scores})
+        ml = [b for b in result["bottlenecks"] if b["category"] == "ml"]
+        if ml:
+            self.assertIn("NumPy", ml[0]["impact"])
+
+
+# --------------------------------------------------------------------------- #
+class TestInterferenceSelfLoad(unittest.TestCase):
+    """A test that saturates every core must not blame its own load on others.
+
+    Measured on a 10-core machine with a no-load control: a 3-second
+    `cpu_multi` raises load by 0.186 per core against 0.000 drift — 74% of the
+    0.25 threshold — and longer runs clear it outright, producing a false
+    "something else started competing for the CPU" on an idle machine.
+    """
+
+    BEFORE = {"load_per_core": 0.10, "celsius": 50.0}
+    AFTER_LOADED = {"load_per_core": 0.90, "celsius": 52.0}
+
+    def test_self_parallel_test_does_not_flag_its_own_load(self):
+        for name in ("cpu_multi", "cores", "mem_scaling"):
+            verdict = interference.compare_samples(
+                self.BEFORE, self.AFTER_LOADED, name)
+            self.assertFalse(verdict["disturbed"],
+                             f"{name} blamed its own load on something else")
+            self.assertIn("self-inflicted", verdict["load_note"])
+
+    def test_single_threaded_test_still_detects_external_load(self):
+        verdict = interference.compare_samples(
+            self.BEFORE, self.AFTER_LOADED, "cpu_int")
+        self.assertTrue(verdict["disturbed"])
+        self.assertTrue(any("competing" in n for n in verdict["notes"]))
+
+    def test_temperature_signal_survives_suppression(self):
+        hot = {"load_per_core": 0.10, "celsius": 95.0}
+        verdict = interference.compare_samples(self.BEFORE, hot, "cpu_multi")
+        self.assertTrue(verdict["disturbed"])
+        self.assertTrue(any("warmed" in n for n in verdict["notes"]))
+
+    def test_load_delta_is_still_recorded_as_data(self):
+        verdict = interference.compare_samples(
+            self.BEFORE, self.AFTER_LOADED, "cpu_multi")
+        self.assertAlmostEqual(verdict["load_delta"], 0.8, places=2)
+        self.assertFalse(verdict["load_signal_used"])
+
+    def test_unknown_test_name_keeps_the_load_check(self):
+        # A plugin or a new test defaults to being trusted as single-threaded;
+        # a false positive is preferable to silently dropping the signal.
+        verdict = interference.compare_samples(
+            self.BEFORE, self.AFTER_LOADED, "some_plugin")
+        self.assertTrue(verdict["disturbed"])
+
+    def test_every_self_parallel_name_is_a_real_test(self):
+        for name in interference.SELF_PARALLEL_TESTS:
+            self.assertIn(name, cli.TESTS)

@@ -25,6 +25,20 @@ STRENGTH_RATIO = 1.5
 # category is judged against.
 DERIVED_CATEGORIES = {"ai"}
 
+# Categories whose workloads run in pure Python, so what they measure is the
+# interpreter running on the CPU rather than an independent subsystem. Their
+# scores track single-core integer throughput almost exactly — measured at
+# within 2-4% of `cpu_int` on both an M1 Max and an M4 — so naming one as a
+# bottleneck restates the CPU result while implying a separate, fixable
+# weakness. They stay in the report and in the composite (pure-Python ML speed
+# is a real thing to care about if that is what you run); they are just not
+# allowed to masquerade as an independent finding.
+INTERPRETER_BOUND = {"ml": "cpu_int"}
+
+# How close an interpreter-bound category must sit to its driving subscore
+# before its weakness is attributed to the CPU rather than to itself.
+TRACKS_TOLERANCE = 0.25
+
 # What a weak category usually means in practice.
 _ADVICE = {
     "cpu": "CPU-bound work (compiling, simulation, encoding) will be the "
@@ -43,6 +57,22 @@ _ADVICE = {
     "system": "process creation and compilation are slow, which dominates "
               "build systems and shell-heavy work",
 }
+
+
+def tracks_cpu(category: str, score: float, subscores: dict) -> bool:
+    """True when an interpreter-bound category is just restating the CPU.
+
+    If pure-Python ML scores what single-core integer work scores, the finding
+    is "this CPU core is modest", not "machine learning is slow here" — and the
+    two lead to completely different actions.
+    """
+    driver = INTERPRETER_BOUND.get(category)
+    if not driver:
+        return False
+    reference = subscores.get(driver)
+    if not isinstance(reference, (int, float)) or reference <= 0:
+        return False
+    return abs(score - reference) / reference <= TRACKS_TOLERANCE
 
 
 def analyse(scores: dict) -> dict:
@@ -79,27 +109,58 @@ def analyse(scores: dict) -> dict:
         "balance_ratio": round(fastest[1] / slowest[1], 2) if slowest[1] else None,
         "bottlenecks": [{"category": k, "score": v,
                          "relative": round(v / median, 2),
-                         "impact": _ADVICE.get(k, "")}
+                         "impact": _impact(k, v, subscores),
+                         "restates_cpu": tracks_cpu(k, v, subscores)}
                         for k, v in weak],
         "strengths": [{"category": k, "score": v,
                        "relative": round(v / median, 2)} for k, v in strong],
         "weakest": {"category": slowest[0], "score": slowest[1]},
         "strongest": {"category": fastest[0], "score": fastest[1]},
-        "verdict": _verdict(cats, weak, median, fastest, slowest),
+        "verdict": _verdict(cats, weak, median, fastest, slowest,
+                            subscores),
     }
 
 
+def _impact(category: str, score: float, subscores: dict) -> str:
+    """What a weak category means, corrected for interpreter-bound ones."""
+    if tracks_cpu(category, score, subscores):
+        driver = INTERPRETER_BOUND[category]
+        return (f"these workloads run in pure Python, and they score what "
+                f"{driver} scores — so this reflects single-core CPU "
+                f"throughput, not a separate weakness. Installing NumPy or "
+                f"PyTorch bypasses the interpreter and changes the picture "
+                f"entirely")
+    return _ADVICE.get(category, "")
+
+
 def _verdict(cats: dict, weak: list, median: float,
-             fastest: tuple, slowest: tuple) -> str:
+             fastest: tuple, slowest: tuple, subscores: dict) -> str:
     if not weak:
         ratio = fastest[1] / slowest[1] if slowest[1] else 1
         if ratio < 2:
             return ("well balanced — no subsystem is holding the others back")
         return (f"reasonably balanced; {slowest[0]} is the weakest area but "
                 f"not severely so")
-    names = ", ".join(w[0] for w in weak)
-    return (f"{names} {'is' if len(weak) == 1 else 'are'} well below this "
-            f"machine's own average and will limit overall performance")
+
+    # A category that merely restates the CPU result is not an independent
+    # finding, so it must not be the headline when something else is.
+    independent = [w for w in weak
+                   if not tracks_cpu(w[0], w[1], subscores)]
+    if not independent:
+        names = ", ".join(w[0] for w in weak)
+        return (f"{names} scores lowest, but these are pure-Python workloads "
+                f"that track single-core CPU throughput — the finding is that "
+                f"this machine's cores are modest, not that a separate "
+                f"subsystem is weak")
+
+    names = ", ".join(w[0] for w in independent)
+    verdict = (f"{names} {'is' if len(independent) == 1 else 'are'} well below "
+               f"this machine's own average and will limit overall performance")
+    dependent = [w[0] for w in weak if w not in independent]
+    if dependent:
+        verdict += (f" ({', '.join(dependent)} also scores low, but only "
+                    f"because it re-measures the CPU through the interpreter)")
+    return verdict
 
 
 def render(result: dict) -> str:

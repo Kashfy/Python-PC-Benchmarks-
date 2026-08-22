@@ -153,9 +153,18 @@ def _hint(sysname: str) -> str:
     return "on-die power metering is not exposed on this platform"
 
 
-def _burn(stop_flag) -> None:
-    """Saturate one core until told to stop. Must be importable for spawn()."""
+def _burn(stop_flag, ready_flag=None) -> None:
+    """Saturate one core until told to stop. Must be importable for spawn().
+
+    Signals ``ready_flag`` once it is actually spinning. ``Process.start()``
+    returns as soon as the child is forked or spawned, which on macOS is
+    several hundred milliseconds before the child has finished importing
+    Python and begun work — so a parent that starts sampling immediately
+    measures the ramp rather than the load.
+    """
     x = 0
+    if ready_flag is not None:
+        ready_flag.set()
     while not stop_flag.is_set():
         for _ in range(10_000):
             x = (x * 1103515245 + 12345) & 0x7FFFFFFF
@@ -189,18 +198,30 @@ def measure_under_load(cpu_model: str = "", load_s: float = 1.5) -> dict:
 
     ctx = mp.get_context("spawn")
     stop = ctx.Event()
-    workers = [ctx.Process(target=_burn, args=(stop,), daemon=True)
-               for _ in range(max(1, os.cpu_count() or 1))]
+    count = max(1, os.cpu_count() or 1)
+    ready = [ctx.Event() for _ in range(count)]
+    workers = [ctx.Process(target=_burn, args=(stop, ready[i]), daemon=True)
+               for i in range(count)]
     reading = probe
     try:
         for w in workers:
             w.start()
-        # Spawned processes take noticeably longer to reach full speed than
-        # threads did; sampling too early would repeat the original mistake in
-        # a subtler form.
+        # Wait for the load to actually exist rather than assuming it does.
+        # A fixed sleep would sample partway up the ramp on machines where
+        # spawn is slow, understating draw in exactly the way the threaded
+        # version did.
+        deadline = time.monotonic() + 15.0
+        for event in ready:
+            event.wait(timeout=max(0.0, deadline - time.monotonic()))
+        started = sum(1 for e in ready if e.is_set())
+
         time.sleep(max(0.5, min(load_s, 3.0)))
         reading = measure(cpu_model)
-        reading["load"] = f"{len(workers)} process(es) at 100%"
+        reading["load"] = f"{started}/{count} process(es) at 100%"
+        if started < count:
+            reading["load_warning"] = (
+                f"only {started} of {count} load processes started in time; "
+                f"the reading may understate full-load draw")
     finally:
         stop.set()
         for w in workers:

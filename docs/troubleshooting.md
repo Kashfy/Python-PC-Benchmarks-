@@ -670,6 +670,47 @@ To judge contention, use the load average in the System Information block
 against the core count, and the per-test interference notes — both are grounded
 in the right measurement.
 
+## "ml" is named as the bottleneck
+
+Check whether the note says these are pure-Python workloads. `nn_training`,
+`kmeans`, and `knn` run in the interpreter, so they re-measure the CPU rather
+than an independent subsystem — measured on real hardware they track `cpu_int`
+to within 2-4% (111.7 vs 113.5 on an M1 Max; 231.5 vs 223.4 on an M4).
+
+From v11.3 the tool detects that and says so, rather than implying a separate
+weakness:
+
+```
+  Verdict: ml scores lowest, but these are pure-Python workloads that track
+  single-core CPU throughput — the finding is that this machine's cores are
+  modest, not that a separate subsystem is weak
+```
+
+The action is not a hardware change. Install NumPy or PyTorch (`python3
+install.py`, tiers `compute` and `data`) and the same work bypasses the
+interpreter entirely — the `numeric` and `datascience` categories then show
+what the silicon can actually do.
+
+If `ml` scores *far* below `cpu_int` rather than tracking it, that is a real
+finding and is reported plainly.
+
+## "system load rose ... something else started competing for the CPU"
+
+Fixed in v11.3 for tests that cause it themselves. `cpu_multi`, `cores`,
+`mem_scaling`, `memory` and `disk` saturate every core by design, so the load
+average rises because of them — measured at +0.19 per core for a 3-second
+`cpu_multi` and +0.68 for a 10-second one, against a 0.25 threshold and 0.000
+drift on an idle machine. Anyone running `--seconds 10` or longer for stabler
+results got the warning on every multi-process test.
+
+The load signal is now suppressed for those tests (the delta is still recorded
+as data) and kept for single-threaded ones, where a rise really is external.
+Temperature checks are unaffected — the tool heating the chip is precisely what
+that check exists to catch.
+
+If you still see this on a single-threaded test, it is real: something started
+during the run.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

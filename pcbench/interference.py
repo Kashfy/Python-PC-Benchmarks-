@@ -18,6 +18,21 @@ import os
 # A test is flagged when load per core rose by more than this during it.
 LOAD_DELTA_THRESHOLD = 0.25
 
+# Tests that spawn a worker per core raise the load average themselves, so a
+# rise during one says nothing about anything external. Measured on a 10-core
+# machine with a no-load control: a 3-second `cpu_multi` lifts load by 0.186
+# per core against 0.000 drift, which is already 74% of the threshold — and
+# `--seconds 10` or longer clears it outright, producing "something else
+# started competing for the CPU" on a completely idle machine.
+#
+# The load signal is therefore suppressed for these tests rather than
+# re-tuned: no threshold can separate self-inflicted load from external load
+# when the test itself is the largest source. Temperature still applies, since
+# the tool heating the chip is exactly what that check is meant to catch.
+SELF_PARALLEL_TESTS = frozenset({
+    "cpu_multi", "cores", "mem_scaling", "memory", "disk",
+})
+
 # ...or when the CPU warmed by more than this many degrees, which usually
 # means clocks fell part-way through.
 TEMP_RISE_THRESHOLD = 12.0
@@ -44,16 +59,29 @@ def sample(script_dir: str = ".") -> dict:
     return snapshot
 
 
-def compare_samples(before: dict, after: dict) -> dict:
-    """Judge whether conditions changed enough to distrust the result."""
+def compare_samples(before: dict, after: dict,
+                    test_name: str = "") -> dict:
+    """Judge whether conditions changed enough to distrust the result.
+
+    ``test_name`` decides whether the load signal is meaningful: a test that
+    saturates every core drives the load average up by itself, so a rise during
+    it is not evidence of anything.
+    """
     findings: list[str] = []
     detail: dict = {}
+    self_parallel = test_name in SELF_PARALLEL_TESTS
 
     b_load, a_load = before.get("load_per_core"), after.get("load_per_core")
     if b_load is not None and a_load is not None:
         delta = a_load - b_load
         detail["load_delta"] = round(delta, 3)
-        if delta > LOAD_DELTA_THRESHOLD:
+        detail["load_signal_used"] = not self_parallel
+        if self_parallel:
+            detail["load_note"] = (
+                f"load rose {delta:.2f} per core, but {test_name} saturates "
+                f"every core by design, so the rise is self-inflicted and "
+                f"carries no information")
+        elif delta > LOAD_DELTA_THRESHOLD:
             findings.append(
                 f"system load rose {delta:.2f} per core during this test — "
                 f"something else started competing for the CPU")

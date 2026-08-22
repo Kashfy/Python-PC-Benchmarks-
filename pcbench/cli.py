@@ -722,7 +722,7 @@ def main(argv=None) -> int:
             # it, which no amount of repetition inside the test would reveal.
             if isinstance(results[name], dict):
                 verdict = interference.compare_samples(
-                    before, interference.sample(_repo_root()))
+                    before, interference.sample(_repo_root()), name)
                 if verdict["disturbed"]:
                     results[name]["interference"] = verdict
                     if not quiet:
