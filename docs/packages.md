@@ -352,6 +352,7 @@ Patterns: `read`, `write`, `randread`, `randwrite`, `randrw`.
 | Flag | Description |
 |------|-------------|
 | `--no-native` | Skip the C engine |
+| `--no-drive-life` | Skip the SSD lifetime/wear report |
 | `--no-autoscale` | Do not shrink test sizes on small or CPU-limited machines |
 | `--force` | Run despite distorting machine state |
 | `--version` | Print version |
@@ -395,7 +396,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-441 cases, standard library only — no pytest, no test dependencies.
+468 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

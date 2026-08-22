@@ -741,6 +741,44 @@ The pre-run state check normally refuses to run in that situation; if you
 passed `--force` you have overridden it. Re-run on a quiet machine, and raise
 `--seconds` (the default 0.6s per point for this test is deliberately short).
 
+## Drive lifetime says "unavailable"
+
+The reason is always stated. Common cases:
+
+- **macOS** — the helper needs a compiler: `xcode-select --install`. It needs
+  no privileges once built.
+- **Linux** — install `nvme-cli` or `smartmontools`. Reading the SMART log
+  usually needs root, so try `sudo`.
+- **Windows** — many consumer drives and almost all USB enclosures do not
+  expose reliability counters at all.
+- **Any platform, external drive** — USB-SATA bridges rarely pass SMART
+  commands through.
+
+## Write rate looks impossibly high
+
+It is per **power-on day**, not per calendar day. A laptop that sleeps most of
+the time accumulates few power-on hours, so dividing lifetime writes by them
+gives a large number. 25 TB over 855 power-on hours is 723 GB per power-on day
+but only a fraction of that per calendar day.
+
+The same distinction applies to the life projection, which is reported in
+power-on hours with calendar equivalents at 4, 8 and 24 hours per day. SMART
+records no manufacture date, so the tool cannot know your duty cycle — pick the
+row that matches how you actually use the machine.
+
+## Health percentage looks wrong for the drive's age
+
+`percentage_used` is the *controller's own* wear estimate against its rated
+endurance, not a measurement of remaining flash. Vendors compute it
+differently, and it commonly sits at 0-1% for a long time and then moves in
+steps. It can also exceed 100%, at which point the drive is past its rated life
+but usually still working — the tool clamps health at 0% rather than showing a
+negative number.
+
+The figure to watch alongside it is **available spare**. Wear is a projection;
+spare blocks falling below the drive's own threshold means the drive is
+consuming its reserve now.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

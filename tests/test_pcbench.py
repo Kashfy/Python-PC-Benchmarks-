@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
                      core, coreml_model, cores, counters, cryptobench,
-                     datascience, diagnose, export, gates, gpucompute, health,
+                     datascience, diagnose, drivelife, export, gates, gpucompute,
+                     health,
                      interference, iobench, monitor, numa, numeric, optional,
                      plugins, provenance, reference, soak, standards, stats,
                      storage, sysbench, limits, mlbench, mlframework, network,
@@ -3360,3 +3361,196 @@ class TestCoreScalingCause(unittest.TestCase):
     def test_too_few_points_is_handled(self):
         self.assertFalse(
             cores.classify_cores([{"marginal_rate": 1.0}], 4, 4)["hybrid"])
+
+
+# --------------------------------------------------------------------------- #
+class TestDriveLifetime(unittest.TestCase):
+    """SSD wear reporting: terabytes written, endurance used, projections."""
+
+    NVME = {"model": "TEST SSD", "protocol": "NVMe", "percentage_used": 2,
+            "data_units_read": 106_772_999, "data_units_written": 50_334_563,
+            "power_cycles": 321, "power_on_hours": 854,
+            "unsafe_shutdowns": 13, "media_errors": 0,
+            "available_spare_pct": 100, "available_spare_threshold_pct": 99,
+            "temperature_c": 50}
+
+    def test_data_units_convert_to_terabytes(self):
+        # An NVMe data unit is fixed by spec at 1000 x 512 bytes.
+        d = drivelife._normalise(dict(self.NVME))
+        self.assertAlmostEqual(d["written_tb"], 25.77, places=1)
+        self.assertAlmostEqual(d["read_tb"], 54.67, places=1)
+
+    def test_health_is_the_complement_of_wear(self):
+        d = drivelife._normalise(dict(self.NVME))
+        self.assertEqual(d["health_pct"], 98)
+
+    def test_health_never_goes_negative(self):
+        # Controllers keep counting past 100% once endurance is spent.
+        d = drivelife._normalise(dict(self.NVME, percentage_used=140))
+        self.assertEqual(d["health_pct"], 0)
+
+    def test_write_rate_is_per_power_on_day(self):
+        # A machine that sleeps has far fewer power-on days than calendar
+        # days; labelling this "per day" would overstate the load severalfold.
+        d = drivelife._normalise(dict(self.NVME))
+        self.assertIn("write_rate_gb_per_power_on_day", d)
+        self.assertNotIn("write_rate_gb_per_day", d)
+
+    def test_projection_is_in_power_on_hours_not_calendar_years(self):
+        """SMART counts power-on hours and carries no manufacture date.
+
+        Dividing remaining hours by 8760 would assume 24/7 operation and
+        understate a laptop's calendar life by roughly ten times.
+        """
+        p = drivelife.project_lifetime(drivelife._normalise(dict(self.NVME)))
+        self.assertIn("projected_remaining_hours", p)
+        years = p["projected_remaining_years"]
+        self.assertIsInstance(years, dict)
+        # Fewer hours per day must mean more calendar years.
+        self.assertGreater(years["at_4h_per_day"], years["at_8h_per_day"])
+        self.assertGreater(years["at_8h_per_day"], years["at_24h_per_day"])
+
+    def test_projection_declines_without_enough_history(self):
+        p = drivelife.project_lifetime(dict(self.NVME, power_on_hours=10))
+        self.assertIn("note", p)
+        self.assertNotIn("projected_remaining_hours", p)
+
+    def test_zero_wear_is_reported_as_such_not_as_infinite_life(self):
+        p = drivelife.project_lifetime(dict(self.NVME, percentage_used=0))
+        self.assertIn("note", p)
+
+    def test_missing_fields_yield_no_projection(self):
+        self.assertIsNone(drivelife.project_lifetime({"model": "x"}))
+
+    def test_healthy_drive_raises_no_warnings(self):
+        result = {"drives": [drivelife._normalise(dict(self.NVME))]}
+        self.assertEqual(drivelife.warnings(result), [])
+
+    def test_media_errors_are_flagged(self):
+        result = {"drives": [dict(self.NVME, media_errors=7)]}
+        notes = drivelife.warnings(result)
+        self.assertTrue(any("media/data-integrity" in n for n in notes))
+
+    def test_spare_below_drive_threshold_is_called_failing(self):
+        result = {"drives": [dict(self.NVME, available_spare_pct=50,
+                                  available_spare_threshold_pct=99)]}
+        notes = drivelife.warnings(result)
+        self.assertTrue(any("failing drive" in n for n in notes), notes)
+
+    def test_worn_drive_is_flagged_at_two_levels(self):
+        warn = drivelife.warnings({"drives": [dict(self.NVME,
+                                                   percentage_used=85)]})
+        crit = drivelife.warnings({"drives": [dict(self.NVME,
+                                                   percentage_used=99)]})
+        self.assertTrue(any("plan a replacement" in n for n in warn))
+        self.assertTrue(any("replace it" in n for n in crit))
+
+    def test_critical_warning_flag_is_surfaced(self):
+        notes = drivelife.warnings({"drives": [dict(self.NVME,
+                                                    critical_warning=1)]})
+        self.assertTrue(any("CRITICAL WARNING" in n for n in notes))
+
+    def test_hot_drive_is_flagged(self):
+        notes = drivelife.warnings({"drives": [dict(self.NVME,
+                                                    temperature_c=78)]})
+        self.assertTrue(any("shortens flash life" in n for n in notes))
+
+    def test_frequent_unsafe_shutdowns_are_flagged(self):
+        notes = drivelife.warnings({"drives": [dict(self.NVME,
+                                                    unsafe_shutdowns=200,
+                                                    power_cycles=300)]})
+        self.assertTrue(any("unsafe shutdowns" in n for n in notes))
+
+    def test_sata_life_remaining_is_inverted_to_wear(self):
+        # SATA attributes report life *remaining*; NVMe reports life *used*.
+        data = {"model": "SATA SSD",
+                "ata_smart_attributes": {"table": [
+                    {"name": "Media_Wearout_Indicator", "value": 90,
+                     "raw": {"value": 0}},
+                    {"name": "Power_On_Hours", "value": 99,
+                     "raw": {"value": 12345}},
+                ]}}
+        entry = drivelife._from_smartctl_json(data)
+        self.assertEqual(entry["percentage_used"], 10)
+        self.assertEqual(entry["power_on_hours"], 12345)
+
+    def test_smartctl_nvme_json_is_mapped(self):
+        data = {"model_name": "NV", "nvme_smart_health_information_log": {
+            "percentage_used": 5, "data_units_written": 1000,
+            "power_on_hours": 500, "media_errors": 0}}
+        entry = drivelife._from_smartctl_json(data)
+        self.assertEqual(entry["protocol"], "NVMe")
+        self.assertEqual(entry["percentage_used"], 5)
+
+    def test_run_never_raises_and_always_reports_why(self):
+        result = drivelife.run(".")
+        self.assertIn("available", result)
+        if not result["available"]:
+            self.assertTrue(result.get("reason"))
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS only")
+    def test_macos_reads_real_drive_data(self):
+        result = drivelife.run(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
+        if not result.get("available"):
+            self.skipTest(result.get("reason", "unavailable"))
+        drive = result["drives"][0]
+        self.assertGreater(drive["written_tb"], 0)
+        self.assertGreaterEqual(drive["health_pct"], 0)
+        self.assertLessEqual(drive["health_pct"], 100)
+
+
+# --------------------------------------------------------------------------- #
+class TestGateListIndexing(unittest.TestCase):
+    """The assertion grammar always accepted brackets; now they resolve.
+
+    Paths like drive_life.drives[0].health_pct parsed cleanly and then silently
+    failed to resolve, because the walk only stepped through dicts. Lists are
+    common in the payload (drives, I/O jobs, NUMA nodes) and gating on one
+    element is what fleet checks need.
+    """
+
+    PAYLOAD = {
+        "scores": {"composite": 1.0, "subscores": {}},
+        "results": {},
+        "drive_life": {"drives": [{"health_pct": 98, "media_errors": 0},
+                                  {"health_pct": 42, "media_errors": 3}]},
+        "io": {"jobs": [{"iops": 49548}, {"iops": 1170}]},
+    }
+
+    def _one(self, expr):
+        return gates.evaluate(self.PAYLOAD, [expr])[0]
+
+    def test_positive_index_resolves(self):
+        self.assertTrue(self._one("drive_life.drives[0].health_pct>=50")["passed"])
+        self.assertFalse(self._one("drive_life.drives[1].health_pct>=50")["passed"])
+
+    def test_negative_index_addresses_the_last_element(self):
+        self.assertTrue(self._one("io.jobs[-1].iops>=1000")["passed"])
+        self.assertFalse(self._one("io.jobs[-1].iops>=2000")["passed"])
+
+    def test_equality_on_an_error_count(self):
+        self.assertTrue(self._one("drive_life.drives[0].media_errors==0")["passed"])
+        self.assertFalse(self._one("drive_life.drives[1].media_errors==0")["passed"])
+
+    def test_out_of_range_index_fails_rather_than_raising(self):
+        result = self._one("drive_life.drives[9].health_pct>=1")
+        self.assertFalse(result["passed"])
+        self.assertIn("not measured", result["message"])
+
+    def test_indexing_a_non_list_fails_cleanly(self):
+        self.assertFalse(self._one("scores.composite[0]>=1")["passed"])
+
+    def test_negative_thresholds_still_parse(self):
+        self.assertEqual(gates.parse("sustained.droop_pct>=-5")[2], -5.0)
+
+    def test_malformed_brackets_are_rejected_with_a_clear_message(self):
+        # A typo must not masquerade as "this metric was not measured".
+        for bad in ("io.jobs[>=1", "io.jobs[a].iops>=1", "io.jobs[]>=1"):
+            with self.assertRaises(gates.GateError, msg=bad):
+                gates.parse(bad)
+
+    def test_valid_indices_are_accepted_by_the_parser(self):
+        for good in ("io.jobs[0].iops>=1", "io.jobs[-1].iops>=1",
+                     "drive_life.drives[12].health_pct>=1"):
+            gates.parse(good)

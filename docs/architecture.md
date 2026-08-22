@@ -12,6 +12,7 @@ Python-PC-Benchmarks-/
 ├── native_engine.c     # optional native engine (C): threads, pointer chase
 ├── accel_engine.m      # optional GPU/NPU engine (Apple: Metal + Core ML)
 ├── sensors_engine.m    # optional temperature reader (Apple: IOHID)
+├── smart_engine.c      # NVMe SMART log reader (Apple: IOKit user client)
 ├── pcbench/
 │   │   ── core plumbing ──
 │   ├── core.py         # timing, statistics, warm-up, validation
@@ -42,6 +43,7 @@ Python-PC-Benchmarks-/
 │   ├── network.py      # loopback stack + opt-in external tests
 │   ├── interference.py # per-test detection of changed conditions
 │   ├── health.py       # RAM integrity, drive SMART (read-only)
+│   ├── drivelife.py    # SSD wear: TBW, power-on hours, endurance left
 │   ├── diagnose.py     # bottleneck analysis, spec sheet
 │   ├── plugins.py      # discover and run user benchmarks
 │   ├── sustained.py    # thermal / sustained-load mode
@@ -66,7 +68,7 @@ Python-PC-Benchmarks-/
 │   ├── export.py       # Prometheus, JUnit XML, SQLite, Markdown
 │   └── regression.py   # run-over-run regression detection
 ├── plugins/            # drop-in user benchmarks (auto-discovered)
-├── tests/              # 441 stdlib unittest cases
+├── tests/              # 468 stdlib unittest cases
 └── docs/
 ```
 
@@ -286,6 +288,7 @@ One `payload` dict per run, written verbatim to JSON:
   "datascience": { "llm": {...}, "dataloader": {...}, "dataframes": {...} },
   "io":        { "jobs": [ { "name": "database", "iops": 49548, ... } ] },
   "energy":    { "joules": 412.5, "units_per_joule": 4850.0, ... },
+  "drive_life": { "drives": [ { "written_tb": 25.77, "health_pct": 98, ... } ] },
   "gates":     [ { "name": "composite>=250", "passed": true, ... } ],
   "scores":    { "subscores": {...}, "composite": 349.0 }
 }

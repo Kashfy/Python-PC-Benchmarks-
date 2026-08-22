@@ -20,8 +20,12 @@ from __future__ import annotations
 
 import re
 
-_ASSERT_RE = re.compile(r"^\s*([A-Za-z0-9_.\[\]]+)\s*(>=|<=|>|<|==|!=)\s*"
+# The path allows '-' so negative list indices work: io.jobs[-1] addresses the
+# last job without the caller needing to know how many there are.
+_ASSERT_RE = re.compile(r"^\s*([A-Za-z0-9_.\[\]-]+)\s*(>=|<=|>|<|==|!=)\s*"
                         r"(-?[0-9.]+(?:[eE][-+]?\d+)?)\s*$")
+
+_INDEX_BODY = re.compile(r"-?\d+")
 
 _OPS = {
     ">=": lambda a, b: a >= b,
@@ -46,6 +50,21 @@ def parse(expression: str) -> tuple[str, str, float]:
             f"Expected NAME OP VALUE, e.g. 'composite>=250', "
             f"'disk.read_rate>=500', 'sustained.droop_pct<=15'")
     path, op, raw = m.groups()
+
+    # The character class permits brackets anywhere, so an unbalanced or
+    # non-numeric index would parse and then quietly fail to resolve, giving
+    # the user "not measured" for what is really a typo.
+    if path.count("[") != path.count("]"):
+        raise GateError(
+            f"unbalanced brackets in assertion: {expression!r}")
+    for segment in path.split("."):
+        if "[" in segment:
+            name, _, rest = segment.partition("[")
+            if not rest.endswith("]") or not _INDEX_BODY.fullmatch(rest[:-1]):
+                raise GateError(
+                    f"invalid list index in assertion: {expression!r}. "
+                    f"Use an integer, e.g. drives[0] or jobs[-1]")
+
     try:
         return path, op, float(raw)
     except ValueError:
@@ -92,15 +111,44 @@ def resolve(payload: dict, path: str) -> tuple:
         return cats.get(tail), "category score"
 
     # Otherwise walk the payload: results first, then the top-level sections
-    # (sustained, power, network, health, ...).
+    # (sustained, power, network, health, drive_life, ...).
     node = results.get(head, payload.get(head))
     unit = node.get("unit", "") if isinstance(node, dict) else ""
     for part in tail.split("."):
-        if isinstance(node, dict):
-            node = node.get(part)
-        else:
+        node = _step(node, part)
+        if node is None:
             return None, None
     return node, (f"raw value ({unit})" if unit else "raw value")
+
+
+_INDEXED = re.compile(r"^([A-Za-z0-9_]*)\[(-?\d+)\]$")
+
+
+def _step(node, part: str):
+    """Take one step through the payload, honouring ``name[i]`` indexing.
+
+    The assertion grammar has always accepted brackets, so paths like
+    ``drive_life.drives[0].health_pct`` parsed cleanly and then silently failed
+    to resolve. Lists are common in the payload — drives, I/O jobs, NUMA nodes
+    — and gating on the first (or last) element of one is exactly what fleet
+    checks need.
+    """
+    match = _INDEXED.match(part)
+    if match:
+        name, index = match.group(1), int(match.group(2))
+        if name:
+            if not isinstance(node, dict):
+                return None
+            node = node.get(name)
+        if not isinstance(node, (list, tuple)):
+            return None
+        try:
+            return node[index]
+        except IndexError:
+            return None
+    if isinstance(node, dict):
+        return node.get(part)
+    return None
 
 
 def evaluate(payload: dict, expressions: list[str],

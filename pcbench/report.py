@@ -790,6 +790,22 @@ def print_io(result: dict | None) -> None:
         print(body)
 
 
+def print_drive_life(result: dict | None) -> None:
+    """SSD wear and lifetime. Distinct from the speed numbers above it.
+
+    Kept in its own section because it answers a different question: the
+    storage benchmarks say how fast the drive is today, this says how much of
+    it is left.
+    """
+    if not result:
+        return
+    from . import drivelife as drivelife_mod
+    body = drivelife_mod.render(result)
+    if body.strip():
+        hr("Drive lifetime & wear")
+        print(body)
+
+
 def print_energy(result: dict | None) -> None:
     if not result:
         return
@@ -825,6 +841,7 @@ def print_report(payload: dict) -> None:
     print_datascience(payload.get("datascience"))
     print_storage(payload.get("storage"))
     print_io(payload.get("io"))
+    print_drive_life(payload.get("drive_life"))
     print_energy(payload.get("energy"))
     print_counters(payload.get("counters"))
     print_sustained(payload.get("sustained"))
@@ -882,6 +899,9 @@ CSV_FIELDS = [
     "dataframe_ops_s", "ipc", "cache_miss_pct", "branch_miss_pct",
     "cpu_governor", "mitigations_disabled", "smt_enabled", "thp",
     "numa_nodes", "numa_remote_penalty_pct", "energy_joules",
+    "drive_model", "drive_written_tb", "drive_read_tb", "drive_health_pct",
+    "drive_power_on_hours", "drive_power_cycles", "drive_temp_c",
+    "drive_media_errors",
     "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
     "cpu_celsius", "battery_health_pct", "battery_cycles",
     "sustained_temp_peak_c", "sustained_temp_rise_c",
@@ -904,6 +924,22 @@ def _rate(results: dict, key: str, field: str = "rate") -> float:
         if isinstance(v, (int, float)):
             return round(float(v), 2)
     return 0.0
+
+
+def _drive_row(drive_life: dict | None) -> dict:
+    """First drive's lifetime figures, flattened for the CSV."""
+    drives = (drive_life or {}).get("drives") or []
+    d = drives[0] if drives else {}
+    return {
+        "drive_model": d.get("model", ""),
+        "drive_written_tb": d.get("written_tb", ""),
+        "drive_read_tb": d.get("read_tb", ""),
+        "drive_health_pct": d.get("health_pct", ""),
+        "drive_power_on_hours": d.get("power_on_hours", ""),
+        "drive_power_cycles": d.get("power_cycles", ""),
+        "drive_temp_c": d.get("temperature_c", ""),
+        "drive_media_errors": d.get("media_errors", ""),
+    }
 
 
 def flatten_row(payload: dict) -> dict:
@@ -999,6 +1035,9 @@ def flatten_row(payload: dict) -> dict:
                                     .get("bandwidth") or {})
                                    .get("remote_penalty_pct", ""),
         "energy_joules": (payload.get("energy") or {}).get("joules", ""),
+        # Drive wear trends over months, which is precisely what a per-run
+        # history file is good for.
+        **_drive_row(payload.get("drive_life")),
         "net_loopback_mb_s": round(
             (payload.get("network") or {}).get("loopback_mb_s", 0) or 0, 1),
         "power_watts": power.get("package_w") or "",

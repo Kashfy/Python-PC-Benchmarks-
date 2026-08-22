@@ -462,6 +462,73 @@ Absolute floors are checked separately, where a figure is implausible rather
 than merely slow — sequential reads under 80 MB/s, random reads under 200 IOPS,
 memory bandwidth under 800 MB/s — each with what it usually means.
 
+## Drive lifetime & wear
+
+A benchmark says how fast storage is *today*. It says nothing about how long it
+will keep working — and for an SSD that is the more consequential question,
+because flash wears out by writing.
+
+```
+  APPLE SSD AP0256Z (NVMe)
+    Status              : Verified
+    Total written       : 25.77 TB
+    Total read          : 54.67 TB
+    Temperature         : 51 °C
+    Health              : 98% (2% of rated life used)
+    Power cycles        : 321
+    Power on hours      : 855 (35.6 days)
+    Spare blocks        : 100% (threshold 99%)
+    Unsafe shutdowns    : 13
+    Media errors        : 0
+    Write rate          : 723.4 GB per power-on day
+    Projected life left : ~41,895 more power-on hours
+      which is ~28.7 years at 4h/day, ~14.3 at 8h/day, ~4.8 running continuously
+```
+
+Runs by default, costs milliseconds, needs no privileges, and is strictly
+read-only — nothing writes to a drive, starts a self-test, or clears a log.
+Disable with `--no-drive-life`.
+
+**Where the data comes from.** Every platform records it; none make it easy the
+same way. Linux uses `/sys/class/nvme`, then `nvme smart-log`, then `smartctl`
+(SATA SSDs report the same facts under vendor-specific attribute names, which
+are mapped). Windows uses `Get-StorageReliabilityCounter`.
+
+macOS needed real work: **no command-line tool exposes this**. `system_profiler`
+reports only a pass/fail status, and searching every IORegistry property for the
+relevant keys returns nothing. The data sits behind an IOKit user client, so a
+small helper (`smart_engine.c`, auto-compiled like the other native helpers)
+reads NVMe log page 0x02 directly. One non-obvious detail: on Apple silicon the
+user client is **not** published by the controller class — `IONVMeController`
+and `AppleANS3CGv2Controller` both return `kIOReturnUnsupported`. It is
+published by `IONVMeBlockStorageDevice`. Output was verified byte-for-byte
+against a third-party SMART utility on the same machine.
+
+**Two units that are easy to get wrong**, and are labelled explicitly here:
+
+- **Write rate is per *power-on* day**, not per calendar day. A machine that
+  sleeps has far fewer power-on days than calendar days, so "GB/day" would
+  overstate the daily write load several-fold.
+- **The projection is in power-on hours**, not calendar years. SMART counts
+  power-on time and carries no manufacture date, so the drive's duty cycle is
+  unknowable from the log. Dividing by 8760 would assume 24/7 operation and
+  understate a laptop's calendar life by roughly ten times — so calendar
+  figures are given against explicit daily-use assumptions instead.
+
+**What gets flagged**, most urgent first: a controller critical-warning flag,
+media/data-integrity errors, spare blocks below the drive's *own* threshold
+(a failing drive, not a worn one), endurance past 80% and 95%, sustained
+temperature above 70 °C, and unsafe shutdowns running at more than a quarter of
+power cycles.
+
+The figures also go into the CSV, so wear trends over months — which is exactly
+what a per-run history file is good for — and can be gated on:
+
+```bash
+pcbench --assert 'drive_life.drives[0].health_pct>=20' \
+        --assert 'drive_life.drives[0].media_errors==0'
+```
+
 ## Reference workloads — numbers that mean something elsewhere
 
 Every other benchmark here is internally consistent and externally meaningless:
@@ -1082,7 +1149,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-441 tests, standard library only (they run with or without the optional tiers).
+468 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

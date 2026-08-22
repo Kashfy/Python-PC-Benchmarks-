@@ -19,6 +19,7 @@ from . import cores as cores_mod
 from . import diagnose
 from . import counters as counters_mod
 from . import datascience as ds_mod
+from . import drivelife
 from . import export as export_mod
 from . import gates as gates_mod
 from . import health
@@ -187,6 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip power / perf-per-watt measurement")
     g.add_argument("--health", action="store_true",
                    help="Run RAM integrity and drive SMART health checks")
+    g.add_argument("--no-drive-life", action="store_true",
+                   help="Skip the SSD lifetime/wear report (terabytes written, "
+                        "power-on hours, remaining endurance)")
     g.add_argument("--health-mb", type=int, default=256,
                    help="Memory to cover in the RAM integrity test")
     g.add_argument("--network-host", default="", metavar="HOST",
@@ -922,6 +926,12 @@ def main(argv=None) -> int:
             print(f"  running {len(jobs)} storage I/O job(s) ...", flush=True)
         io_result = iobench.run(jobs, disk_dir, quiet=quiet)
 
+    # Drive lifetime is read-only, costs a few milliseconds, and answers a
+    # question no benchmark can: how much life the storage has left.
+    drive_life = None
+    if not args.no_drive_life:
+        drive_life = drivelife.run(_repo_root())
+
     energy_result = None
     if args.energy:
         if not quiet:
@@ -1027,6 +1037,7 @@ def main(argv=None) -> int:
         "datascience": datascience_result,
         "io": io_result,
         "energy": energy_result,
+        "drive_life": drive_life,
         "provenance": (None if args.no_provenance else provenance.collect()),
         "confinement": confinement,
         "confinement_warnings": confinement_warnings,
