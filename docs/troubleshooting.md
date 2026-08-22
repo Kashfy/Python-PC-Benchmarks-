@@ -657,11 +657,24 @@ automatically when sysfs reports them.
 ## Involuntary context switches look enormous
 
 They usually are, and it is not a problem. The counter is reported as data with
-no verdict attached, because for this workload it does not measure contention:
-the benchmark spawns hundreds of worker processes across the core-scaling,
-multicore, compile and process-spawn tests, and every blocking disk call adds
-more. Measured on an idle machine, a full run reaches ~8,600 switches per
-second; a genuinely busier machine measured ~2,500.
+no verdict attached, because for this workload it does not measure contention.
+Measured per test:
+
+| test | involuntary switches/s |
+|---|---:|
+| `disk` | 132,152 |
+| `latency` | 83,027 |
+| everything else | 36 – 571 |
+
+Two tests produce the overwhelming majority, and both do so by construction: `disk`
+issues hundreds of thousands of blocking `pread()` calls to measure random-read
+IOPS, and each one that blocks is a preemption; `latency` *is* a context-switch
+benchmark, so making them is its measurement. A whole-run total is therefore
+close to a restatement of how many I/O operations the disk test completed,
+which is already reported as IOPS.
+
+Skipping them is the falsification test, and it is quick to repeat:
+`--skip disk,latency` took a full run from 8,812/s to 985/s here, an 89% drop.
 
 Versions up to v11.1 asserted "other processes were competing for CPU" from
 this number. That conclusion was not supported and has been removed.

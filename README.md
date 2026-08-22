@@ -613,10 +613,12 @@ invalidate everything else in a report:
 
 One counter is deliberately reported **without** a verdict attached.
 Involuntary context switches look like a contention signal and are not one for
-this workload: a full run on a completely idle machine reached ~8,600/s while a
-genuinely busier machine measured ~2,500/s, because the count is dominated by
-the tool's own worker processes and blocking I/O. It is printed as data, and
-contention is judged from load average and per-test condition sampling instead.
+this workload. Measured per test, `disk` produces 132,000/s and `latency`
+83,000/s while every other test sits between 36 and 571/s — `--skip
+disk,latency` takes a full run from 8,812/s to 985/s. Both do so by
+construction: `disk` makes hundreds of thousands of blocking `pread()` calls to
+measure IOPS, and `latency` *is* a context-switch benchmark. It is printed as data, and contention is judged from load average
+and per-test condition sampling instead.
 
 **PMU counters** (cycles, instructions, cache and branch misses) are real
 hardware registers needing kernel cooperation, so they come from `perf` on

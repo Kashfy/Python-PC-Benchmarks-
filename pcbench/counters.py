@@ -274,20 +274,31 @@ def derive(counts: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Involuntary context switches are reported as data but are deliberately NOT
 # used to infer CPU contention, because for this workload they do not measure
-# it. Two measurements settled the question:
+# it. Measured per test on one machine in a single sitting, so ambient load
+# applies equally to every row:
 #
-#   * A single CPU-bound process on a completely idle macOS machine sustains
-#     ~185 involuntary switches/s (the QoS scheduler preempts far more eagerly
-#     than Linux's CFS).
-#   * A full benchmark run on that same idle machine reaches ~8,600/s, while a
-#     genuinely busier machine measured ~2,500/s.
+#     disk           132,152 /s   <- 94% of the switches in that sample
+#     latency         83,027 /s
+#     cache_sweep         571 /s
+#     sqlite              445 /s
+#     nn_training         422 /s
+#     memory              356 /s
+#     cpu_int             121 /s
+#     cpu_multi            71 /s
 #
-# The busy machine scored *lower* than the idle one. The count is dominated by
-# the tool's own behaviour — hundreds of spawned workers across the core-scaling,
-# multicore, compile and process-spawn tests, plus every blocking disk call —
-# rather than by anything external. An earlier version asserted "other processes
-# were competing for CPU" from this counter, which was simply not a conclusion
-# the number supports.
+# Two tests produce the overwhelming majority, and both do so by construction.
+# Skipping them takes a full run from 8,812/s to 985/s -- an 89% drop, which is
+# the falsification test to repeat on any machine. The `disk`
+# test issues hundreds of thousands of blocking pread() calls to measure random
+# read IOPS, and every one that blocks is a preemption. The `latency` suite
+# *is* a context-switch benchmark -- producing context switches is its
+# measurement. A whole-run figure is therefore a restatement of how many I/O
+# operations the disk test completed, which is already reported as IOPS.
+#
+# Note what is not on that list: spawning. `cpu_multi` spawns a worker per core
+# and sits near the bottom, because the parent process being measured spends
+# the test waiting. An earlier version of this comment blamed worker spawning;
+# that was wrong, and the per-test numbers above are what disproved it.
 #
 # Real contention detection already exists and is grounded properly: load
 # average against core count in `system.state_warnings`, and per-test condition
@@ -392,9 +403,9 @@ def render(result: dict | None) -> str:
                   if rate is not None else "")
         lines.append(f"  Involuntary switches      : "
                      f"{res.get('involuntary_switches', 0):,}{suffix}")
-        lines.append("      (dominated by this tool's own worker processes "
-                     "and blocking I/O; not a contention signal — see the "
-                     "load average for that)")
+        lines.append("      (mostly from the disk test's blocking reads and "
+                     "the latency test, which measures context switches by "
+                     "making them; not a contention signal)")
         lines.append(f"  Page faults (minor/major) : "
                      f"{res.get('minor_faults', 0):,} / "
                      f"{res.get('major_faults', 0):,}")
