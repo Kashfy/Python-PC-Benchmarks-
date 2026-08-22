@@ -654,6 +654,22 @@ If the note says **BELOW**, it tells you what to pass to `--stream-mb`. Very
 large server caches (EPYC parts with 256-384 MB of L3) are handled
 automatically when sysfs reports them.
 
+## Involuntary context switches look enormous
+
+They usually are, and it is not a problem. The counter is reported as data with
+no verdict attached, because for this workload it does not measure contention:
+the benchmark spawns hundreds of worker processes across the core-scaling,
+multicore, compile and process-spawn tests, and every blocking disk call adds
+more. Measured on an idle machine, a full run reaches ~8,600 switches per
+second; a genuinely busier machine measured ~2,500.
+
+Versions up to v11.1 asserted "other processes were competing for CPU" from
+this number. That conclusion was not supported and has been removed.
+
+To judge contention, use the load average in the System Information block
+against the core count, and the per-test interference notes — both are grounded
+in the right measurement.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

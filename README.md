@@ -535,15 +535,21 @@ pcbench --counters
 
 Two tiers, because privilege differs enormously. **Resource counters** (page
 faults, context switches, peak RSS) come from `getrusage`, cost nothing, need
-no privileges, and run everywhere — they already catch the two findings that
+no privileges, and run everywhere — and major page faults in particular
 invalidate everything else in a report:
 
 ```
-  Involuntary switches      : 11,132
-      i 11,132 involuntary context switches — the scheduler preempted this
-        work repeatedly, which means other processes were competing for CPU.
-        The result understates the hardware.
+  Page faults (minor/major) : 93,658 / 8,243
+      i 8,243 major page faults (89.8/s) — memory was fetched from backing
+        store during the run, which dominates any CPU effect.
 ```
+
+One counter is deliberately reported **without** a verdict attached.
+Involuntary context switches look like a contention signal and are not one for
+this workload: a full run on a completely idle machine reached ~8,600/s while a
+genuinely busier machine measured ~2,500/s, because the count is dominated by
+the tool's own worker processes and blocking I/O. It is printed as data, and
+contention is judged from load average and per-test condition sampling instead.
 
 **PMU counters** (cycles, instructions, cache and branch misses) are real
 hardware registers needing kernel cooperation, so they come from `perf` on
@@ -1076,7 +1082,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-417 tests, standard library only (they run with or without the optional tiers).
+420 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

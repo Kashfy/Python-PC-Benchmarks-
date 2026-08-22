@@ -41,6 +41,7 @@ import re
 import resource
 import shutil
 import subprocess
+import time
 
 #: perf events requested. Names rather than raw codes so perf maps them to
 #: whatever the local microarchitecture actually calls them.
@@ -54,13 +55,20 @@ PERF_EVENTS = [
 # Tier 1: resource counters (always available)
 # --------------------------------------------------------------------------- #
 def resource_snapshot(children: bool = False) -> dict:
-    """Cumulative resource counters for this process (or its children)."""
+    """Cumulative resource counters for this process (or its children).
+
+    The wall clock is captured alongside them because every counter here is
+    cumulative: a raw count is meaningless without the interval it accumulated
+    over, and comparing counts across runs of different lengths is how a
+    perfectly healthy long run gets flagged as contended.
+    """
     who = resource.RUSAGE_CHILDREN if children else resource.RUSAGE_SELF
     try:
         r = resource.getrusage(who)
     except (OSError, ValueError):
         return {}
     return {
+        "wall_clock": time.monotonic(),
         "user_s": r.ru_utime,
         "system_s": r.ru_stime,
         "max_rss_bytes": _rss_bytes(r.ru_maxrss),
@@ -86,8 +94,18 @@ def resource_delta(before: dict, after: dict) -> dict:
     for key in after:
         if key == "max_rss_bytes":
             out[key] = max(after[key], before.get(key, 0))
+        elif key == "wall_clock":
+            continue
         else:
             out[key] = after[key] - before.get(key, 0)
+
+    elapsed = after.get("wall_clock", 0) - before.get("wall_clock", 0)
+    if elapsed > 0:
+        out["elapsed_s"] = round(elapsed, 2)
+        out["involuntary_switches_per_s"] = round(
+            out.get("involuntary_switches", 0) / elapsed, 1)
+        out["major_faults_per_s"] = round(
+            out.get("major_faults", 0) / elapsed, 2)
     return out
 
 
@@ -254,6 +272,32 @@ def derive(counts: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Interpretation
 # --------------------------------------------------------------------------- #
+# Involuntary context switches are reported as data but are deliberately NOT
+# used to infer CPU contention, because for this workload they do not measure
+# it. Two measurements settled the question:
+#
+#   * A single CPU-bound process on a completely idle macOS machine sustains
+#     ~185 involuntary switches/s (the QoS scheduler preempts far more eagerly
+#     than Linux's CFS).
+#   * A full benchmark run on that same idle machine reaches ~8,600/s, while a
+#     genuinely busier machine measured ~2,500/s.
+#
+# The busy machine scored *lower* than the idle one. The count is dominated by
+# the tool's own behaviour — hundreds of spawned workers across the core-scaling,
+# multicore, compile and process-spawn tests, plus every blocking disk call —
+# rather than by anything external. An earlier version asserted "other processes
+# were competing for CPU" from this counter, which was simply not a conclusion
+# the number supports.
+#
+# Real contention detection already exists and is grounded properly: load
+# average against core count in `system.state_warnings`, and per-test condition
+# sampling in `interference`.
+
+#: Major page faults per second. Unlike context switches this is unambiguous —
+#: the machine went to backing store for memory, and whatever caused it, every
+#: figure measured during it is affected.
+HIGH_MAJOR_FAULTS_PER_S = 5.0
+
 #: IPC below this suggests the core is stalling rather than executing. Modern
 #: out-of-order cores retire 4-8 instructions per cycle at peak, and
 #: well-behaved compute code reaches 2-3.
@@ -308,18 +352,14 @@ def interpret(derived: dict, resources: dict | None = None) -> list[str]:
             f"memory-level parallelism and prefetching.")
 
     res = resources or {}
-    involuntary = res.get("involuntary_switches")
-    if isinstance(involuntary, int) and involuntary > 1000:
+    fault_rate = res.get("major_faults_per_s")
+    if isinstance(fault_rate, (int, float)) and fault_rate > HIGH_MAJOR_FAULTS_PER_S:
         notes.append(
-            f"{involuntary:,} involuntary context switches — the scheduler "
-            f"preempted this work repeatedly, which means other processes were "
-            f"competing for CPU. The result understates the hardware.")
-    major = res.get("major_faults")
-    if isinstance(major, int) and major > 100:
-        notes.append(
-            f"{major:,} major page faults — the machine went to disk for "
-            f"memory during the run. This dominates any CPU effect; add RAM or "
-            f"reduce the working set before reading anything else here.")
+            f"{res.get('major_faults', 0):,} major page faults "
+            f"({fault_rate:,.1f}/s) — memory was fetched from backing store "
+            f"during the run, which dominates any CPU effect. On a machine "
+            f"with little free RAM this is the benchmark's own footprint; "
+            f"either way the figures measured during it are affected.")
     return notes
 
 
@@ -347,8 +387,14 @@ def render(result: dict | None) -> str:
 
     res = result.get("resources") or {}
     if res:
+        rate = res.get("involuntary_switches_per_s")
+        suffix = (f"  ({rate:,.0f}/s over {res.get('elapsed_s', 0):,.0f}s)"
+                  if rate is not None else "")
         lines.append(f"  Involuntary switches      : "
-                     f"{res.get('involuntary_switches', 0):,}")
+                     f"{res.get('involuntary_switches', 0):,}{suffix}")
+        lines.append("      (dominated by this tool's own worker processes "
+                     "and blocking I/O; not a contention signal — see the "
+                     "load average for that)")
         lines.append(f"  Page faults (minor/major) : "
                      f"{res.get('minor_faults', 0):,} / "
                      f"{res.get('major_faults', 0):,}")

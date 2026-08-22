@@ -2632,8 +2632,47 @@ class TestCounters(unittest.TestCase):
                             for n in notes), notes)
 
     def test_major_faults_are_reported_as_dominant(self):
-        notes = counters.interpret({}, {"major_faults": 5000})
+        notes = counters.interpret(
+            {}, {"major_faults": 5000, "major_faults_per_s": 50.0})
         self.assertTrue(any("major page faults" in n for n in notes))
+
+    def test_delta_computes_rates_from_elapsed_time(self):
+        before = {"wall_clock": 100.0, "involuntary_switches": 0,
+                  "major_faults": 0, "max_rss_bytes": 0}
+        after = {"wall_clock": 110.0, "involuntary_switches": 2000,
+                 "major_faults": 50, "max_rss_bytes": 0}
+        delta = counters.resource_delta(before, after)
+        self.assertEqual(delta["elapsed_s"], 10.0)
+        self.assertEqual(delta["involuntary_switches_per_s"], 200.0)
+        self.assertEqual(delta["major_faults_per_s"], 5.0)
+        self.assertNotIn("wall_clock", delta)
+
+    def test_involuntary_switches_never_claim_contention(self):
+        """Regression test for a metric that did not measure what it claimed.
+
+        Two measurements killed the original assertion: a full benchmark run on
+        a completely idle machine reached ~8,600 involuntary switches/s, while
+        a genuinely busier machine measured ~2,500/s. The count tracks this
+        tool's own worker spawning and blocking I/O, not external contention,
+        so no verdict may be drawn from it.
+        """
+        for rate in (185.0, 2545.0, 8638.0, 50_000.0):
+            notes = counters.interpret(
+                {}, {"involuntary_switches": int(rate * 90),
+                     "involuntary_switches_per_s": rate,
+                     "elapsed_s": 90.0,
+                     "major_faults": 0, "major_faults_per_s": 0.0})
+            self.assertEqual(
+                notes, [],
+                f"{rate}/s produced a verdict; involuntary switches must "
+                f"never be interpreted as contention")
+
+    def test_render_labels_switches_as_non_diagnostic(self):
+        text = counters.render({"resources": {
+            "involuntary_switches": 500_000,
+            "involuntary_switches_per_s": 5000.0, "elapsed_s": 100.0,
+            "minor_faults": 0, "major_faults": 0}})
+        self.assertIn("not a contention signal", text)
 
 
 # --------------------------------------------------------------------------- #

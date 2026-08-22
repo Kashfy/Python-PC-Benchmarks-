@@ -66,7 +66,7 @@ Python-PC-Benchmarks-/
 │   ├── export.py       # Prometheus, JUnit XML, SQLite, Markdown
 │   └── regression.py   # run-over-run regression detection
 ├── plugins/            # drop-in user benchmarks (auto-discovered)
-├── tests/              # 417 stdlib unittest cases
+├── tests/              # 420 stdlib unittest cases
 └── docs/
 ```
 
