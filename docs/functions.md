@@ -530,6 +530,74 @@ metric is fetched independently so a card omitting one does not lose the rest.
 
 ---
 
+## `pcbench.interference` — mid-run condition detection
+
+Machine state is checked before a run, but a run takes minutes and the machine
+can change underneath it. Every repeat inside a test is equally affected, so
+statistics cannot rescue a disturbed measurement — it has to be labelled.
+
+#### `sample(script_dir) -> dict`
+Cheap snapshot of load per core and CPU temperature.
+
+#### `compare_samples(before, after) -> dict`
+Flags a test when load rose more than 0.25 per core, the CPU warmed more than
+12 °C, or it was already above 85 °C.
+
+#### `summarize(results) -> dict`
+Run-level verdict listing which tests ran under changing conditions.
+
+---
+
+## `pcbench.diagnose` — bottleneck analysis and spec sheet
+
+#### `analyse(scores) -> dict`
+Compares category scores against the machine's **own median**, so the answer
+is "what is weak *for this machine*" — which is what determines whether an
+upgrade helps. Derived categories (`ai`, a roll-up of gpu/npu/ml) are excluded
+so they cannot double-count.
+
+#### `render(result) -> str`
+Bar chart of subsystem scores with the bottleneck and strongest marked, plus
+plain-language impact ("storage is the limit: application launches and builds
+will feel slow regardless of CPU").
+
+#### `spec_sheet(payload) -> str`
+One-page Markdown summary — hardware, headline results, subsystem scores, and
+the assessment. For a support ticket or a listing.
+
+---
+
+## `pcbench.health` — RAM integrity and drive SMART
+
+#### `memory_integrity(size_mb, ram_bytes) -> dict`
+Writes six adversarial bit patterns (all-zeros, all-ones, both alternating
+patterns, both nibble patterns) and verifies each reads back. Catches stuck
+bits and coupling between adjacent cells.
+
+**Scope is reported with every result**: it tests only memory this process
+could allocate, through the OS's virtual memory. A pass does **not** certify
+the RAM — only a bootable tester owning the whole address space can.
+
+#### `drive_health() -> dict`
+Read-only drive self-assessment. macOS uses `system_profiler` (no privileges
+needed); elsewhere `smartctl` if installed. **Never writes SMART data** — a
+test asserts no mutating commands appear in the module.
+
+---
+
+## `pcbench.plugins` — user-supplied benchmarks
+
+#### `discover(root) -> list[dict]`
+Loads every `.py` in `plugins/`. A plugin needs `NAME`, `UNIT`, `BASELINE`, and
+`run(seconds, repeats)` returning a dict with `rate`. Invalid or raising
+plugins are reported and skipped, never fatal.
+
+#### `run_all(plugins, seconds, repeats) -> dict` · `scores(results) -> dict`
+Executes each plugin and scores it against its own declared baseline, so it
+joins the composite like any built-in metric.
+
+---
+
 ## `pcbench.cli`
 
 #### `build_parser() -> ArgumentParser` · `main(argv=None) -> int` · `entry()`

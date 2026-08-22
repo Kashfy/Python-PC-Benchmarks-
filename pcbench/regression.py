@@ -39,6 +39,15 @@ _CONFIG_DEPS = {
     "disk_read_mb_s": "cfg_disk_mb",
     "disk_iops": "cfg_disk_mb",
     "mem_mb_s": "cfg_mem_mb",
+    # Several workloads are pure-Python loops, so their result depends on the
+    # interpreter as much as the hardware — CPython releases differ by tens of
+    # percent on this kind of code. Upgrading Python would otherwise appear as
+    # a hardware change.
+    "cpu_int_primes_s": "python_version",
+    "cpu_multi_primes_s": "python_version",
+    "nn_train_steps_s": "python_version",
+    "kmeans_dist_s": "python_version",
+    "knn_cmp_s": "python_version",
 }
 
 

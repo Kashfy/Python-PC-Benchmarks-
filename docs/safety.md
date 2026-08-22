@@ -126,7 +126,15 @@ them and loses nothing else.
 - `sudo -n powermetrics` is attempted on macOS *only* to read a power meter.
   The `-n` flag means it never prompts and never blocks; without existing sudo
   rights it silently falls back to an estimate.
-- The network benchmark binds **only to `127.0.0.1`** on an ephemeral port and
+- **External network tests are opt-in and have no default target.** Nothing
+  leaves the machine unless you pass `--network-host` or `--network-url`.
+  Downloads are capped in both time and bytes so a mistyped URL cannot pull an
+  unbounded amount over a metered connection.
+- **Plugins are ordinary Python and run with full privileges**, exactly like
+  any script you execute. Only add files you trust. Discovery never looks
+  outside `plugins/`, and a plugin that raises is skipped rather than aborting
+  the run — but that is fault tolerance, not a sandbox.
+- The loopback network benchmark binds **only to `127.0.0.1`** on an ephemeral port and
   sends nothing off the machine. No telemetry, no external requests.
 - No `shell=True` anywhere; every subprocess call passes an argument list, so
   there is no shell-injection surface.
@@ -164,3 +172,5 @@ is the point; the tool is not what caused it.
 | Thread/process cleanup | Verified no leaks |
 | Network | Loopback only, no external traffic |
 | Package installs | Opt-in, confirmed, into a venv, from PyPI only |
+| External network | Opt-in only, no default target, capped downloads |
+| RAM / SMART checks | RAM test is read-write on its own buffer; SMART is read-only |

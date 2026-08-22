@@ -19,7 +19,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, cli, compare, core, coreml_model, cores,  # noqa: E402
-                     cryptobench, gpucompute, numeric, optional, sysbench,
+                     cryptobench, diagnose, gpucompute, health, interference,
+                     numeric, optional, plugins, sysbench,
                      limits, mlbench, mlframework, network, npu, onnx_model,
                      power, regression, report, scoring, sustained, system,
                      thermal, workloads)
@@ -1490,3 +1491,239 @@ class TestInstaller(unittest.TestCase):
             self.assertIn("Cancelled", buf.getvalue())
         finally:
             builtins.input = real_input
+
+
+# --------------------------------------------------------------------------- #
+class TestInterference(unittest.TestCase):
+    """Conditions that change mid-run must be detected, not averaged over."""
+
+    def test_stable_conditions_not_flagged(self):
+        v = interference.compare_samples(
+            {"load_per_core": 0.10, "celsius": 50.0},
+            {"load_per_core": 0.12, "celsius": 53.0})
+        self.assertFalse(v["disturbed"])
+
+    def test_load_spike_flagged(self):
+        v = interference.compare_samples(
+            {"load_per_core": 0.1}, {"load_per_core": 0.9})
+        self.assertTrue(v["disturbed"])
+        self.assertTrue(any("load" in n for n in v["notes"]))
+
+    def test_large_temp_rise_flagged(self):
+        v = interference.compare_samples(
+            {"celsius": 45.0}, {"celsius": 70.0})
+        self.assertTrue(v["disturbed"])
+
+    def test_already_hot_flagged(self):
+        v = interference.compare_samples({"celsius": 86.0}, {"celsius": 88.0})
+        self.assertTrue(v["disturbed"])
+
+    def test_missing_sensors_are_not_an_error(self):
+        self.assertFalse(interference.compare_samples({}, {})["disturbed"])
+
+    def test_summarize_lists_disturbed_tests(self):
+        out = interference.summarize({
+            "cpu_int": {"interference": {"disturbed": True}},
+            "memory": {"rate": 1.0}})
+        self.assertEqual(out["disturbed_tests"], ["cpu_int"])
+        self.assertFalse(out["clean"])
+
+    def test_sample_returns_dict(self):
+        self.assertIsInstance(interference.sample("."), dict)
+
+
+class TestComparabilityGuards(unittest.TestCase):
+    """A different interpreter or setting must not look like different hardware."""
+
+    def test_interpreter_mismatch_warns(self):
+        rows = [
+            {"hostname": "a", "timestamp_utc": "t1", "python_version": "3.14.7",
+             "composite_score": "250", "cpu_int_primes_s": "4500000"},
+            {"hostname": "b", "timestamp_utc": "t2", "python_version": "3.11.9",
+             "composite_score": "150", "cpu_int_primes_s": "3000000"}]
+        out = compare.render_table(rows)
+        self.assertIn("different Python versions", out)
+        self.assertIn("cpu_int_primes_s", out)
+
+    def test_same_interpreter_no_warning(self):
+        rows = [
+            {"hostname": "a", "timestamp_utc": "t1", "python_version": "3.14.7",
+             "composite_score": "250"},
+            {"hostname": "b", "timestamp_utc": "t2", "python_version": "3.14.7",
+             "composite_score": "150"}]
+        self.assertNotIn("different Python versions",
+                         compare.render_table(rows))
+
+    def test_insignificant_gap_is_called_out(self):
+        rows = [
+            {"hostname": "a", "timestamp_utc": "t1", "composite_score": "250"},
+            {"hostname": "b", "timestamp_utc": "t2", "composite_score": "245"}]
+        self.assertIn("treat them as equivalent", compare.render_table(rows))
+
+    def test_large_gap_not_called_insignificant(self):
+        rows = [
+            {"hostname": "a", "timestamp_utc": "t1", "composite_score": "250"},
+            {"hostname": "b", "timestamp_utc": "t2", "composite_score": "100"}]
+        self.assertNotIn("treat them as equivalent",
+                         compare.render_table(rows))
+
+    def test_regression_guards_interpreter_bound_metrics(self):
+        for col in ("cpu_int_primes_s", "nn_train_steps_s", "kmeans_dist_s"):
+            self.assertEqual(regression._CONFIG_DEPS.get(col),
+                             "python_version", col)
+
+    def test_python_version_is_recorded_in_csv(self):
+        self.assertIn("python_version", report.CSV_FIELDS)
+
+
+class TestDiagnose(unittest.TestCase):
+    def test_identifies_weakest_subsystem(self):
+        r = diagnose.analyse({"subscores": {
+            "cpu_int": 400, "cpu_float": 400, "memory": 400,
+            "disk_write": 50, "disk_read": 50, "disk_iops": 50}})
+        self.assertTrue(r["available"])
+        self.assertEqual(r["weakest"]["category"], "disk")
+        self.assertTrue(any(b["category"] == "disk" for b in r["bottlenecks"]))
+
+    def test_balanced_machine_has_no_bottleneck(self):
+        r = diagnose.analyse({"subscores": {
+            "cpu_int": 200, "memory": 200, "disk_write": 200}})
+        self.assertEqual(r["bottlenecks"], [])
+        self.assertIn("balanced", r["verdict"])
+
+    def test_derived_ai_category_excluded(self):
+        # "ai" rolls up gpu/npu/ml and would double-count them.
+        r = diagnose.analyse({"subscores": {
+            "cpu_int": 200, "memory": 200, "npu": 400, "gpu_fp32": 400}})
+        self.assertNotIn("ai", r["categories"])
+
+    def test_single_category_declines_to_guess(self):
+        r = diagnose.analyse({"subscores": {"cpu_int": 200}})
+        self.assertFalse(r["available"])
+
+    def test_render_is_string(self):
+        r = diagnose.analyse({"subscores": {"cpu_int": 400, "memory": 100,
+                                            "disk_write": 400}})
+        self.assertIsInstance(diagnose.render(r), str)
+
+    def test_spec_sheet_contains_key_facts(self):
+        payload = {
+            "version": "9.0", "timestamp_utc": "2026-01-01T00:00:00Z",
+            "system": {"cpu_model": "Test CPU", "arch_family": "ARM64",
+                       "architecture": "arm64", "arch_bits": 64,
+                       "cpu_cores_logical": 8, "cpu_cores_physical": 8,
+                       "ram_total_gb": 16.0, "os": "Darwin",
+                       "os_release": "25.0", "hostname": "h"},
+            "state": {}, "results": {"cpu_int": {"rate": 4_000_000.0}},
+            "scores": {"subscores": {"cpu_int": 200, "memory": 100},
+                       "composite": 150.0},
+        }
+        md = diagnose.spec_sheet(payload)
+        self.assertIn("# Test CPU", md)
+        self.assertIn("4,000,000", md)
+        self.assertIn("Composite score", md)
+
+
+class TestHealth(unittest.TestCase):
+    def test_memory_integrity_passes_on_good_ram(self):
+        r = health.memory_integrity(16, 16 * 1024 ** 3)
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["errors"], 0)
+        self.assertEqual(r["patterns"], len(health._PATTERNS))
+
+    def test_memory_integrity_states_its_scope(self):
+        # A clean pass here is easy to over-read, so the limitation must
+        # always accompany the result.
+        r = health.memory_integrity(8, 16 * 1024 ** 3)
+        self.assertIn("does not certify", r["scope"])
+
+    def test_memory_integrity_respects_safety_cap(self):
+        r = health.memory_integrity(10 ** 6, 8 * 1024 ** 3)
+        self.assertLess(r["tested_mb"], 10 ** 6)
+        self.assertIn("safety_notice", r)
+
+    def test_patterns_cover_stuck_and_coupling_faults(self):
+        values = {v for v, _ in health._PATTERNS}
+        self.assertIn(0x00, values)
+        self.assertIn(0xFF, values)
+        self.assertIn(0xAA, values)
+        self.assertIn(0x55, values)
+
+    def test_drive_health_is_read_only(self):
+        import inspect
+        src = inspect.getsource(health)
+        for forbidden in ("smartctl -s", "--set", "nvme format"):
+            self.assertNotIn(forbidden, src)
+
+    def test_drive_health_shape(self):
+        d = health.drive_health()
+        self.assertIn("available", d)
+
+
+class TestPlugins(unittest.TestCase):
+    def _root(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_example_plugin_discovered_and_valid(self):
+        found = plugins.discover(self._root())
+        keys = {p["key"]: p for p in found}
+        self.assertIn("example_pi", keys)
+        self.assertTrue(keys["example_pi"]["valid"])
+
+    def test_plugin_runs_and_scores(self):
+        found = [p for p in plugins.discover(self._root())
+                 if p["key"] == "example_pi"]
+        results = plugins.run_all(found, 0.05, 1)
+        self.assertGreater(results["example_pi"]["rate"], 0)
+        self.assertIn("plugin_example_pi", plugins.scores(results))
+
+    def test_invalid_plugin_reported_not_fatal(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdir = os.path.join(d, "plugins")
+            os.makedirs(pdir)
+            with open(os.path.join(pdir, "broken.py"), "w") as fh:
+                fh.write("NAME = 'x'\n")          # missing UNIT/BASELINE/run
+            found = plugins.discover(d)
+            self.assertFalse(found[0]["valid"])
+            self.assertIn("missing", found[0]["error"])
+
+    def test_raising_plugin_does_not_abort_others(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdir = os.path.join(d, "plugins")
+            os.makedirs(pdir)
+            with open(os.path.join(pdir, "boom.py"), "w") as fh:
+                fh.write("NAME='b'\nUNIT='u'\nBASELINE=1.0\n"
+                         "def run(s, r):\n    raise RuntimeError('nope')\n")
+            results = plugins.run_all(plugins.discover(d), 0.01, 1)
+            self.assertIn("error", results["boom"])
+
+    def test_plugin_must_return_rate(self):
+        with tempfile.TemporaryDirectory() as d:
+            pdir = os.path.join(d, "plugins")
+            os.makedirs(pdir)
+            with open(os.path.join(pdir, "norate.py"), "w") as fh:
+                fh.write("NAME='n'\nUNIT='u'\nBASELINE=1.0\n"
+                         "def run(s, r):\n    return {'x': 1}\n")
+            results = plugins.run_all(plugins.discover(d), 0.01, 1)
+            self.assertIn("error", results["norate"])
+
+    def test_missing_plugin_dir_is_fine(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(plugins.discover(d), [])
+
+
+class TestExternalNetworkOptIn(unittest.TestCase):
+    def test_no_external_traffic_without_a_target(self):
+        # The default must never contact anything off the machine.
+        self.assertEqual(network.run_external(), {})
+        self.assertEqual(network.run_external(None, None), {})
+
+    def test_loopback_run_has_no_external_key(self):
+        r = network.run(0.2)
+        self.assertNotIn("external", r)
+
+    def test_download_is_bounded(self):
+        import inspect
+        src = inspect.getsource(network.download_throughput)
+        self.assertIn("max_bytes", src)
+        self.assertIn("max_seconds", src)

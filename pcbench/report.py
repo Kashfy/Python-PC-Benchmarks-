@@ -128,6 +128,8 @@ def _metric(results: dict, key: str, label: str, unit: str,
     _row(label, fmt(r.get(field)), suffix)
     if r.get("safety_notice"):
         print(f"      safety: {r['safety_notice']}")
+    for note in (r.get("interference") or {}).get("notes", []):
+        print(f"      ! measured under changing conditions: {note}")
 
 
 def print_results(results: dict) -> None:
@@ -497,6 +499,85 @@ def print_power(power: dict | None, ppw: dict | None) -> None:
         print(f"  hint: {power['hint']}")
 
 
+def print_plugins(results: dict | None) -> None:
+    """User-supplied benchmarks from plugins/."""
+    if not results:
+        return
+    hr("Plugins")
+    for key, entry in results.items():
+        label = entry.get("name", key)
+        if entry.get("error"):
+            _row(label, "FAILED", f"  {entry['error'][:44]}")
+            continue
+        _row(label, fmt(entry.get("rate")), f" {entry.get('unit', '')}")
+
+
+def print_health(h: dict | None) -> None:
+    """RAM integrity and drive self-assessment."""
+    if not h:
+        return
+    hr("Hardware Health")
+
+    mem = h.get("memory")
+    if isinstance(mem, dict) and not mem.get("skipped"):
+        verdict = "PASSED" if mem["passed"] else f"{mem['errors']} ERROR(S)"
+        _row("RAM integrity", verdict,
+             f"  {mem['tested_mb']} MB x {mem['patterns']} bit patterns")
+        if not mem["passed"]:
+            print("      !! Memory did not read back what was written. "
+                  "Suspect failing RAM,")
+            print("         an unstable memory overclock, or inadequate "
+                  "cooling.")
+            for err in mem.get("error_detail", []):
+                print(f"         {err['pattern']} at "
+                      f"{err['offset_mb']} MB")
+        # Always stated: a pass here is easy to over-read.
+        print(f"      scope: {mem['scope']}")
+
+    drive = h.get("drive") or {}
+    if drive.get("available"):
+        for d in drive.get("drives", []):
+            name = d.get("name") or d.get("device", "drive")
+            bits = [f"{k}={v}" for k, v in d.items()
+                    if k not in ("name", "device")]
+            _kv(str(name)[:24], ", ".join(bits) or "no attributes")
+    elif drive.get("note"):
+        print(f"  Drive health: {drive['note']}")
+
+
+def print_external_network(net: dict | None) -> None:
+    ext = (net or {}).get("external") or {}
+    if not ext:
+        return
+    hr("Network — external")
+    tcp = ext.get("tcp") or {}
+    if tcp.get("p50_ms") is not None:
+        _row(f"Latency to {tcp['host']}", f"{tcp['p50_ms']:.2f}",
+             f" ms p50  (p99 {tcp['p99_ms']:.1f} ms, "
+             f"{tcp['loss_percent']}% failed)")
+    elif tcp.get("error"):
+        print(f"  {tcp['error']}")
+    dns = ext.get("dns") or {}
+    if dns.get("median_ms") is not None:
+        _row("DNS resolution", f"{dns['median_ms']:.2f}",
+             f" ms median  ({dns['resolved']} resolved)")
+    dl = ext.get("download") or {}
+    if dl.get("mbit_per_s"):
+        _row("Download", f"{dl['mbit_per_s']:,.1f}",
+             f" Mbit/s  ({dl['downloaded_mb']} MB in {dl['seconds']}s)")
+    elif dl.get("error"):
+        print(f"  download: {dl['error']}")
+
+
+def print_bottleneck(b: dict | None) -> None:
+    """Which subsystem is holding this machine back."""
+    if not b:
+        return
+    hr("Bottleneck Analysis")
+    from .diagnose import render as _render
+    print(_render(b))
+
+
 def print_regression(reg: dict | None) -> None:
     if not reg:
         return
@@ -555,9 +636,13 @@ def print_report(payload: dict) -> None:
     print_npu_onnx(payload.get("npu_onnx"))
     print_ai(payload.get("ml_framework"))
     print_network(payload.get("network"))
+    print_external_network(payload.get("network"))
+    print_plugins(payload.get("plugins"))
+    print_health(payload.get("health"))
     print_power(payload.get("power"), payload.get("perf_per_watt"))
     print_sustained(payload.get("sustained"))
     print_scores(payload["scores"])
+    print_bottleneck(payload.get("bottleneck"))
     print_regression(payload.get("regression"))
     _print_validation(payload["results"])
 
@@ -589,7 +674,7 @@ def save_json(payload: dict, out_dir: str) -> str:
 
 CSV_FIELDS = [
     "timestamp_utc", "tool_version", "hostname", "os", "arch", "arch_family",
-    "cfg_disk_mb", "cfg_mem_mb",
+    "cfg_disk_mb", "cfg_mem_mb", "python_version", "python_impl",
     "cpu_model", "cores_physical", "cores_logical", "ram_gb", "on_ac_power",
     "cpu_int_primes_s", "cpu_float_iters_s", "cpu_multi_primes_s",
     "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
@@ -634,6 +719,8 @@ def flatten_row(payload: dict) -> dict:
         "tool_version": payload["version"],
         "cfg_disk_mb": (payload.get("config") or {}).get("disk_mb", ""),
         "cfg_mem_mb": (payload.get("config") or {}).get("mem_mb", ""),
+        "python_version": info.get("python_version", ""),
+        "python_impl": info.get("python_implementation", ""),
         "hostname": info["hostname"],
         "os": info["os"],
         "arch": info["architecture"],
@@ -745,6 +832,19 @@ tr:last-child td{border-bottom:none}
 .warn{color:var(--warn)}.bad{color:var(--bad)}.good{color:var(--good)}
 .note{color:var(--muted);font-size:.85rem}
 """
+
+
+def save_spec_sheet(payload: dict, out_dir: str) -> str:
+    """Write the Markdown spec sheet."""
+    from .diagnose import spec_sheet
+    os.makedirs(out_dir, exist_ok=True)
+    stamp = payload["timestamp_utc"].replace(":", "").replace("-", "")
+    host = re.sub(r"[^A-Za-z0-9_-]", "_",
+                  payload["system"].get("hostname") or "host")
+    path = os.path.join(out_dir, f"spec_{host}_{stamp}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(spec_sheet(payload))
+    return path
 
 
 def save_html(payload: dict, out_dir: str) -> str:
