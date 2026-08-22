@@ -243,6 +243,73 @@ def cpu_frequency_mhz() -> float | None:
     return None
 
 
+def last_level_cache_bytes() -> tuple[int | None, str]:
+    """Largest CPU cache the OS will admit to, and where the figure came from.
+
+    Used to size STREAM's arrays, which must clear the last-level cache by
+    roughly 4x or the benchmark measures cache bandwidth instead of memory
+    bandwidth.
+
+    The number is a floor, not the truth. Apple silicon does not expose its
+    system-level cache at all — an M1 Max reports 24 MB of L2 while also having
+    a 48 MB SLC behind it — and some server firmware under-reports shared L3.
+    Callers must therefore treat this as "at least this big" and add headroom
+    rather than sizing to exactly 4x it.
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        for key in ("hw.l3cachesize", "hw.perflevel0.l2cachesize",
+                    "hw.l2cachesize"):
+            raw = _run(["sysctl", "-n", key])
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value, key
+        return None, "not reported by sysctl"
+
+    if system == "Linux":
+        best, source = 0, ""
+        base = "/sys/devices/system/cpu/cpu0/cache"
+        try:
+            entries = sorted(os.listdir(base))
+        except OSError:
+            entries = []
+        for name in entries:
+            if not name.startswith("index"):
+                continue
+            size = _read(os.path.join(base, name, "size")).strip()
+            level = _read(os.path.join(base, name, "level")).strip()
+            if not size:
+                continue
+            multiplier = 1
+            if size[-1:].upper() == "K":
+                multiplier, size = 1024, size[:-1]
+            elif size[-1:].upper() == "M":
+                multiplier, size = 1024 * 1024, size[:-1]
+            try:
+                value = int(size) * multiplier
+            except ValueError:
+                continue
+            if value > best:
+                best, source = value, f"sysfs L{level or '?'}"
+        if best:
+            return best, source
+        # /proc/cpuinfo carries a "cache size" line on x86.
+        for line in _read("/proc/cpuinfo").splitlines():
+            if line.lower().startswith("cache size"):
+                parts = line.split(":", 1)[1].split()
+                try:
+                    return int(parts[0]) * 1024, "/proc/cpuinfo"
+                except (ValueError, IndexError):
+                    pass
+        return None, "not reported by sysfs"
+
+    return None, f"cache size detection is not implemented on {system}"
+
+
 def gil_status() -> dict:
     """Report whether this interpreter runs with the GIL.
 

@@ -618,6 +618,42 @@ the elapsed time. That is labelled rather than presented as a measurement:
 - **macOS** needs `sudo` for `powermetrics`; without it only the TDP estimate
   is available.
 
+## Package power looks far too low (and perf-per-watt too high)
+
+Fixed in v11.1. Before it, the "under load" reading was generated with Python
+threads, which the GIL serialises onto a single core — so on a 10-core machine
+the all-core figure was really single-core power. An M1 Max reported 6.9 W
+where the true all-core draw is several times that, and every perf-per-watt
+number derived from it was inflated by roughly the core count.
+
+The load now runs in processes. If you have saved runs from v11.0 or earlier
+**with a real (non-estimated) power reading**, their `power_watts`,
+`score_per_watt`, and energy figures are wrong and should be re-measured. Runs
+where power was shown as `(estimated)` are unaffected — the TDP estimate never
+depended on the load.
+
+## STREAM Triad seems high for my chip
+
+Check the cache line printed under the result. From v11.1 it states the ratio
+and gives a verdict:
+
+```
+  268 MB per array against a 17 MB last-level cache (hw.perflevel0.l2cachesize)
+  — 16.0x, satisfying STREAM's 4x rule, so this measures memory rather than
+  cache bandwidth.
+```
+
+Arrays are now sized from the detected last-level cache with a generous floor,
+rather than a fixed 64 MB. The floor matters on Apple silicon specifically:
+macOS reports only L2, so an M1 Max looks like a 24 MB cache while also having
+a 48 MB system-level cache the OS never mentions. Under the old fixed default
+that machine ran STREAM at 1.4x its real cache and reported a Triad figure that
+was partly cache bandwidth.
+
+If the note says **BELOW**, it tells you what to pass to `--stream-mb`. Very
+large server caches (EPYC parts with 256-384 MB of L3) are handled
+automatically when sysfs reports them.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

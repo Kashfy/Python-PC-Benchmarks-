@@ -12,6 +12,7 @@ import csv
 import json
 import math
 import os
+import resource
 import time
 import platform
 import sys
@@ -26,7 +27,7 @@ from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
                      interference, iobench, monitor, numa, numeric, optional,
                      plugins, provenance, reference, soak, standards, stats,
                      storage, sysbench, limits, mlbench, mlframework, network,
-                     npu, onnx_model, power, regression, report, scoring,
+                     native, npu, onnx_model, power, regression, report, scoring,
                      sustained, system, thermal, workloads)
 
 
@@ -2978,3 +2979,116 @@ class TestNewScoringCalibration(unittest.TestCase):
         cats = scoring.category_scores(subscores)
         self.assertIn("standards", cats)
         self.assertIn("datascience", cats)
+
+
+# --------------------------------------------------------------------------- #
+class TestPowerLoadIsParallel(unittest.TestCase):
+    """The 'under load' power reading must actually load every core.
+
+    Regression test for a real bug: the load was generated with Python threads,
+    which the GIL serialises onto one core. On a 10-core M1 Max that reported
+    6.9 W as the all-core figure and inflated every perf-per-watt number
+    derived from it. The bug was invisible wherever power was only a TDP
+    estimate, because the estimate ignores load entirely.
+    """
+
+    def test_burn_worker_is_importable_for_spawn(self):
+        # spawn() re-imports the target, so a closure or local function would
+        # fail at run time on macOS and Windows.
+        self.assertTrue(callable(power._burn))
+        self.assertEqual(power._burn.__module__, "pcbench.power")
+
+    def test_load_saturates_more_than_one_core(self):
+        import multiprocessing as mp
+        cores = os.cpu_count() or 1
+        if cores < 2:
+            self.skipTest("needs at least 2 cores to detect the difference")
+
+        ctx = mp.get_context("spawn")
+        stop = ctx.Event()
+        workers = min(4, cores)
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        procs = [ctx.Process(target=power._burn, args=(stop,), daemon=True)
+                 for _ in range(workers)]
+        for p in procs:
+            p.start()
+        start = time.perf_counter()
+        time.sleep(1.0)
+        stop.set()
+        for p in procs:
+            p.join(timeout=5.0)
+        wall = time.perf_counter() - start
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+        cpu = ((after.ru_utime - before.ru_utime)
+               + (after.ru_stime - before.ru_stime))
+        # Threads under the GIL give ~1.0. Anything meaningfully above proves
+        # real parallelism; 1.5 leaves room for spawn overhead and a busy host.
+        self.assertGreater(cpu / wall, 1.5,
+                           f"load used only {cpu / wall:.2f} cores — the "
+                           f"power reading would be single-core")
+
+    def test_estimated_power_skips_the_load_entirely(self):
+        # A TDP estimate is load-independent, so spawning processes to produce
+        # load would cost seconds for no change in the answer.
+        import unittest.mock as mock
+        with mock.patch.object(power, "measure",
+                               return_value={"package_w": 15.0,
+                                             "estimated": True}) as m:
+            result = power.measure_under_load("core i7")
+        self.assertTrue(result["estimated"])
+        self.assertEqual(m.call_count, 1, "no load should have been raised")
+
+
+# --------------------------------------------------------------------------- #
+class TestStreamArraySizing(unittest.TestCase):
+    """STREAM arrays must clear the last-level cache by ~4x.
+
+    Regression test for a real reporting error: the fixed 64 MB default gave
+    only 1.4x on an M1 Max's 48 MB system-level cache, so the reported Triad
+    figure was partly cache bandwidth.
+    """
+
+    GB = 1024 ** 3
+    MB = 1024 ** 2
+
+    def test_large_cache_gets_larger_arrays(self):
+        small = native.stream_array_mb(2 * self.MB, 64 * self.GB)
+        large = native.stream_array_mb(256 * self.MB, 512 * self.GB)
+        self.assertGreater(large, small)
+
+    def test_four_times_rule_is_met_for_a_big_cache(self):
+        cache_mb = 256
+        chosen = native.stream_array_mb(cache_mb * self.MB, 512 * self.GB)
+        self.assertGreaterEqual(chosen, 4 * cache_mb)
+
+    def test_apple_silicon_hidden_slc_is_covered_by_the_floor(self):
+        # An M1 Max reports 24 MB of L2 while also having a 48 MB SLC the OS
+        # never mentions, so the floor has to carry the margin.
+        chosen_mb = native.stream_array_mb(24 * self.MB, 64 * self.GB)
+        self.assertGreaterEqual(chosen_mb * self.MB, 4 * 48 * self.MB)
+
+    def test_small_machines_are_clamped_below_a_quarter_of_ram(self):
+        ram = 1 * self.GB
+        chosen = native.stream_array_mb(2 * self.MB, ram)
+        self.assertLess(chosen * self.MB * 3, ram / 3)
+
+    def test_undetected_cache_still_yields_a_sane_default(self):
+        self.assertGreaterEqual(native.stream_array_mb(None, 8 * self.GB), 64)
+
+    def test_cache_note_states_the_ratio_and_the_verdict(self):
+        ok = standards._stream_cache_note(256 * self.MB, 16 * self.MB, "L2")
+        self.assertIn("satisfying", ok)
+        bad = standards._stream_cache_note(64 * self.MB, 48 * self.MB, "SLC")
+        self.assertIn("BELOW", bad)
+        self.assertIn("--stream-mb", bad)
+
+    def test_cache_note_admits_when_it_cannot_check(self):
+        note = standards._stream_cache_note(64 * self.MB, None, "unavailable")
+        self.assertIn("could not be checked", note)
+
+    def test_last_level_cache_detection_never_raises(self):
+        size, source = system.last_level_cache_bytes()
+        self.assertIsInstance(source, str)
+        if size is not None:
+            self.assertGreater(size, 0)

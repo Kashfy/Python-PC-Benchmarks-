@@ -395,7 +395,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-406 cases, standard library only — no pytest, no test dependencies.
+417 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

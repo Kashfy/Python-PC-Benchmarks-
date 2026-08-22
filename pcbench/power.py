@@ -153,36 +153,60 @@ def _hint(sysname: str) -> str:
     return "on-die power metering is not exposed on this platform"
 
 
-def measure_under_load(cpu_model: str = "", load_s: float = 1.5) -> dict:
-    """Sample power while the CPU is deliberately busy.
+def _burn(stop_flag) -> None:
+    """Saturate one core until told to stop. Must be importable for spawn()."""
+    x = 0
+    while not stop_flag.is_set():
+        for _ in range(10_000):
+            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
 
-    Idle power is uninteresting; the number that matters is draw under work. A
-    background thread burns all cores for the sampling window. If only a TDP
-    estimate is available the load is skipped (the estimate is load-independent).
+
+def measure_under_load(cpu_model: str = "", load_s: float = 1.5) -> dict:
+    """Sample power while every core is deliberately busy.
+
+    Idle power is uninteresting; the number that matters is draw under work.
+
+    The load runs in **processes, not threads**. An earlier version used
+    threads, and under CPython's GIL ten of them saturate exactly one core —
+    so on a 10-core machine the "all-core" reading was single-core power. On an
+    M1 Max that reported 6.9 W where the real all-core figure is several times
+    higher, and every perf-per-watt figure derived from it was correspondingly
+    inflated. The bug was invisible wherever power was only a TDP estimate,
+    because the estimate ignores load entirely.
+
+    If only a TDP estimate is available the load is skipped, since the estimate
+    is load-independent and spawning processes would cost time for nothing.
     """
     if platform.system() not in ("Darwin", "Linux"):
         return measure(cpu_model)
 
-    import threading
+    # No point loading the machine if nothing can actually meter it.
+    probe = measure(cpu_model)
+    if probe.get("estimated"):
+        return probe
 
-    stop = threading.Event()
+    import multiprocessing as mp
 
-    def burn():
-        x = 0
-        while not stop.is_set():
-            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-
-    workers = [threading.Thread(target=burn, daemon=True)
+    ctx = mp.get_context("spawn")
+    stop = ctx.Event()
+    workers = [ctx.Process(target=_burn, args=(stop,), daemon=True)
                for _ in range(max(1, os.cpu_count() or 1))]
-    for w in workers:
-        w.start()
+    reading = probe
     try:
-        time.sleep(0.2)                 # let the load ramp
+        for w in workers:
+            w.start()
+        # Spawned processes take noticeably longer to reach full speed than
+        # threads did; sampling too early would repeat the original mistake in
+        # a subtler form.
+        time.sleep(max(0.5, min(load_s, 3.0)))
         reading = measure(cpu_model)
+        reading["load"] = f"{len(workers)} process(es) at 100%"
     finally:
         stop.set()
         for w in workers:
-            w.join(timeout=0.5)
+            w.join(timeout=2.0)
+            if w.is_alive():
+                w.terminate()
     return reading
 
 

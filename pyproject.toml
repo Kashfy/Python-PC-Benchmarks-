@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcbench"
-version = "11.0"
+version = "11.1"
 description = "Cross-platform PC benchmark and diagnostics tool"
 readme = "README.md"
 requires-python = ">=3.8"

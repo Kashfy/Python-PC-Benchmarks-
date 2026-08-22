@@ -182,7 +182,9 @@ def from_native(native: dict | None) -> dict:
     if isinstance(stream, dict) and stream.get("triad"):
         out["stream"] = dict(stream)
         out["stream"]["cache_rule"] = _stream_cache_note(
-            stream.get("array_bytes", 0))
+            stream.get("array_bytes", 0),
+            native.get("last_level_cache_bytes"),
+            native.get("last_level_cache_source"))
         if not stream.get("validated", True):
             out["stream"]["validation_failed"] = True
             out["stream"]["error"] = (
@@ -204,15 +206,37 @@ def from_native(native: dict | None) -> dict:
     return out
 
 
-def _stream_cache_note(array_bytes: int) -> str:
-    """STREAM requires each array to be ~4x the last-level cache."""
+def _stream_cache_note(array_bytes: int, cache_bytes: int | None = None,
+                       cache_source: str | None = None) -> str:
+    """State whether STREAM's 4x-last-level-cache rule is actually satisfied.
+
+    When the cache size is known the ratio is computed and reported as a
+    verdict, because "valid for caches up to 64 MB" is only useful to someone
+    who already knows their cache size. The detected figure is a floor — Apple
+    silicon hides its system-level cache — so a comfortable margin is treated
+    as satisfying the rule and a narrow one is called out.
+    """
     if not array_bytes:
         return "array size unknown"
     mb = array_bytes / 1e6
-    return (f"{mb:.0f} MB per array; STREAM requires roughly 4x the "
-            f"last-level cache, so this is valid for caches up to about "
-            f"{mb / 4:.0f} MB. A machine with a larger cache than that needs "
-            f"--stream-mb raised, or the figure includes cache bandwidth.")
+    covers = mb / 4
+
+    if not cache_bytes:
+        return (f"{mb:.0f} MB per array, valid for last-level caches up to "
+                f"about {covers:.0f} MB. This machine's cache size could not "
+                f"be read ({cache_source or 'unknown'}), so the rule could "
+                f"not be checked; raise --stream-mb if the cache is larger.")
+
+    cache_mb = cache_bytes / 1e6
+    ratio = array_bytes / cache_bytes
+    verdict = (f"{mb:.0f} MB per array against a {cache_mb:.0f} MB last-level "
+               f"cache ({cache_source}) — {ratio:.1f}x")
+    if ratio >= 4.0:
+        return (f"{verdict}, satisfying STREAM's 4x rule, so this measures "
+                f"memory rather than cache bandwidth.")
+    return (f"{verdict}, BELOW STREAM's 4x requirement — this figure is partly "
+            f"cache bandwidth and reads high. Re-run with "
+            f"--stream-mb {int(cache_mb * 4 / 1.048576):d} or more.")
 
 
 # --------------------------------------------------------------------------- #

@@ -13,6 +13,17 @@ import os
 import shutil
 import subprocess
 
+MB = 1024 * 1024
+
+#: STREAM requires each array to clear the last-level cache by about 4x.
+#: Detected cache sizes are a floor rather than the truth — Apple silicon hides
+#: its system-level cache entirely, reporting 24 MB of L2 on a part that also
+#: has 48 MB of SLC behind it — so a generous minimum is applied on top of the
+#: 4x rule. 256 MB arrays cover any last-level cache up to 64 MB, which spans
+#: every consumer part and most server ones.
+STREAM_MIN_ARRAY_BYTES = 256 * MB
+STREAM_CACHE_MULTIPLE = 4
+
 SOURCE_NAME = "native_engine.c"
 BINARY_NAME = "native_engine.exe" if os.name == "nt" else "native_engine"
 
@@ -42,8 +53,22 @@ def build(src: str, exe: str) -> tuple[bool, str]:
     return True, ""
 
 
+def stream_array_mb(cache_bytes: int | None, ram_bytes: int = 0) -> int:
+    """Choose a STREAM array size that clears the cache without risking swap.
+
+    Three arrays are allocated, so the total is 3x this. The RAM clamp keeps
+    that under a quarter of memory, which matters on the small machines where
+    the default would otherwise be the whole system.
+    """
+    target = max(STREAM_MIN_ARRAY_BYTES,
+                 (cache_bytes or 0) * STREAM_CACHE_MULTIPLE)
+    if ram_bytes:
+        target = min(target, ram_bytes // 12)
+    return max(4, int(target // MB))
+
+
 def run(seconds: float, repeats: int, script_dir: str,
-        threads: int | None = None) -> dict | None:
+        threads: int | None = None, stream_mb: int | None = None) -> dict | None:
     """Compile if stale, then run the engine and return its parsed JSON.
 
     Returns None when the source is absent; an ``{"error": ...}`` dict on any
@@ -63,6 +88,8 @@ def run(seconds: float, repeats: int, script_dir: str,
     cmd = [exe, "--json", "--seconds", str(seconds), "--repeats", str(repeats)]
     if threads:
         cmd += ["--threads", str(threads)]
+    if stream_mb:
+        cmd += ["--stream-mb", str(stream_mb)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=seconds * repeats * 8 + 60)

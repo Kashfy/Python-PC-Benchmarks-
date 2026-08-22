@@ -51,6 +51,7 @@ from .compare import load_history, render_table
 from .core import ValidationError
 from .scoring import compute_scores
 from .sustained import run_sustained
+from . import system as system_mod
 from .system import inventory, machine_state, state_warnings
 
 #: Synthetic tests: each isolates one subsystem, which is what makes them
@@ -742,8 +743,15 @@ def main(argv=None) -> int:
     if not args.no_native:
         if not quiet:
             print("  running native engine ...", flush=True)
-        native = native_mod.run(args.seconds, args.repeats, _repo_root(),
-                                threads=info["cpu_cores_logical"])
+        cache_bytes, cache_source = system_mod.last_level_cache_bytes()
+        native = native_mod.run(
+            args.seconds, args.repeats, _repo_root(),
+            threads=info["cpu_cores_logical"],
+            stream_mb=native_mod.stream_array_mb(
+                cache_bytes, info.get("ram_total_bytes", 0)))
+        if isinstance(native, dict):
+            native["last_level_cache_bytes"] = cache_bytes
+            native["last_level_cache_source"] = cache_source
 
     # Accelerator inventory is cheap and always collected; benchmarking it is
     # opt-out and only implemented on Apple platforms.

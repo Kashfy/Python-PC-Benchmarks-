@@ -1076,7 +1076,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-406 tests, standard library only (they run with or without the optional tiers).
+417 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 
