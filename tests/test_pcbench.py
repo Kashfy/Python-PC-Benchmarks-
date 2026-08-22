@@ -3288,3 +3288,75 @@ class TestInterferenceSelfLoad(unittest.TestCase):
     def test_every_self_parallel_name_is_a_real_test(self):
         for name in interference.SELF_PARALLEL_TESTS:
             self.assertIn(name, cli.TESTS)
+
+
+# --------------------------------------------------------------------------- #
+class TestCoreScalingCause(unittest.TestCase):
+    """A scaling knee has two causes, and the curve alone cannot tell them apart.
+
+    Regression test: the analysis saw only `os.cpu_count()` (logical) and
+    called every knee "a hybrid design with slower efficiency cores". On any
+    x86 CPU with SMT — most of them — the knee is hyperthreads sharing
+    execution units, which is a different fact calling for a different action.
+    """
+
+    @staticmethod
+    def _points(gains):
+        aggregate, out = 0.0, []
+        for i, g in enumerate(gains, 1):
+            aggregate += g
+            out.append({"workers": i, "marginal_rate": g,
+                        "aggregate_rate": aggregate,
+                        "scaling_vs_one": aggregate / gains[0]})
+        return out
+
+    def test_smt_knee_is_not_called_hybrid(self):
+        points = self._points([4.0] * 8 + [1.2] * 8)
+        result = cores.classify_cores(points, physical_cores=8,
+                                      logical_cores=16)
+        self.assertEqual(result["cause"], "smt")
+        self.assertFalse(result["hybrid"])
+        self.assertIn("SMT", result["note"])
+        self.assertNotIn("efficiency cores", result["note"])
+
+    def test_true_hybrid_without_smt_is_still_reported(self):
+        # An M1 Max: 8 performance + 2 efficiency, physical == logical.
+        points = self._points([2.2] * 8 + [0.85] * 2)
+        result = cores.classify_cores(points, physical_cores=10,
+                                      logical_cores=10)
+        self.assertEqual(result["cause"], "hybrid")
+        self.assertTrue(result["hybrid"])
+        self.assertIn("efficiency cores", result["note"])
+
+    def test_uniform_cores_claim_nothing(self):
+        points = self._points([3.0] * 8)
+        result = cores.classify_cores(points, physical_cores=8,
+                                      logical_cores=8)
+        self.assertIsNone(result["cause"])
+        self.assertIn("uniform", result["note"])
+
+    def test_knee_away_from_physical_count_refuses_to_guess(self):
+        # SMT exists but the knee is at 4 of 8 physical cores, so it is not
+        # the hyperthread boundary and the cause is genuinely unknown.
+        points = self._points([4.0] * 4 + [1.2] * 12)
+        result = cores.classify_cores(points, physical_cores=8,
+                                      logical_cores=16)
+        self.assertEqual(result["cause"], "ambiguous")
+        self.assertFalse(result["hybrid"])
+        self.assertIn("cannot separate", result["note"])
+
+    def test_unknown_physical_count_does_not_invent_smt(self):
+        points = self._points([4.0] * 8 + [1.2] * 8)
+        result = cores.classify_cores(points, physical_cores=None,
+                                      logical_cores=16)
+        self.assertNotEqual(result["cause"], "smt")
+
+    def test_slow_relative_is_reported_for_every_knee(self):
+        for physical, logical in ((8, 16), (10, 10)):
+            points = self._points([4.0] * 8 + [1.2] * (logical - 8))
+            result = cores.classify_cores(points, physical, logical)
+            self.assertAlmostEqual(result["slow_relative"], 0.3, places=2)
+
+    def test_too_few_points_is_handled(self):
+        self.assertFalse(
+            cores.classify_cores([{"marginal_rate": 1.0}], 4, 4)["hybrid"])

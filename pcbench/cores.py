@@ -35,6 +35,11 @@ LINEAR_SCALING_RATIO = 0.70
 # machine is called hybrid; a gentler difference is ordinary scaling loss.
 HYBRID_DROP_RATIO = 0.65
 
+# How close the scaling knee must sit to the physical core count before the
+# drop is attributed to SMT. A knee exactly at the number of physical cores is
+# the signature of hyperthreads taking over; one somewhere else is not.
+SMT_KNEE_TOLERANCE = 1
+
 
 def _worker(duration: float) -> int:
     """Run prime chunks for ``duration``; returns primes tested."""
@@ -89,7 +94,8 @@ def scaling_curve(seconds: float = 0.5,
     return points
 
 
-def classify_cores(points: list[dict]) -> dict:
+def classify_cores(points: list[dict], physical_cores: int | None = None,
+                   logical_cores: int | None = None) -> dict:
     """Characterise the core layout from the marginal gains.
 
     **What this reports, and why not more.** An earlier version of this
@@ -114,6 +120,8 @@ def classify_cores(points: list[dict]) -> dict:
     if len(gains) < 2 or gains[0] <= 0:
         return {"hybrid": False, "note": "too few cores to classify"}
 
+    logical_cores = logical_cores or (os.cpu_count() or len(gains))
+
     reference = gains[0]
 
     # How many workers scale near-linearly: the run of leading workers each
@@ -134,19 +142,65 @@ def classify_cores(points: list[dict]) -> dict:
     hybrid = bool(slow) and fast_each > 0 and \
         slow_each < fast_each * HYBRID_DROP_RATIO
 
+    # A drop in marginal gain has two completely different causes, and the
+    # curve alone cannot tell them apart:
+    #
+    #   * Hybrid layout — physically different core types (Apple silicon,
+    #     Intel 12th gen and later). The slow workers landed on smaller cores.
+    #   * SMT / Hyper-Threading — the same cores running a second thread each.
+    #     Once every physical core is busy, additional logical CPUs share
+    #     execution units and contribute roughly a third as much.
+    #
+    # They call for different actions (pin to P-cores vs. consider disabling
+    # SMT), so guessing is worse than declining to guess. The physical core
+    # count settles it: a knee sitting at exactly that number is SMT.
+    smt_capable = bool(physical_cores and logical_cores
+                       and logical_cores > physical_cores)
+    knee_at_physical = bool(
+        physical_cores
+        and abs(linear - physical_cores) <= SMT_KNEE_TOLERANCE)
+
+    cause = None
+    if slow and smt_capable and knee_at_physical:
+        cause = "smt"
+    elif slow and smt_capable:
+        cause = "ambiguous"
+    elif hybrid:
+        cause = "hybrid"
+
     result = {
-        "hybrid": hybrid,
+        "hybrid": hybrid and cause == "hybrid",
+        "cause": cause,
         "linear_up_to_workers": linear,
         "fast_rate_each": fast_each,
         "slow_rate_each": slow_each,
+        "physical_cores": physical_cores,
+        "logical_cores": logical_cores,
     }
-    if hybrid:
-        result["slow_relative"] = round(slow_each / fast_each, 2)
+    relative = (slow_each / fast_each) if fast_each and slow else None
+    if relative is not None:
+        result["slow_relative"] = round(relative, 2)
+    pct = f"{relative * 100:.0f}%" if relative is not None else "less"
+
+    if cause == "smt":
+        result["note"] = (
+            f"scales near-linearly to {linear} worker(s), matching this "
+            f"machine's {physical_cores} physical cores; beyond that each "
+            f"added worker contributes about {pct} as much because it is a "
+            f"second thread on an already-busy core (SMT), not a slower core")
+    elif cause == "ambiguous":
+        result["note"] = (
+            f"scales near-linearly to {linear} worker(s), then each added "
+            f"worker contributes about {pct} as much. With "
+            f"{physical_cores} physical and {logical_cores} logical cores the "
+            f"curve cannot separate SMT from a hybrid layout, so no cause is "
+            f"claimed")
+    elif cause == "hybrid":
         result["note"] = (
             f"scales near-linearly to {linear} worker(s); beyond that each "
-            f"added worker contributes about "
-            f"{result['slow_relative'] * 100:.0f}% as much, indicating a "
-            f"hybrid design with slower efficiency cores")
+            f"added worker contributes about {pct} as much. With no SMT on "
+            f"this machine that indicates a hybrid design with slower "
+            f"efficiency cores")
     else:
         result["note"] = (
             f"scales near-linearly to {linear} worker(s); cores appear "
@@ -179,15 +233,22 @@ def per_core_map(seconds: float = 0.4) -> list[dict] | None:
     return out
 
 
-def analyze(seconds: float = 0.5, max_workers: int | None = None) -> dict:
+def analyze(seconds: float = 0.5, max_workers: int | None = None,
+            physical_cores: int | None = None) -> dict:
     """Full core analysis: scaling curve, inferred layout, per-core map."""
     points = scaling_curve(seconds, max_workers)
     if not points:
         return {"error": "no scaling data"}
-    classes = classify_cores(points)
+
+    if physical_cores is None:
+        from .system import physical_cores as detect_physical
+        physical_cores = detect_physical()
+    logical = os.cpu_count() or 1
+    classes = classify_cores(points, physical_cores, logical)
     peak = points[-1]
     return {
-        "logical_cores": os.cpu_count() or 1,
+        "logical_cores": logical,
+        "physical_cores": physical_cores,
         "points": points,
         "classes": classes,
         "peak_aggregate_rate": peak["aggregate_rate"],

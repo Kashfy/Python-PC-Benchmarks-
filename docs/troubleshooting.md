@@ -711,6 +711,36 @@ that check exists to catch.
 If you still see this on a single-threaded test, it is real: something started
 during the run.
 
+## Core scaling says "hybrid design" on a CPU that is not hybrid
+
+Fixed in v11.4. The analysis only saw the logical core count, so any knee in
+the scaling curve was reported as "a hybrid design with slower efficiency
+cores". On the many x86 CPUs with SMT / Hyper-Threading the knee is not that at
+all — it is hyperthreads sharing execution units once every physical core is
+busy, which typically contribute about 30% of a full core.
+
+The two look identical in the curve and call for different actions (pin to
+P-cores versus consider disabling SMT), so the physical core count is now used
+to separate them:
+
+- knee at the physical core count, with SMT present -> reported as SMT
+- knee with no SMT on the machine -> reported as a hybrid layout
+- knee somewhere else with SMT present -> no cause claimed, curve shown
+
+Apple silicon is genuinely hybrid and has no SMT, so it is still reported as
+hybrid.
+
+## Core scaling reports far fewer linear workers than my CPU has
+
+Usually the machine was busy. The curve needs the CPU mostly free: background
+load steals workers unevenly and the marginal gain per worker becomes noise —
+on a loaded machine successive workers can even show a negative marginal
+contribution.
+
+The pre-run state check normally refuses to run in that situation; if you
+passed `--force` you have overridden it. Re-run on a quiet machine, and raise
+`--seconds` (the default 0.6s per point for this test is deliberately short).
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:
