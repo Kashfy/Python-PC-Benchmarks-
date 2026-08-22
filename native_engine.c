@@ -141,6 +141,276 @@ static double cpu_float_chunk(void) {
     return s;
 }
 
+/* --------------------------- STREAM ------------------------------------
+ * The industry-standard memory-bandwidth benchmark (John McCalpin, 1991).
+ * Four kernels over three double arrays:
+ *
+ *   Copy   c[j] = a[j]              2 arrays touched
+ *   Scale  b[j] = q * c[j]          2 arrays touched
+ *   Add    c[j] = a[j] + b[j]       3 arrays touched
+ *   Triad  a[j] = b[j] + q * c[j]   3 arrays touched
+ *
+ * Triad is the figure people quote, because it is the one with a
+ * read-read-write pattern and an arithmetic operation, which is what real
+ * numerical code looks like.
+ *
+ * Two rules from the reference implementation are honoured here because
+ * violating either silently invalidates the number:
+ *
+ *   1. Each array must be considerably larger than the last-level cache,
+ *      or the benchmark measures cache bandwidth instead of memory bandwidth.
+ *      STREAM requires 4x LLC; the array size is chosen from RAM below and
+ *      reported so the caller can judge.
+ *   2. The result must be validated. A compiler that hoists or vectorises
+ *      away the loop produces a spectacular and meaningless number, so the
+ *      final array contents are checked against the arithmetic they should
+ *      have produced.
+ *
+ * STREAM reports MB/s in powers of ten (1 MB = 1e6 bytes), not powers of two.
+ * That convention is kept so figures are directly comparable to published
+ * STREAM results; it is why these numbers look ~5% higher than a MiB/s figure
+ * for the same hardware.
+ */
+#define STREAM_SCALAR 3.0
+
+typedef struct {
+    double copy, scale, add, triad;
+    size_t elements;
+    size_t array_bytes;
+    int validated;
+} StreamResult;
+
+static int stream_validate(const double *a, const double *b, const double *c,
+                           size_t n, int ntimes) {
+    /* Replay the kernels on scalars: every element underwent identical
+     * arithmetic, so one scalar trace predicts the whole array. */
+    double aj = 1.0, bj = 2.0, cj = 0.0, q = STREAM_SCALAR;
+    for (int k = 0; k < ntimes; ++k) {
+        cj = aj;              /* Copy  */
+        bj = q * cj;          /* Scale */
+        cj = aj + bj;         /* Add   */
+        aj = bj + q * cj;     /* Triad */
+    }
+    double ea = 0.0, eb = 0.0, ec = 0.0;
+    for (size_t j = 0; j < n; ++j) {
+        ea += fabs(a[j] - aj);
+        eb += fabs(b[j] - bj);
+        ec += fabs(c[j] - cj);
+    }
+    double tol = 1e-8;
+    return (ea / n < tol * fabs(aj) + tol)
+        && (eb / n < tol * fabs(bj) + tol)
+        && (ec / n < tol * fabs(cj) + tol);
+}
+
+static int run_stream(StreamResult *out, size_t array_bytes, int ntimes) {
+    size_t n = array_bytes / sizeof(double);
+    if (n < 1024) return 0;
+
+    double *a = (double *)malloc(n * sizeof(double));
+    double *b = (double *)malloc(n * sizeof(double));
+    double *c = (double *)malloc(n * sizeof(double));
+    if (!a || !b || !c) { free(a); free(b); free(c); return 0; }
+
+    for (size_t j = 0; j < n; ++j) { a[j] = 1.0; b[j] = 2.0; c[j] = 0.0; }
+    if (ntimes < 2) ntimes = 2;
+
+    /* Best (not mean) time per kernel, as the reference implementation does:
+     * the fastest pass is the one least disturbed by interference, and the
+     * quantity being characterised is the hardware's capability. */
+    double best_copy = 1e30, best_scale = 1e30;
+    double best_add = 1e30, best_triad = 1e30;
+    double q = STREAM_SCALAR, t;
+
+    for (int k = 0; k < ntimes; ++k) {
+        t = now_seconds();
+        for (size_t j = 0; j < n; ++j) c[j] = a[j];
+        t = now_seconds() - t;
+        if (k > 0 && t < best_copy) best_copy = t;
+
+        t = now_seconds();
+        for (size_t j = 0; j < n; ++j) b[j] = q * c[j];
+        t = now_seconds() - t;
+        if (k > 0 && t < best_scale) best_scale = t;
+
+        t = now_seconds();
+        for (size_t j = 0; j < n; ++j) c[j] = a[j] + b[j];
+        t = now_seconds() - t;
+        if (k > 0 && t < best_add) best_add = t;
+
+        t = now_seconds();
+        for (size_t j = 0; j < n; ++j) a[j] = b[j] + q * c[j];
+        t = now_seconds() - t;
+        if (k > 0 && t < best_triad) best_triad = t;
+    }
+
+    out->validated = stream_validate(a, b, c, n, ntimes);
+    if (!out->validated) g_validation_failed = 1;
+
+    /* MB/s on STREAM's 1e6 convention. */
+    double two = 2.0 * sizeof(double) * (double)n / 1.0e6;
+    double three = 3.0 * sizeof(double) * (double)n / 1.0e6;
+    out->copy  = best_copy  < 1e29 ? two   / best_copy  : 0.0;
+    out->scale = best_scale < 1e29 ? two   / best_scale : 0.0;
+    out->add   = best_add   < 1e29 ? three / best_add   : 0.0;
+    out->triad = best_triad < 1e29 ? three / best_triad : 0.0;
+    out->elements = n;
+    out->array_bytes = n * sizeof(double);
+
+    g_sink_d += a[0] + b[n / 2] + c[n - 1];
+    free(a); free(b); free(c);
+    return 1;
+}
+
+/* --------------------------- CoreMark-style ----------------------------
+ * EEMBC's CoreMark is the reference integer benchmark for embedded and
+ * general-purpose cores, and it exists because Dhrystone was trivially
+ * defeated by compilers. It combines four kernels whose results feed each
+ * other, so none can be optimised away in isolation:
+ *
+ *   - linked-list insert / find / sort
+ *   - small matrix multiply and column operations
+ *   - a finite state machine over a character buffer
+ *   - CRC over every intermediate result, which is also the validation
+ *
+ * This is a faithful *reimplementation of the same kernel mix*, not the
+ * certified benchmark. Published CoreMark scores come from EEMBC's exact
+ * source under strict reporting rules (fixed run duration, disclosed compiler
+ * flags, no library calls in the timed region), and a number produced here
+ * must not be presented as a CoreMark score. It is reported as
+ * "coremark_style" throughout for that reason. What it is good for is
+ * comparing cores to each other under an identical, compiler-resistant
+ * integer workload — which is most of what people want it for.
+ */
+#define CM_LIST_SIZE   200
+#define CM_MATRIX_DIM  16
+#define CM_FSM_LEN     512
+
+typedef struct cm_node {
+    struct cm_node *next;
+    short value;
+    short info;
+} cm_node;
+
+static unsigned short cm_crc16(unsigned short crc, unsigned short data) {
+    for (int i = 0; i < 16; ++i) {
+        unsigned short bit = ((data >> i) & 1) ^ (crc & 1);
+        crc >>= 1;
+        if (bit) crc ^= 0xA001;
+    }
+    return crc;
+}
+
+/* Insertion sort on the linked list, by value then info. */
+static cm_node *cm_sort(cm_node *head) {
+    cm_node *sorted = NULL;
+    while (head) {
+        cm_node *next = head->next;
+        if (!sorted || head->value < sorted->value) {
+            head->next = sorted;
+            sorted = head;
+        } else {
+            cm_node *p = sorted;
+            while (p->next && p->next->value <= head->value) p = p->next;
+            head->next = p->next;
+            p->next = head;
+        }
+        head = next;
+    }
+    return sorted;
+}
+
+static unsigned short cm_list_kernel(cm_node *pool, unsigned short seed) {
+    for (int i = 0; i < CM_LIST_SIZE; ++i) {
+        pool[i].value = (short)((seed + i * 7) & 0x7FFF);
+        pool[i].info = (short)(i & 0xFF);
+        pool[i].next = (i + 1 < CM_LIST_SIZE) ? &pool[i + 1] : NULL;
+    }
+    cm_node *head = cm_sort(&pool[0]);
+    unsigned short crc = 0;
+    int found = 0;
+    for (cm_node *p = head; p; p = p->next) {
+        crc = cm_crc16(crc, (unsigned short)p->value);
+        if (p->next && p->next->value < p->value) found++;   /* must stay 0 */
+    }
+    if (found != 0) g_validation_failed = 1;
+    return crc;
+}
+
+static unsigned short cm_matrix_kernel(short *a, short *b, int *out,
+                                       unsigned short seed) {
+    const int N = CM_MATRIX_DIM;
+    for (int i = 0; i < N * N; ++i) {
+        a[i] = (short)((seed + i) & 0xFF);
+        b[i] = (short)((seed ^ i) & 0xFF);
+    }
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j) {
+            int sum = 0;
+            for (int k = 0; k < N; ++k)
+                sum += (int)a[i * N + k] * (int)b[k * N + j];
+            out[i * N + j] = sum;
+        }
+    unsigned short crc = 0;
+    for (int i = 0; i < N * N; i += 7)
+        crc = cm_crc16(crc, (unsigned short)(out[i] & 0xFFFF));
+    return crc;
+}
+
+/* Four-state machine classifying a character buffer, as CoreMark's does. */
+static unsigned short cm_fsm_kernel(unsigned char *buf, unsigned short seed) {
+    for (int i = 0; i < CM_FSM_LEN; ++i)
+        buf[i] = (unsigned char)((seed + i * 31) & 0x7F);
+
+    int state = 0;
+    unsigned int counts[4] = {0, 0, 0, 0};
+    for (int i = 0; i < CM_FSM_LEN; ++i) {
+        unsigned char ch = buf[i];
+        switch (state) {
+            case 0: state = (ch >= '0' && ch <= '9') ? 1 : 2; break;
+            case 1: state = (ch == '.') ? 3 : ((ch >= '0' && ch <= '9') ? 1 : 0); break;
+            case 2: state = (ch == ' ') ? 0 : 2; break;
+            default: state = (ch >= '0' && ch <= '9') ? 3 : 0; break;
+        }
+        counts[state]++;
+    }
+    unsigned short crc = 0;
+    for (int i = 0; i < 4; ++i)
+        crc = cm_crc16(crc, (unsigned short)(counts[i] & 0xFFFF));
+    return crc;
+}
+
+static double run_coremark_style(double seconds, unsigned short *out_crc) {
+    cm_node *pool = (cm_node *)malloc(sizeof(cm_node) * CM_LIST_SIZE);
+    short *ma = (short *)malloc(sizeof(short) * CM_MATRIX_DIM * CM_MATRIX_DIM);
+    short *mb = (short *)malloc(sizeof(short) * CM_MATRIX_DIM * CM_MATRIX_DIM);
+    int *mo = (int *)malloc(sizeof(int) * CM_MATRIX_DIM * CM_MATRIX_DIM);
+    unsigned char *fsm = (unsigned char *)malloc(CM_FSM_LEN);
+    if (!pool || !ma || !mb || !mo || !fsm) {
+        free(pool); free(ma); free(mb); free(mo); free(fsm);
+        return 0.0;
+    }
+
+    unsigned short crc = 0, seed = 0x1234;
+    long long iterations = 0;
+    double start = now_seconds(), elapsed;
+    do {
+        /* Each kernel's CRC seeds the next, so the chain cannot be
+         * reordered or elided. */
+        crc = cm_crc16(crc, cm_list_kernel(pool, seed));
+        crc = cm_crc16(crc, cm_matrix_kernel(ma, mb, mo, crc));
+        crc = cm_crc16(crc, cm_fsm_kernel(fsm, crc));
+        seed = crc;
+        ++iterations;
+        elapsed = now_seconds() - start;
+    } while (elapsed < seconds);
+
+    g_sink_i += crc;
+    *out_crc = crc;
+    free(pool); free(ma); free(mb); free(mo); free(fsm);
+    return (double)iterations / elapsed;
+}
+
 /* --------------------------- Statistics -------------------------------- */
 static double median(double *v, int n) {
     for (int i = 1; i < n; ++i) {          /* insertion sort; n is tiny */
@@ -413,8 +683,24 @@ static void print_human(Res *r, int n, double *lat) {
         printf("\n  !! VALIDATION FAILED — computed results were incorrect\n");
 }
 
+static void print_human_standards(const StreamResult *st, double coremark) {
+    if (st->elements) {
+        printf("\n  STREAM (%.0f MB per array, MB/s on the 1e6 convention):\n",
+               (double)st->array_bytes / 1.0e6);
+        printf("    Copy  : %10.1f\n    Scale : %10.1f\n"
+               "    Add   : %10.1f\n    Triad : %10.1f%s\n",
+               st->copy, st->scale, st->add, st->triad,
+               st->validated ? "" : "   (VALIDATION FAILED)");
+    }
+    if (coremark > 0.0)
+        printf("\n  CoreMark-style : %10.1f iterations/s "
+               "(not a certified CoreMark score)\n", coremark);
+}
+
 static void print_json(Res *r, int n, double *lat,
-                       double seconds, int repeats, int threads) {
+                       double seconds, int repeats, int threads,
+                       const StreamResult *st, double coremark,
+                       unsigned crc) {
     printf("{\n  \"engine\": \"native-c\",\n");
     printf("  \"seconds\": %.3f,\n  \"repeats\": %d,\n  \"threads\": %d,\n",
            seconds, repeats, threads);
@@ -431,19 +717,45 @@ static void print_json(Res *r, int n, double *lat,
         printf("    {\"label\": \"%s\", \"bytes\": %zu, \"ns\": %.3f}%s\n",
                lbl, LAT_SIZES[i], lat[i], (i == N_LAT - 1) ? "" : ",");
     }
-    printf("  ]\n}\n");
+    printf("  ],\n");
+
+    printf("  \"stream\": ");
+    if (st->elements) {
+        printf("{\"unit\": \"MB/s\", \"convention\": \"1e6 bytes\", "
+               "\"array_bytes\": %zu, \"elements\": %zu, "
+               "\"validated\": %s, \"copy\": %.2f, \"scale\": %.2f, "
+               "\"add\": %.2f, \"triad\": %.2f},\n",
+               st->array_bytes, st->elements, st->validated ? "true" : "false",
+               st->copy, st->scale, st->add, st->triad);
+    } else {
+        printf("null,\n");
+    }
+
+    printf("  \"coremark_style\": ");
+    if (coremark > 0.0)
+        printf("{\"unit\": \"iterations/s\", \"rate\": %.3f, "
+               "\"crc\": %u, \"certified\": false, "
+               "\"note\": \"same kernel mix as EEMBC CoreMark; not the "
+               "certified benchmark and not comparable to published "
+               "CoreMark scores\"}\n", coremark, crc);
+    else
+        printf("null\n");
+
+    printf("}\n");
 }
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--json] [--seconds N] [--repeats M] [--threads T]\n"
-            "          [--mem-mb K] [--disk-mb K]\n", prog);
+            "          [--mem-mb K] [--disk-mb K] [--stream-mb K]\n"
+            "          [--no-standards]\n", prog);
 }
 
 /* --------------------------- Main -------------------------------------- */
 int main(int argc, char **argv) {
     double seconds = 3.0;
     int repeats = 3, as_json = 0, threads = 0, mem_mb = 64, disk_mb = 256;
+    int stream_mb = 0, no_standards = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--json")) as_json = 1;
@@ -452,6 +764,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mem-mb")  && i + 1 < argc) mem_mb  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--disk-mb") && i + 1 < argc) disk_mb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stream-mb") && i + 1 < argc) stream_mb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-standards")) no_standards = 1;
         else { usage(argv[0]); return 1; }
     }
     if (repeats < 1) repeats = 1;
@@ -483,6 +797,34 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < N_LAT; ++i)
         lat[i] = pointer_chase_ns(LAT_SIZES[i], lat_budget);
 
+    /* STREAM and the CoreMark-style suite: reference workloads whose value
+     * is that their numbers mean something outside this tool. */
+    StreamResult stream;
+    memset(&stream, 0, sizeof(stream));
+    double coremark = 0.0;
+    unsigned short cm_crc = 0;
+
+    if (!no_standards) {
+        /* Each array must clear the last-level cache by a wide margin, and
+         * three of them are allocated at once. 64 MB apiece satisfies the 4x
+         * rule for any cache up to 16 MB while staying under 1/5 of RAM on a
+         * 1 GB board. */
+        size_t bytes;
+        if (stream_mb > 0) {
+            bytes = (size_t)stream_mb * MB;
+        } else {
+            unsigned long long ram = total_ram_bytes();
+            bytes = 64 * (size_t)MB;
+            if (ram > 0 && bytes * 3 > ram / 4) bytes = (size_t)(ram / 12);
+            if (bytes < 4 * (size_t)MB) bytes = 4 * (size_t)MB;
+        }
+        int ntimes = (int)(seconds * 2.0);
+        if (ntimes < 3) ntimes = 3;
+        if (ntimes > 20) ntimes = 20;
+        run_stream(&stream, bytes, ntimes);
+        coremark = run_coremark_style(seconds, &cm_crc);
+    }
+
     Res results[6];
     results[0] = (Res){"CPU Integer (primes)",  "primes/s", median(ci, repeats), stddev(ci, repeats)};
     results[1] = (Res){"CPU Float (math ops)",  "iters/s",  median(cf, repeats), stddev(cf, repeats)};
@@ -491,8 +833,13 @@ int main(int argc, char **argv) {
     results[4] = (Res){"Disk write",            "MB/s",     median(dw, repeats), stddev(dw, repeats)};
     results[5] = (Res){"Disk read",             "MB/s",     median(dr, repeats), stddev(dr, repeats)};
 
-    if (as_json) print_json(results, 6, lat, seconds, repeats, threads);
-    else         print_human(results, 6, lat);
+    if (as_json) {
+        print_json(results, 6, lat, seconds, repeats, threads,
+                   &stream, coremark, cm_crc);
+    } else {
+        print_human(results, 6, lat);
+        print_human_standards(&stream, coremark);
+    }
 
     free(ci); free(cf); free(mt); free(mm); free(dw); free(dr);
     if (g_sink_i == 0x7FFFFFFF && g_sink_d == 1.5) fputs("", stderr);

@@ -196,3 +196,170 @@ def perf_per_watt(composite_score: float, power: dict) -> dict | None:
         "watts": watts,
         "estimated": power.get("estimated", True),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Energy to solution
+# --------------------------------------------------------------------------- #
+# Watts is a rate and answers "how hot will this get?". It does not answer the
+# question that decides a datacenter bill or a battery's life: "how much energy
+# did finishing this job actually cost?"
+#
+# Those come apart constantly. A chip that draws twice the power but finishes in
+# a third of the time uses less total energy — the "race to idle" effect that
+# governs mobile battery life. Comparing two machines on watts alone gets that
+# backwards, and comparing them on speed alone ignores the bill.
+#
+# So this measures joules for a *fixed amount of work*, which is the only
+# formulation that lets machines of different speeds be compared honestly.
+#
+# Measurement method differs by platform, and the difference matters enough to
+# report: Linux RAPL exposes a cumulative energy counter, so subtracting two
+# readings gives exact joules with no sampling error at all. macOS exposes only
+# instantaneous power, so the figure there is an integral of samples and
+# inherits their noise. A TDP estimate is a last resort and is labelled as one.
+# --------------------------------------------------------------------------- #
+
+
+def energy_to_solution(work, cpu_model: str = "", label: str = "workload",
+                       sample_interval: float = 0.5) -> dict:
+    """Run ``work()`` and report the energy it consumed.
+
+    ``work`` must return the number of work units completed (iterations,
+    samples, tokens — whatever makes sense), so efficiency can be expressed as
+    work per joule. Returning None just omits that ratio.
+    """
+    sysname = platform.system()
+
+    start_uj = _rapl_energy_uj() if sysname == "Linux" else None
+    samples: list[float] = []
+    stop = None
+    sampler = None
+
+    if start_uj is None:
+        # No cumulative counter: sample instantaneous power on a background
+        # thread and integrate. Started before the work so the first sample is
+        # not paid for out of the measured interval.
+        import threading
+
+        stop = threading.Event()
+
+        # measure() falls back to a TDP estimate when no meter is readable, so
+        # whether the samples are real has to be carried through. Integrating
+        # estimates and calling the total "measured" would be the exact kind of
+        # false precision this module exists to avoid.
+        sampled_estimates = []
+
+        def poll() -> None:
+            while not stop.is_set():
+                reading = measure(cpu_model)
+                watts = reading.get("package_w")
+                if isinstance(watts, (int, float)):
+                    samples.append(float(watts))
+                    sampled_estimates.append(bool(reading.get("estimated")))
+                stop.wait(sample_interval)
+
+        sampler = threading.Thread(target=poll, daemon=True)
+        sampler.start()
+
+    start = time.perf_counter()
+    units = work()
+    elapsed = time.perf_counter() - start
+
+    if sampler is not None:
+        stop.set()
+        sampler.join(timeout=5.0)
+
+    end_uj = _rapl_energy_uj() if sysname == "Linux" else None
+
+    joules = None
+    method = None
+    estimated = True
+    samples_were_estimated = bool(
+        locals().get("sampled_estimates") and all(sampled_estimates))
+    if start_uj is not None and end_uj is not None and end_uj >= start_uj:
+        joules = (end_uj - start_uj) / 1e6
+        method = "RAPL cumulative energy counter (exact)"
+        estimated = False
+    elif samples:
+        mean_w = sum(samples) / len(samples)
+        joules = mean_w * elapsed
+        estimated = samples_were_estimated
+        method = (
+            f"a ~{mean_w:.0f}W TDP estimate for this chip class, held over "
+            f"{elapsed:.1f}s" if estimated else
+            f"integrated from {len(samples)} power sample(s) at "
+            f"{sample_interval:g}s intervals")
+    else:
+        tdp = estimate_tdp(cpu_model)
+        if tdp:
+            joules = float(tdp) * elapsed
+            method = f"estimated from a ~{tdp}W TDP for this chip class"
+
+    result: dict = {
+        "label": label,
+        "seconds": round(elapsed, 3),
+        "joules": round(joules, 2) if joules is not None else None,
+        "watt_hours": round(joules / 3600.0, 5) if joules is not None else None,
+        "mean_watts": (round(joules / elapsed, 2)
+                       if joules is not None and elapsed > 0 else None),
+        "method": method or "unavailable",
+        "estimated": estimated,
+    }
+    if isinstance(units, (int, float)) and units and joules:
+        result["units"] = units
+        result["units_per_joule"] = float(f"{units / joules:.6g}")
+        result["joules_per_kilo_unit"] = float(
+            f"{1000.0 * joules / units:.6g}")
+    if joules is None:
+        result["hint"] = _hint(sysname)
+    return result
+
+
+def compare_efficiency(a: dict, b: dict) -> str:
+    """One sentence contrasting two energy-to-solution results.
+
+    Written to make the race-to-idle case explicit, because a machine that
+    finishes sooner while drawing more power is the outcome people most often
+    misread.
+    """
+    ja, jb = a.get("joules"), b.get("joules")
+    ta, tb = a.get("seconds"), b.get("seconds")
+    if not (ja and jb and ta and tb):
+        return "not enough data to compare energy"
+
+    faster = "A" if ta < tb else "B"
+    leaner = "A" if ja < jb else "B"
+    energy_gap = 100.0 * abs(ja - jb) / max(ja, jb)
+    time_gap = 100.0 * abs(ta - tb) / max(ta, tb)
+
+    if faster == leaner:
+        return (f"{leaner} is both {time_gap:.0f}% faster and uses "
+                f"{energy_gap:.0f}% less energy")
+    return (f"{faster} finishes {time_gap:.0f}% sooner but {leaner} uses "
+            f"{energy_gap:.0f}% less energy — the faster machine draws more "
+            f"power than it saves in time")
+
+
+def render_energy(result: dict | None) -> str:
+    """Terminal block for an energy measurement."""
+    if not result:
+        return ""
+    if result.get("joules") is None:
+        lines = [f"  Energy              : unavailable"]
+        if result.get("hint"):
+            lines.append(f"                        {result['hint']}")
+        return "\n".join(lines)
+
+    lines = [
+        f"  Energy to solution  : {result['joules']:,.1f} J "
+        f"over {result['seconds']:.1f}s ({result['mean_watts']:,.1f} W mean)",
+    ]
+    if result.get("units_per_joule"):
+        lines.append(f"  Efficiency          : "
+                     f"{result['units_per_joule']:,.6g} units/J "
+                     f"({result['joules_per_kilo_unit']:.4g} J per 1000 units)")
+    lines.append(f"      source: {result['method']}")
+    if result.get("estimated"):
+        lines.append("      this is a TDP estimate, not a measurement")
+    return "\n".join(lines)

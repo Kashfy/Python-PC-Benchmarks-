@@ -103,6 +103,59 @@ requested budget, bounded at 60–3000 frames and 120 seconds. The source is
 which turns the benchmark into a measurement of how fast x264 can skip
 macroblocks.
 
+### Reference workloads and the honesty rules around them
+
+STREAM, LINPACK, and the CoreMark-style suite exist here for one reason: their
+numbers are comparable to figures published outside this tool. That property is
+fragile, and three rules protect it.
+
+**STREAM validates and reports its array size.** The reference implementation
+requires each of the three double arrays to be roughly 4x the last-level cache;
+below that the benchmark measures cache bandwidth and the number is simply
+wrong. The array size is therefore printed with the result so the rule can be
+checked, and `--stream-mb` raises it for machines with very large caches. The
+final array contents are verified against the arithmetic the four kernels
+should have produced — a compiler that hoists or vectorises the loops away
+yields a spectacular, meaningless figure, and validation is the only defence.
+Results are MB/s on STREAM's 1e6-byte convention (not MiB/s), which is why they
+read about 5% higher than a binary-prefix figure for the same hardware.
+
+**LINPACK reports its residual.** HPL requires the scaled residual to fall
+below a tolerance; a solve that did not actually solve the system is not a fast
+solve, however many GFLOPS it claims. N is capped so the run stays short and
+clear of swap, which means the figure is honestly below what a tuned HPL run
+filling most of RAM would report — and that caveat is printed with the number,
+not buried here.
+
+**CoreMark-style is never called CoreMark.** It reimplements the same four
+kernels (list, matrix, state machine, CRC, chained through a CRC so none can be
+optimised away in isolation), which makes it useful for comparing cores under
+an identical compiler-resistant integer workload. Published CoreMark scores
+come from EEMBC's exact source under fixed reporting rules, and presenting an
+approximation under that name would destroy precisely the comparability that
+made implementing it worthwhile.
+
+### Statistics: why Mann-Whitney rather than a t-test
+
+Run-to-run benchmark samples are not normally distributed. They are bounded
+below by the hardware's best case and have a long upper tail produced by
+interference — a background process waking, a thermal event, a page-fault
+storm. A t-test assumes a symmetry the data does not have, and its p-values are
+correspondingly optimistic in exactly the situation where care is most needed.
+
+The Mann-Whitney U rank-sum test makes no distributional assumption, and it is
+consistent with the rest of the tool: the headline figure everywhere is a
+median, which is itself a rank statistic. The implementation applies both a tie
+correction (necessary when timer resolution makes samples repeat) and a
+continuity correction, and uses the normal approximation for the p-value.
+
+That approximation is poor for very small samples, which is why comparisons
+below three repeats per side return `INCONCLUSIVE` rather than a p-value that
+would look authoritative and mean nothing. Effect size (Cliff's delta) is
+reported alongside p because significance and magnitude are different
+questions: with enough repeats, a 0.3% difference becomes statistically
+significant while remaining completely irrelevant.
+
 ### Why the real-world workloads matter
 
 The synthetic loops measure one execution unit each. Compression, hashing, and

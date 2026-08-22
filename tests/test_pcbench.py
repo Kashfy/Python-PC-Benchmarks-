@@ -9,8 +9,10 @@ no test dependencies to install:
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
+import time
 import platform
 import sys
 import tempfile
@@ -19,11 +21,12 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
-                     core, coreml_model, cores, cryptobench, diagnose, export,
-                     gates, gpucompute, health, interference, monitor,
-                     numeric, optional, plugins, reference, soak, storage,
-                     sysbench, limits, mlbench, mlframework, network, npu,
-                     onnx_model, power, regression, report, scoring,
+                     core, coreml_model, cores, counters, cryptobench,
+                     datascience, diagnose, export, gates, gpucompute, health,
+                     interference, iobench, monitor, numa, numeric, optional,
+                     plugins, provenance, reference, soak, standards, stats,
+                     storage, sysbench, limits, mlbench, mlframework, network,
+                     npu, onnx_model, power, regression, report, scoring,
                      sustained, system, thermal, workloads)
 
 
@@ -2388,3 +2391,590 @@ class TestNewScoringBaselines(unittest.TestCase):
         self.assertNotIn("fsync", scoring.BASELINES)
         scores = scoring.compute_scores({"fsync": {"rate": 5000.0}})
         self.assertEqual(scores["subscores"], {})
+
+
+# --------------------------------------------------------------------------- #
+class TestProvenance(unittest.TestCase):
+    """Configuration capture must never crash and never over-claim."""
+
+    def test_collect_returns_all_sections(self):
+        info = provenance.collect()
+        for key in ("mitigations", "frequency", "memory", "smt", "microcode",
+                    "kernel"):
+            self.assertIn(key, info)
+
+    def test_collect_never_raises(self):
+        # Every section is wrapped; an unreadable platform yields
+        # available=False rather than an exception.
+        info = provenance.collect()
+        self.assertIsInstance(info, dict)
+
+    def test_absent_smt_is_not_reported_as_disabled(self):
+        # Apple silicon and many i3/i5 parts have no SMT. Calling that
+        # "DISABLED" sends the user hunting for a BIOS setting that does not
+        # exist, so supported and enabled are distinct fields.
+        notes = provenance.notes(
+            {"smt": {"available": True, "enabled": False, "supported": False}})
+        self.assertEqual(notes, [])
+
+    def test_disabled_smt_is_reported(self):
+        notes = provenance.notes(
+            {"smt": {"available": True, "enabled": False, "supported": True}})
+        self.assertTrue(any("switched off" in n for n in notes), notes)
+
+    def test_unknown_smt_support_is_not_reported(self):
+        notes = provenance.notes(
+            {"smt": {"available": True, "enabled": False, "supported": None}})
+        self.assertEqual(notes, [])
+
+    def test_disabled_mitigations_are_flagged(self):
+        notes = provenance.notes({"mitigations": {
+            "available": True, "vulnerable": ["spectre_v2", "meltdown"],
+            "mitigated": [], "cmdline_override": None}})
+        self.assertTrue(any("not comparable" in n for n in notes), notes)
+
+    def test_kernel_cmdline_override_takes_precedence(self):
+        notes = provenance.notes({"mitigations": {
+            "available": True, "vulnerable": [], "mitigated": ["x"],
+            "cmdline_override": "mitigations=off"}})
+        self.assertTrue(any("mitigations=off" in n for n in notes), notes)
+
+    def test_non_performance_governor_is_flagged(self):
+        notes = provenance.notes(
+            {"frequency": {"available": True, "governor": "powersave"}})
+        self.assertTrue(any("powersave" in n for n in notes), notes)
+
+    def test_performance_governor_is_not_flagged(self):
+        notes = provenance.notes(
+            {"frequency": {"available": True, "governor": "performance"}})
+        self.assertEqual(notes, [])
+
+    def test_render_omits_unavailable_sections(self):
+        text = provenance.render({"frequency": {"available": False},
+                                  "memory": {"available": False},
+                                  "smt": {"available": False},
+                                  "mitigations": {"available": False},
+                                  "microcode": {"available": False}})
+        self.assertEqual(text.strip(), "")
+
+
+# --------------------------------------------------------------------------- #
+class TestStatistics(unittest.TestCase):
+    def test_confidence_interval_brackets_the_mean(self):
+        ci = stats.confidence_interval([10.0, 11.0, 9.0, 10.5, 9.5])
+        self.assertLess(ci["low"], ci["mean"])
+        self.assertGreater(ci["high"], ci["mean"])
+
+    def test_single_sample_has_no_interval(self):
+        ci = stats.confidence_interval([42.0])
+        self.assertEqual(ci["low"], ci["high"])
+        self.assertIsNone(ci["relative_margin_pct"])
+
+    def test_identical_samples_have_zero_margin(self):
+        ci = stats.confidence_interval([5.0] * 6)
+        self.assertAlmostEqual(ci["margin"], 0.0)
+
+    def test_ranks_average_ties(self):
+        # Tied values must share the average rank, or the rank-sum test is
+        # biased whenever timer resolution is coarse.
+        self.assertEqual(stats._rank([1.0, 2.0, 2.0, 3.0]),
+                         [1.0, 2.5, 2.5, 4.0])
+
+    def test_identical_distributions_are_not_significant(self):
+        a = [100.0, 101.0, 99.0, 100.5, 99.5, 100.2]
+        b = [100.1, 100.9, 99.2, 100.4, 99.6, 100.3]
+        result = stats.compare(a, b)
+        self.assertFalse(result["significant"])
+        self.assertIn("NO SIGNIFICANT DIFFERENCE", result["verdict"])
+
+    def test_clear_difference_is_significant(self):
+        a = [100.0, 101.0, 99.0, 100.5, 99.5, 100.2]
+        b = [150.0, 151.0, 149.0, 150.5, 149.5, 150.2]
+        result = stats.compare(a, b)
+        self.assertTrue(result["significant"])
+        self.assertIn("SIGNIFICANT", result["verdict"])
+        self.assertGreater(result["change_pct"], 40)
+
+    def test_too_few_samples_is_inconclusive_not_negative(self):
+        # Collapsing "not enough data" into "no difference" is how
+        # underpowered comparisons get mistaken for evidence of no effect.
+        result = stats.compare([100.0, 101.0], [150.0, 151.0])
+        self.assertFalse(result["conclusive"])
+        self.assertIsNone(result["significant"])
+        self.assertIn("INCONCLUSIVE", result["verdict"])
+
+    def test_all_identical_samples_report_no_difference(self):
+        result = stats.mann_whitney([5.0] * 5, [5.0] * 5)
+        self.assertEqual(result["p"], 1.0)
+
+    def test_cliffs_delta_signs_correctly(self):
+        self.assertAlmostEqual(stats.cliffs_delta([1.0, 2.0], [3.0, 4.0]), 1.0)
+        self.assertAlmostEqual(stats.cliffs_delta([3.0, 4.0], [1.0, 2.0]), -1.0)
+
+    def test_negligible_difference_is_called_out(self):
+        a = [1000.0 + i * 0.01 for i in range(12)]
+        b = [1000.3 + i * 0.01 for i in range(12)]
+        result = stats.compare(a, b)
+        if result["significant"]:
+            self.assertIn("NEGLIGIBLE", result["verdict"])
+
+    def test_required_samples_grows_as_effect_shrinks(self):
+        samples = [100.0, 102.0, 98.0, 101.0, 99.0]
+        self.assertGreater(stats.required_samples(samples, 1.0),
+                           stats.required_samples(samples, 10.0))
+
+    def test_lower_is_better_metrics_invert_direction(self):
+        slow = [10.0, 10.1, 9.9, 10.2, 9.8, 10.0]
+        fast = [5.0, 5.1, 4.9, 5.2, 4.8, 5.0]
+        result = stats.compare(slow, fast, label="latency",
+                               higher_is_better=False)
+        self.assertIn("faster", result["verdict"])
+
+
+# --------------------------------------------------------------------------- #
+class TestPayloadComparison(unittest.TestCase):
+    def _payload(self, host, rate, n=8, composite=100.0):
+        return {
+            "system": {"hostname": host, "cpu_model": "Test CPU"},
+            "config": {"seconds": 3, "repeats": n},
+            "results": {"cpu_int": {"samples": [rate + (i % 3) - 1
+                                                for i in range(n)]}},
+            "scores": {"composite": composite},
+        }
+
+    def test_regression_is_detected(self):
+        a = self._payload("h", 1000.0)
+        b = self._payload("h", 800.0)
+        result = stats.compare_payloads(a, b)
+        self.assertIn("cpu_int", result["regressions"])
+        self.assertIn("REGRESSION", result["verdict"])
+
+    def test_improvement_is_detected(self):
+        result = stats.compare_payloads(self._payload("h", 800.0),
+                                        self._payload("h", 1000.0))
+        self.assertIn("cpu_int", result["improvements"])
+
+    def test_different_machines_warn(self):
+        result = stats.compare_payloads(self._payload("a", 1000.0),
+                                        self._payload("b", 1000.0))
+        self.assertTrue(any("different machines" in w
+                            for w in result["warnings"]))
+
+    def test_different_config_warns(self):
+        a = self._payload("h", 1000.0)
+        b = self._payload("h", 1000.0)
+        b["config"]["seconds"] = 10
+        result = stats.compare_payloads(a, b)
+        self.assertTrue(any("--seconds" in w for w in result["warnings"]))
+
+    def test_metrics_present_on_only_one_side_are_listed(self):
+        a = self._payload("h", 1000.0)
+        b = self._payload("h", 1000.0)
+        b["results"]["memory"] = {"samples": [1.0, 2.0, 3.0]}
+        result = stats.compare_payloads(a, b)
+        self.assertEqual(result["only_in_candidate"], ["memory"])
+
+    def test_lower_is_better_metric_is_not_called_a_regression(self):
+        a = self._payload("h", 1000.0)
+        b = self._payload("h", 1000.0)
+        a["results"]["fsync_median_us"] = {"samples": [100.0] * 6}
+        b["results"]["fsync_median_us"] = {"samples": [50.0] * 6}
+        result = stats.compare_payloads(a, b)
+        self.assertNotIn("fsync_median_us", result["regressions"])
+
+
+# --------------------------------------------------------------------------- #
+class TestCounters(unittest.TestCase):
+    def test_resource_snapshot_has_expected_fields(self):
+        snap = counters.resource_snapshot()
+        for key in ("minor_faults", "major_faults", "involuntary_switches"):
+            self.assertIn(key, snap)
+
+    def test_resource_delta_subtracts(self):
+        before = {"minor_faults": 10, "max_rss_bytes": 100}
+        after = {"minor_faults": 25, "max_rss_bytes": 80}
+        delta = counters.resource_delta(before, after)
+        self.assertEqual(delta["minor_faults"], 15)
+        # Peak RSS is a high-water mark, so the larger of the two survives.
+        self.assertEqual(delta["max_rss_bytes"], 100)
+
+    def test_perf_availability_always_explains_itself(self):
+        status = counters.perf_available()
+        if not status["available"]:
+            self.assertTrue(status.get("reason"))
+
+    def test_parse_perf_stat_handles_unsupported_events(self):
+        parsed = counters.parse_perf_stat(
+            "  12,345,678      cycles\n  <not supported>      cache-misses")
+        self.assertEqual(parsed["cycles"], 12345678)
+        self.assertIsNone(parsed["cache-misses"])
+
+    def test_derive_computes_ipc_and_rates(self):
+        d = counters.derive({"cycles": 1000, "instructions": 2000,
+                             "cache-references": 100, "cache-misses": 20,
+                             "branches": 200, "branch-misses": 10})
+        self.assertEqual(d["ipc"], 2.0)
+        self.assertEqual(d["cache_miss_rate_pct"], 20.0)
+        self.assertEqual(d["branch_miss_rate_pct"], 5.0)
+
+    def test_derive_tolerates_missing_counters(self):
+        self.assertNotIn("ipc", counters.derive({"instructions": 100}))
+
+    def test_low_ipc_with_cache_misses_names_the_cause(self):
+        notes = counters.interpret(
+            {"ipc": 0.4, "cache_misses_per_kilo_instruction": 50.0})
+        self.assertTrue(any("cache misses" in n for n in notes), notes)
+
+    def test_high_ipc_points_at_clock_not_memory(self):
+        notes = counters.interpret({"ipc": 2.5})
+        self.assertTrue(any("clock speed or a power limit" in n
+                            for n in notes), notes)
+
+    def test_major_faults_are_reported_as_dominant(self):
+        notes = counters.interpret({}, {"major_faults": 5000})
+        self.assertTrue(any("major page faults" in n for n in notes))
+
+
+# --------------------------------------------------------------------------- #
+class TestStandards(unittest.TestCase):
+    def test_linpack_size_is_blocked_and_bounded(self):
+        n = standards.linpack_size(16 * 1024 ** 3)
+        self.assertEqual(n % 64, 0)
+        self.assertGreaterEqual(n, 256)
+
+    def test_linpack_size_shrinks_on_small_machines(self):
+        self.assertLess(standards.linpack_size(512 * 1024 ** 2),
+                        standards.linpack_size(64 * 1024 ** 3))
+
+    def test_from_native_handles_a_missing_engine(self):
+        result = standards.from_native(None)
+        self.assertTrue(result["stream"]["skipped"])
+        self.assertTrue(result["coremark_style"]["skipped"])
+
+    def test_from_native_extracts_stream(self):
+        result = standards.from_native({
+            "stream": {"copy": 1.0, "scale": 2.0, "add": 3.0, "triad": 4.0,
+                       "array_bytes": 64_000_000, "validated": True},
+            "coremark_style": {"rate": 1234.0}})
+        self.assertEqual(result["stream"]["triad"], 4.0)
+        self.assertIn("cache", result["stream"]["cache_rule"])
+
+    def test_failed_stream_validation_is_surfaced(self):
+        result = standards.from_native({
+            "stream": {"triad": 4.0, "array_bytes": 1, "validated": False}})
+        self.assertTrue(result["stream"]["validation_failed"])
+
+    def test_coremark_is_never_called_certified(self):
+        # Publishing an approximation under a standard's name destroys the
+        # comparability that made the standard worth implementing.
+        caveat = standards.coremark_caveat()
+        self.assertIn("not the certified benchmark", caveat)
+        result = standards.from_native({"coremark_style": {"rate": 1.0}})
+        self.assertIn("caveat", result["coremark_style"])
+
+    def test_extract_rates_skips_unvalidated_linpack(self):
+        rates = standards.extract_rates(
+            {"linpack": {"rate": 100.0, "validated": False}})
+        self.assertNotIn("linpack", rates)
+
+    @unittest.skipUnless(standards.available()["linpack"], "needs NumPy")
+    def test_linpack_solves_correctly(self):
+        result = standards.linpack(1 * 1024 ** 3)
+        if result.get("skipped"):
+            self.skipTest(result["reason"])
+        self.assertTrue(result["validated"])
+        self.assertLess(result["residual"], standards.RESIDUAL_TOLERANCE)
+        self.assertGreater(result["rate"], 0)
+
+
+# --------------------------------------------------------------------------- #
+class TestNuma(unittest.TestCase):
+    def test_cpulist_parsing(self):
+        self.assertEqual(numa.parse_cpulist("0-3,8,12-13"),
+                         [0, 1, 2, 3, 8, 12, 13])
+        self.assertEqual(numa.parse_cpulist(""), [])
+        self.assertEqual(numa.parse_cpulist("garbage"), [])
+
+    def test_topology_never_raises(self):
+        self.assertIsInstance(numa.topology(), dict)
+
+    def test_single_node_skips_the_matrix(self):
+        result = numa.bandwidth_matrix({"numa": False})
+        self.assertTrue(result["skipped"])
+        self.assertIn("single NUMA node", result["reason"])
+
+    def test_penalty_computed_from_matrix(self):
+        penalty = numa._penalty({"0": {"0": 100.0, "1": 50.0},
+                                 "1": {"0": 50.0, "1": 100.0}})
+        self.assertEqual(penalty["local_mean_mb_s"], 100.0)
+        self.assertEqual(penalty["remote_mean_mb_s"], 50.0)
+        self.assertEqual(penalty["remote_penalty_pct"], 50.0)
+
+    def test_large_penalty_recommends_pinning(self):
+        notes = numa.notes({
+            "topology": {"numa": True, "nodes": 2},
+            "bandwidth": {"remote_penalty_pct": 40.0,
+                          "local_mean_mb_s": 100.0,
+                          "remote_mean_mb_s": 60.0}})
+        self.assertTrue(any("numactl" in n for n in notes), notes)
+
+    def test_small_penalty_says_not_worth_tuning(self):
+        notes = numa.notes({
+            "topology": {"numa": True, "nodes": 2},
+            "bandwidth": {"remote_penalty_pct": 3.0,
+                          "local_mean_mb_s": 100.0,
+                          "remote_mean_mb_s": 97.0}})
+        self.assertTrue(any("not worth tuning" in n for n in notes), notes)
+
+    def test_probe_returns_a_positive_rate(self):
+        self.assertGreater(numa._probe(buf_mb=4, seconds=0.1), 0)
+
+
+# --------------------------------------------------------------------------- #
+class TestIobench(unittest.TestCase):
+    def test_job_spec_parsing(self):
+        job = iobench.parse_job("oltp:bs=8k,pattern=randread,qd=32,rw=70")
+        self.assertEqual(job.name, "oltp")
+        self.assertEqual(job.block_size, 8192)
+        self.assertEqual(job.queue_depth, 32)
+        self.assertEqual(job.read_pct, 70)
+
+    def test_size_suffixes(self):
+        self.assertEqual(iobench._parse_size("4k"), 4096)
+        self.assertEqual(iobench._parse_size("1m"), 1048576)
+        self.assertEqual(iobench._parse_size("2g"), 2 * 1024 ** 3)
+
+    def test_unknown_option_is_rejected_with_valid_names(self):
+        with self.assertRaises(ValueError) as ctx:
+            iobench.parse_job("x:bogus=1")
+        self.assertIn("bs, pattern, qd", str(ctx.exception))
+
+    def test_unknown_pattern_is_rejected(self):
+        with self.assertRaises(ValueError):
+            iobench.parse_job("x:pattern=sideways")
+
+    def test_read_pct_is_bounded(self):
+        with self.assertRaises(ValueError):
+            iobench.JobSpec("x", read_pct=150)
+
+    def test_default_suite_covers_the_four_profiles(self):
+        names = {j.name for j in iobench.default_suite()}
+        self.assertEqual(names,
+                         {"database", "sequential", "log_write", "vm_mixed"})
+
+    def test_job_runs_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as d:
+            job = iobench.JobSpec("t", block_size=4096, pattern="randread",
+                                  queue_depth=2, seconds=0.3, file_mb=8)
+            result = iobench.run_job(job, d)
+            if result.get("skipped"):
+                self.skipTest(result["reason"])
+            self.assertGreater(result["iops"], 0)
+            self.assertIn("latency_us", result)
+            self.assertEqual(os.listdir(d), [],
+                             "the I/O test file must be removed")
+
+    def test_percentiles_are_ordered(self):
+        values = [float(i) for i in range(1000)]
+        self.assertLessEqual(iobench._pct(values, 50), iobench._pct(values, 99))
+
+
+# --------------------------------------------------------------------------- #
+class TestDataScience(unittest.TestCase):
+    def test_model_sizing_fits_the_budget(self):
+        spec = datascience.choose_model(1 * 1024 ** 3, dtype_size=4)
+        self.assertLessEqual(spec.bytes(4), 1 * 1024 ** 3 * 0.06 + 1)
+
+    def test_small_machines_get_small_models(self):
+        small = datascience.choose_model(256 * 1024 ** 2)
+        large = datascience.choose_model(128 * 1024 ** 3)
+        self.assertLessEqual(small.params, large.params)
+
+    def test_parameter_count_matches_the_formula(self):
+        spec = datascience.ModelSpec(d_model=128, n_layers=2, n_heads=4,
+                                     vocab=100)
+        self.assertEqual(spec.params, 2 * 12 * 128 * 128 + 100 * 128)
+
+    def test_accelerator_memory_reports_model_sizes(self):
+        result = datascience.accelerator_memory(16 * 1024 ** 3)
+        if result.get("skipped"):
+            self.skipTest(result["reason"])
+        fits = result["largest_model_billions"]
+        # Halving the bytes per parameter must roughly double what fits.
+        self.assertGreater(fits["int4"], fits["int8"])
+        self.assertGreater(fits["int8"], fits["fp16"])
+
+    def test_extract_rates_ignores_skipped_sections(self):
+        rates = datascience.extract_rates(
+            {"llm": {"decode_tokens_per_s": 100.0},
+             "dataloader": {"skipped": True}})
+        self.assertEqual(rates, {"llm_decode": 100.0})
+
+    def test_render_tolerates_partial_results(self):
+        # A section that never ran is {} — neither skipped nor populated.
+        self.assertIsInstance(datascience.render({"llm": {}}), str)
+
+    def test_dataloader_produces_a_rate(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("needs NumPy")
+        result = datascience.dataloader(seconds=0.3, batch_size=4)
+        if result.get("skipped"):
+            self.skipTest(result["reason"])
+        self.assertGreater(result["rate"], 0)
+        self.assertEqual(result["unit"], "samples/s")
+
+    def test_numpy_transformer_produces_finite_output(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("needs NumPy")
+        spec = datascience.ModelSpec(64, 2, 4, vocab=100)
+        layers = datascience._np_weights(spec, np)
+        x = np.zeros((4, 64), dtype=np.float32)
+        out = datascience._np_forward(x, layers, spec, np)
+        self.assertEqual(out.shape, (4, 64))
+        self.assertTrue(np.isfinite(out).all())
+
+
+# --------------------------------------------------------------------------- #
+class TestTwoNodeNetwork(unittest.TestCase):
+    def test_client_reports_a_clear_error_without_a_server(self):
+        result = network.measure_latency("127.0.0.1", port=1, probes=10)
+        self.assertIn("error", result)
+        self.assertIn("net-server", result.get("hint", ""))
+
+    def test_round_trip_over_loopback(self):
+        import threading as _threading
+        port = 51987
+        server = _threading.Thread(
+            target=network.serve,
+            kwargs={"port": port, "bind": "127.0.0.1", "seconds": 8,
+                    "quiet": True},
+            daemon=True)
+        server.start()
+        time.sleep(0.4)          # let the listener bind before connecting
+
+        latency = network.measure_latency("127.0.0.1", port, probes=40)
+        if latency.get("error"):
+            self.skipTest(latency["error"])
+        self.assertGreater(latency["probes"], 0)
+        self.assertGreaterEqual(latency["jitter_ms"], 0.0)
+
+        throughput = network.measure_throughput("127.0.0.1", port,
+                                                seconds=0.5, streams=2)
+        if throughput.get("error"):
+            self.skipTest(throughput["error"])
+        self.assertGreater(throughput["megabytes_per_s"], 0)
+
+
+# --------------------------------------------------------------------------- #
+class TestEnergy(unittest.TestCase):
+    def test_energy_to_solution_returns_units_per_joule(self):
+        result = power.energy_to_solution(lambda: 1000, "Apple M4", "test")
+        self.assertIn("joules", result)
+        if result["joules"]:
+            self.assertIn("units_per_joule", result)
+
+    def test_tdp_derived_energy_is_labelled_as_an_estimate(self):
+        # Integrating TDP estimates and calling the total "measured" would be
+        # exactly the false precision the module exists to avoid.
+        result = power.energy_to_solution(lambda: 10, "core i7", "test")
+        if result.get("joules") and result.get("method", "").startswith("a ~"):
+            self.assertTrue(result["estimated"])
+
+    def test_race_to_idle_is_described_correctly(self):
+        text = power.compare_efficiency({"joules": 100.0, "seconds": 10.0},
+                                        {"joules": 80.0, "seconds": 20.0})
+        self.assertIn("sooner", text)
+        self.assertIn("less energy", text)
+
+    def test_same_winner_on_both_axes(self):
+        text = power.compare_efficiency({"joules": 50.0, "seconds": 5.0},
+                                        {"joules": 80.0, "seconds": 20.0})
+        self.assertIn("both", text)
+
+
+# --------------------------------------------------------------------------- #
+class TestExtendedCliSurface(unittest.TestCase):
+    def test_new_flags_parse(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([
+            "--counters", "--numa", "--numa-bandwidth", "--datascience",
+            "--io", "--io-job", "x:bs=4k", "--energy", "--no-standards",
+            "--no-linpack", "--no-provenance", "--net-port", "9999"])
+        self.assertTrue(args.counters)
+        self.assertTrue(args.numa_bandwidth)
+        self.assertEqual(args.io_job, ["x:bs=4k"])
+        self.assertEqual(args.net_port, 9999)
+
+    def test_compare_runs_takes_two_paths(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["--compare-runs", "a.json", "b.json"])
+        self.assertEqual(args.compare_runs, ["a.json", "b.json"])
+
+    def test_compare_runs_reports_a_regression_and_exits_six(self):
+        import io as _io
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            def write(name, rate):
+                payload = {
+                    "system": {"hostname": "h", "cpu_model": "c"},
+                    "config": {"seconds": 3, "repeats": 8},
+                    "results": {"cpu_int": {
+                        "samples": [rate + (i % 3) for i in range(8)]}},
+                    "scores": {"composite": rate / 10},
+                }
+                path = os.path.join(d, name)
+                with open(path, "w") as f:
+                    json.dump(payload, f)
+                return path
+
+            a, b = write("a.json", 1000.0), write("b.json", 700.0)
+            buf = _io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["--compare-runs", a, b])
+            self.assertEqual(code, 6)
+            self.assertIn("REGRESSION", buf.getvalue())
+
+    def test_compare_runs_on_missing_file_exits_two(self):
+        import io as _io
+        import contextlib
+        with contextlib.redirect_stderr(_io.StringIO()):
+            self.assertEqual(
+                cli.main(["--compare-runs", "/nonexistent/a.json",
+                          "/nonexistent/b.json"]), 2)
+
+    def test_bad_io_job_is_rejected_before_benchmarking(self):
+        import io as _io
+        import contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code = cli.main(["--io-job", "x:pattern=sideways", "--no-save",
+                             "--only", "cpu_int", "--quick", "--force",
+                             "--no-native", "--no-accel", "--no-power",
+                             "--no-optional", "--no-plugins", "--no-network",
+                             "--no-standards", "--json-stdout"])
+        self.assertEqual(code, 2)
+
+
+# --------------------------------------------------------------------------- #
+class TestNewScoringCalibration(unittest.TestCase):
+    def test_every_new_source_has_a_baseline(self):
+        for score_key, _, _ in scoring._SOURCES:
+            self.assertIn(score_key, scoring.BASELINES)
+
+    def test_reference_machine_scores_exactly_one_hundred(self):
+        keys = ("stream_triad", "coremark_style", "linpack", "llm_prefill",
+                "llm_decode", "dataloader", "dataframe")
+        results = {k: {"rate": scoring.BASELINES[k]} for k in keys}
+        for key, value in scoring.compute_scores(results)["subscores"].items():
+            self.assertAlmostEqual(value, 100.0, places=1, msg=key)
+
+    def test_standards_and_datascience_categories_exist(self):
+        subscores = {"stream_triad": 100.0, "linpack": 100.0,
+                     "llm_decode": 100.0, "dataloader": 100.0}
+        cats = scoring.category_scores(subscores)
+        self.assertIn("standards", cats)
+        self.assertIn("datascience", cats)

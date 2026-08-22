@@ -476,6 +476,148 @@ order is `pcbench.toml`, `.pcbench.toml`, `pcbench.json`, `.pcbench.json`);
 TOML — use a `.json` config there. An unknown setting is a hard error listing
 every valid name, so a typo never silently does nothing.
 
+## PMU counters say "unavailable"
+
+`--counters` always collects resource counters (page faults, context switches,
+peak RSS) — those need no privileges and work everywhere. Hardware PMU counters
+are different, and the message states which case applies:
+
+- **macOS / Windows.** Not reachable. macOS exposes the PMU only through a
+  private framework needing root and an Apple entitlement; Windows needs a
+  kernel driver. There is no workaround, and the tool does not substitute a
+  weaker measurement and call it the same thing.
+- **`perf` is not installed.** `apt install linux-tools-common
+  linux-tools-$(uname -r)`, or `dnf install perf`.
+- **`kernel.perf_event_paranoid` is above 2.** `sudo sysctl -w
+  kernel.perf_event_paranoid=2` allows a process to measure itself.
+- **Inside a container or VM.** Containers commonly drop `CAP_PERFMON` and VMs
+  frequently expose no PMU at all. Neither shows up in `perf_event_paranoid`,
+  which is why availability is confirmed with a trial run rather than assumed.
+
+## STREAM numbers look impossibly high
+
+Almost certainly the array is not large enough. STREAM requires each of its
+three arrays to be roughly 4x the last-level cache; below that it measures
+cache bandwidth. The array size is printed with the result:
+
+```
+  67 MB per array; STREAM requires roughly 4x the last-level cache, so this is
+  valid for caches up to about 17 MB.
+```
+
+Server parts with 64 MB+ of L3 need `--stream-mb` raised well above the
+default. If the result also says `VALIDATION FAILED`, the compiler optimised
+the kernels away or the machine computed them incorrectly — the arrays are
+checked against the arithmetic they should have produced precisely to catch it.
+
+## LINPACK GFLOPS is lower than the vendor's figure
+
+Expected, and stated with the result. N is capped so the run finishes quickly
+and never approaches swap; HPL efficiency rises with N because the O(N³)
+arithmetic increasingly dominates O(N²) memory traffic, which is why TOP500
+submissions use matrices filling most of RAM. This figure is a consistent,
+validated point of comparison, not a peak-performance claim.
+
+If LINPACK is skipped entirely, NumPy is missing. A hand-written LU would
+report a fraction of the machine's real capability and mean nothing, so it is
+skipped rather than approximated.
+
+## "CoreMark-style" — why not just CoreMark?
+
+Because it is not CoreMark. It runs the same four kernels, which makes it
+useful for comparing cores under an identical compiler-resistant integer
+workload. Published CoreMark scores come from EEMBC's exact source under strict
+reporting rules, and a number produced here must not be quoted as one. Use it
+against other runs of this tool, not against published CoreMark figures.
+
+## "NO SIGNIFICANT DIFFERENCE" but the number clearly changed
+
+That is the finding. With a handful of repeats and normal run-to-run variance,
+differences under roughly 5% are usually indistinguishable from noise, and the
+verdict says how many repeats would resolve one that small:
+
+```
+  memory: NO SIGNIFICANT DIFFERENCE — the 0.8% gap is within run-to-run noise
+          (p=0.156). Resolving a difference this small would take about 11
+          repeats per side.
+```
+
+Re-run both sides with `--repeats 11` (or whatever it suggests). If the verdict
+is `INCONCLUSIVE` instead, there were fewer than three repeats per side and no
+statistical claim is made at all — that is deliberately distinct from "no
+difference", because treating too-little-data as evidence of no effect is the
+most common way performance comparisons mislead.
+
+## A/B comparison warns about comparability
+
+`--compare-runs` warns rather than refuses when the two runs differ in machine,
+CPU, `--seconds`, `--repeats`, or resource confinement. Comparing across
+machines is sometimes exactly the intent; the warning exists so the difference
+is not read as a change comparison when it is a hardware comparison.
+
+## LLM decode tokens/s seems low relative to prefill
+
+That is the physics, and separating the two is why they are reported
+separately. Generating one token requires reading *every* model weight, so
+decode is bound by memory bandwidth, while prefill is a large matrix multiply
+and is bound by compute. A ratio of 10-20x between them is normal.
+
+Cross-check the decode figure against the STREAM Triad result: decode's
+"achieved GB/s" should sit close to it. If it does, decode is at the memory
+wall and no amount of extra compute will help — only faster memory or a smaller
+(quantised) model will.
+
+## The data-science tier is skipped or CPU-only
+
+`--datascience` runs on NumPy alone, so a missing accelerated row means PyTorch
+is not installed (`pip install torch`, or `python3 install.py`). A missing
+dataframe section means none of pandas, polars, or duckdb is installed — the
+`data` tier in `install.py` covers all three.
+
+The transformer uses random weights and is never downloaded; if the model looks
+small, it was sized to a fraction of available memory deliberately, so the
+measurement is stable rather than impressive. Both backends run the same model
+so their tokens/s are directly comparable.
+
+## NUMA bandwidth matrix is skipped
+
+Either the machine has one node (nothing remote to measure — the common case
+and not an error), or `numactl` is not installed. It is required because the
+kernel allocates memory locally by default, so without explicit placement the
+remote cases would silently be measured as local and the matrix would come out
+uniform and wrong.
+
+## I/O job throughput looks too high
+
+Check `cache_bypassed` in the JSON. If the OS cache could not be bypassed, the
+figures include page-cache hits and a `caution` line says so. A sequential read
+in the multi-GB/s range from a device that cannot sustain it is the signature.
+
+For very high queue depths on very fast NVMe, expect figures below what `fio`
+reports: Python has no portable asynchronous submission, so depth is reached
+with blocking calls on threads, which costs more CPU per request. The note is
+printed with every I/O run.
+
+## Two-node network test cannot connect
+
+The peer must be running `pcbench --net-server` and the port (default 51900)
+must be open through any firewall between the machines. `--net-server` binds
+all interfaces and says so — it is a real change in the machine's exposure and
+should be stopped when finished.
+
+Where `iperf3` is available on both ends it remains the better tool. This exists
+for the very common case where nothing can be installed on either machine.
+
+## Energy is reported as an estimate
+
+No power meter was readable, so a TDP figure for the chip class was held over
+the elapsed time. That is labelled rather than presented as a measurement:
+
+- **Linux** reads RAPL (`/sys/class/powercap`) and gives exact joules from a
+  cumulative counter — no sampling error at all.
+- **macOS** needs `sudo` for `powermetrics`; without it only the TDP estimate
+  is available.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

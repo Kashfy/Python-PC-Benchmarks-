@@ -462,6 +462,270 @@ Absolute floors are checked separately, where a figure is implausible rather
 than merely slow — sequential reads under 80 MB/s, random reads under 200 IOPS,
 memory bandwidth under 800 MB/s — each with what it usually means.
 
+## Reference workloads — numbers that mean something elsewhere
+
+Every other benchmark here is internally consistent and externally meaningless:
+nobody has published a figure for `raytrace`, so a result can only be compared
+against another run of this tool. These three are the industry's own, so a
+number is comparable to what vendors and papers publish.
+
+| Workload | Unit | What it is |
+|---|---|---|
+| **STREAM** (Copy/Scale/Add/**Triad**) | MB/s | McCalpin's memory-bandwidth standard. Triad is the quoted figure |
+| **LINPACK / HPL** | GFLOPS | Dense `Ax=b` by LU with partial pivoting — the metric that ranks the TOP500 |
+| **CoreMark-style** | iterations/s | The embedded integer kernel mix: list, matrix, state machine, CRC |
+
+STREAM and CoreMark-style live in the native C engine, which is where they
+belong — both reference implementations are C, and a Python version would
+measure the interpreter. They cost nothing extra when the engine runs.
+
+Three honesty rules, because the value of a standard *is* its comparability and
+publishing an approximation under its name destroys exactly that:
+
+- **STREAM validates its arrays** and reports the array size. A compiler that
+  vectorises the loop away produces a spectacular meaningless number, and the
+  4x-last-level-cache rule is checkable only if the size is stated.
+- **LINPACK reports its residual** against HPL's own tolerance. A solve that
+  did not actually solve the system is not a fast solve.
+- **CoreMark-style is never called a CoreMark score.** Published CoreMark
+  figures come from EEMBC's exact source under fixed reporting rules. This is
+  the same kernel mix, useful for comparing cores to each other, and it says so
+  every time it is printed.
+
+```
+  STREAM Triad        :     96,007.0 MB/s   <- the quoted figure
+      67 MB per array; STREAM requires roughly 4x the last-level cache
+  LINPACK (HPL)       :       145.48 GFLOPS   (N=8192, 512.0 MB)
+      residual 0.002 (tolerance 16.0) — passed
+  CoreMark-style      :     53,707.1 iterations/s
+```
+
+## System configuration — the 5–30% nobody records
+
+Two machines with identical hardware routinely benchmark far apart, and the
+reason is almost never the hardware. Every run now captures the settings that
+silently move the numbers:
+
+- **Speculative-execution mitigations** (Spectre, Meltdown, MDS, Retbleed).
+  These cost 5% on ordinary work and 30%+ on syscall-heavy work. A box with
+  `mitigations=off` looks like faster hardware and is not — and that is now
+  stated rather than left to be discovered.
+- **CPU governor** — `powersave` versus `performance` is frequently the whole
+  explanation for a laptop scoring badly, and it is a settings fix.
+- **Transparent hugepages, swappiness, SMT state, microcode revision, turbo.**
+
+The SMT report distinguishes *not implemented by this CPU* from *implemented
+and switched off*. Conflating them sends people hunting for a BIOS setting that
+does not exist on their chip.
+
+## Performance counters — why, not just how fast
+
+Every other measurement says *how fast*. Counters say *what limited it*, and
+the three common causes have completely different fingerprints:
+
+| Symptom | Cause |
+|---|---|
+| Low score, **high IPC** | Cores executing efficiently, just not enough cycles — a clock or power limit |
+| **Low IPC**, high cache miss rate | The working set does not fit. More cores will not help; memory is the wall |
+| **Low IPC**, high branch miss rate | Unpredictable control flow — a code-shape problem |
+
+```bash
+pcbench --counters
+```
+
+Two tiers, because privilege differs enormously. **Resource counters** (page
+faults, context switches, peak RSS) come from `getrusage`, cost nothing, need
+no privileges, and run everywhere — they already catch the two findings that
+invalidate everything else in a report:
+
+```
+  Involuntary switches      : 11,132
+      i 11,132 involuntary context switches — the scheduler preempted this
+        work repeatedly, which means other processes were competing for CPU.
+        The result understates the hardware.
+```
+
+**PMU counters** (cycles, instructions, cache and branch misses) are real
+hardware registers needing kernel cooperation, so they come from `perf` on
+Linux. On macOS the equivalent is a private framework requiring root and an
+Apple entitlement; on Windows most counters need a driver. On those platforms
+the tool says so plainly, with the specific fix where one exists, rather than
+substituting something weaker and calling it the same thing.
+
+## Statistical rigor — "is this 3% real?"
+
+A median and a coefficient of variation describe one run. They cannot answer
+the question people actually ask after changing something, and getting it wrong
+is how teams ship changes that did nothing and chase regressions that never
+happened.
+
+```bash
+pcbench --compare-runs before.json after.json
+```
+
+```
+  METRIC                   BASELINE    CANDIDATE    CHANGE  VERDICT
+  --------------------------------------------------------------------------
+  cpu_int               1,974,169.1  2,402,776.8    +21.7% * SIGNIFICANT
+  disk                      2,500.0      2,500.0     +0.0% = INCONCLUSIVE
+  memory                    5,961.6      6,011.9     +0.8%   NO SIGNIFICANT DIFFERENCE
+
+    memory: NO SIGNIFICANT DIFFERENCE — the 0.8% gap is within run-to-run
+            noise (p=0.156). Resolving a difference this small would take
+            about 11 repeats per side.
+```
+
+Three design choices worth knowing:
+
+- **Mann-Whitney U, not a t-test.** Benchmark samples are not normal — they are
+  bounded below by the hardware's best case with a long upper tail of
+  interference. The reported median is a rank statistic anyway, so testing
+  ranks keeps the headline figure and the test consistent.
+- **"Inconclusive" is a distinct verdict.** Collapsing *not enough data* into
+  *no difference* is how underpowered comparisons get mistaken for evidence of
+  no effect. Below three repeats per side, no claim is made — and the tool says
+  how many repeats would be needed.
+- **Effect size alongside p.** With enough repeats a 0.3% difference becomes
+  statistically significant while remaining completely irrelevant; that is
+  reported as `SIGNIFICANT BUT NEGLIGIBLE`.
+
+Exits `6` on a significant regression, so CI can gate on evidence rather than
+on a raw percentage that may be noise. Confidence intervals are available on
+every metric.
+
+## Data science & ML
+
+The old ML tier measured MLP training steps. That was the right thing to
+measure in 2015. `--datascience` measures the four numbers that actually decide
+whether a machine is usable now:
+
+```bash
+pcbench --datascience
+```
+
+```
+  LLM model           : 8 layers, d_model=1024, 16 heads, 133M parameters
+    Accelerated (mps, float16, 254 MB of weights)
+      prefill :      6,625 tok/s   (1.77 TFLOPS, compute-bound)
+      decode  :        351 tok/s   (94 GB/s achieved, bandwidth-bound)
+    CPU (cpu, float32, 509 MB of weights)
+      prefill :      2,068 tok/s   (0.55 TFLOPS, compute-bound)
+      decode  :        158 tok/s   (84 GB/s achieved, bandwidth-bound)
+  Accelerator memory  : 11.8 GB (mps, unified)
+      largest model that fits: 5.1B at fp16, 10.2B at int8, 20.3B at int4
+  Input pipeline      : 2,422 samples/s per worker, ~24,223 across 10 cores
+  Dataframes (2,000,000 rows — filter/groupby/join/sort)
+      polars  : 0.034 0.017 0.014 0.035   total 0.099s
+      pandas  : 0.009 0.015 0.022 0.178   total 0.225s
+      duckdb  : 0.006 0.006 0.006 0.211   total 0.229s
+```
+
+- **Prefill and decode are reported separately** because they are bound by
+  different hardware. Generating one token requires reading *every* model
+  weight, so decode is memory-bandwidth-bound — a GPU with huge FLOPS and
+  modest bandwidth generates text slowly. Prefill is a big GEMM and is
+  compute-bound. A single "inference" number hides the thing being asked about.
+  (Sanity check on the machine above: decode achieved 94 GB/s against a STREAM
+  Triad of 96 GB/s — decode really is sitting at the memory wall.)
+- **Input-pipeline throughput** is measured because most training runs are
+  limited by the CPU decoding and augmenting samples, not by the accelerator.
+  A fast GPU behind a slow pipeline trains at the speed of the pipeline, and
+  almost nobody measures it.
+- **Everything runs on NumPy**, which is a far lower bar than PyTorch. Torch is
+  used when present because it is the only way to reach a GPU. The transformer
+  uses random weights rather than a downloaded checkpoint: throughput depends
+  on the shape of the computation, not the values, and requiring a
+  multi-gigabyte download would exclude exactly the constrained machines that
+  most need measuring. Both backends run the **same** model so the figures are
+  directly comparable.
+
+## NUMA
+
+On multi-socket servers and several chiplet designs, memory is not uniformly
+fast, and run-to-run variance is frequently *not* noise — it is the allocator
+landing on a different node.
+
+```bash
+pcbench --numa --numa-bandwidth
+```
+
+```
+  Bandwidth MB/s (rows = CPU node, columns = memory node)
+              node 0      node 1
+  cpu 0       42,000      24,000
+  cpu 1       23,500      41,800
+  Remote penalty            : 43.3%
+      i remote memory is 43% slower than local — pin latency-sensitive
+        services with 'numactl --cpunodebind=N --membind=N'
+```
+
+Topology comes from sysfs and is free. The measured matrix needs `numactl`,
+because the kernel allocates locally by default and the remote case would
+otherwise never occur.
+
+## Configurable storage I/O
+
+The built-in disk test measures one fixed pattern — the right default and the
+wrong tool for evaluating storage, since a device excellent at one pattern is
+routinely poor at another.
+
+```bash
+pcbench --io                                          # the default four-job suite
+pcbench --io-job 'oltp:bs=8k,pattern=randread,qd=32'  # your own
+```
+
+```
+  JOB          PATTERN                            IOPS      MB/s   p50 us    p99 us
+  database     randread bs=8K qd=16             49,548     387.1      170     1,803
+  sequential   read bs=1M qd=1                   1,170   1,169.9      774     1,916
+  log_write    write bs=64K qd=4                90,625   5,664.1       20       348
+  vm_mixed     randrw bs=16K qd=8, 70/30 r/     42,286     660.7       71     1,491
+```
+
+Jobs are described the way `fio` describes them: block size, pattern, read/write
+mix, queue depth, duration, cache bypass. **The queue-depth caveat is stated in
+the output**: Python has no portable async submission, so depth is reached with
+blocking calls on threads. That reaches real queue depths but carries more CPU
+overhead than `fio`, so very high depths on very fast NVMe read low.
+
+## Two-node network
+
+Loopback characterises the OS stack and says nothing about the NIC, the cable,
+or the path. That needs a second machine, so both halves are included:
+
+```bash
+pcbench --net-server              # on machine A (opens a listening port)
+pcbench --net-client 10.0.0.5     # on machine B
+```
+
+Reports RTT percentiles, **jitter** (RFC 3550 definition), and throughput on one
+stream versus several. The gap between them is the diagnosis: if four streams
+greatly exceed one, the single-stream figure is limited by the TCP window and
+latency rather than by the link's capacity. Where `iperf3` is installed it
+remains the better tool and this says so; this exists for the very common case
+where nothing can be installed on either end.
+
+## Energy to solution
+
+Watts is a rate and answers "how hot will this get?". It does not answer what
+decides a datacenter bill or a battery's life:
+
+```bash
+pcbench --energy
+```
+
+Measures **joules for a fixed amount of work**, which is the only formulation
+that compares machines of different speeds honestly. A chip drawing twice the
+power that finishes in a third of the time uses less total energy — the
+race-to-idle effect that governs battery life, and the thing a watts-only
+comparison gets backwards.
+
+Linux RAPL exposes a cumulative energy counter, so two readings give exact
+joules with no sampling error. macOS exposes only instantaneous power, so the
+figure is an integral of samples. A TDP estimate is a last resort and is
+labelled as one — integrating estimates and calling the result "measured" is
+exactly the false precision worth avoiding.
+
 ## Options
 
 | Flag | Default | Meaning |
@@ -497,6 +761,50 @@ memory bandwidth under 800 MB/s — each with what it usually means.
 | `--force` | off | Run despite distorting machine state |
 | `--no-autoscale` | off | Do not shrink test sizes on small or CPU-limited machines |
 | `--list-tests` | — | List every test and profile, then exit |
+
+**Analysis depth**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--counters` | off | Hardware performance counters (IPC, cache/branch misses); needs `perf` on Linux |
+| `--no-provenance` | off | Skip capture of governor, mitigations, hugepages, microcode |
+| `--no-standards` | off | Skip STREAM, LINPACK, and the CoreMark-style suite |
+| `--no-linpack` | off | Skip LINPACK only (needs NumPy and a few seconds) |
+| `--numa` | off | Report NUMA topology |
+| `--numa-bandwidth` | off | Also measure the local/remote bandwidth matrix (needs `numactl`) |
+| `--energy` | off | Measure energy-to-solution in joules |
+
+**Data science / ML**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--datascience` | off | LLM prefill/decode, input pipeline, batch scaling, dataframes |
+| `--ds-prefill-tokens N` | `256` | Prompt length for the prefill measurement |
+| `--ds-decode-tokens N` | `32` | Tokens generated for the decode measurement |
+| `--no-dataframes` | off | Skip the dataframe benchmarks |
+
+**Configurable I/O**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--io` | off | Run the four-job storage suite |
+| `--io-job SPEC` | — | Custom job, e.g. `oltp:bs=8k,pattern=randread,qd=32`. Repeatable |
+
+**Two-node network**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--net-server` | off | Run the receiving half (opens a listening port) |
+| `--net-client HOST` | — | Measure throughput, latency, jitter against a peer |
+| `--net-port N` | `51900` | Port for the two-node test |
+| `--net-streams N` | `4` | Parallel streams for the throughput test |
+
+**A/B comparison**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--compare-runs A.json B.json` | — | Statistically compare two saved runs and exit |
+| `--alpha P` | `0.05` | Significance threshold |
 
 **Storage devices**
 
@@ -568,6 +876,13 @@ Run `pcbench --list-tests` for the full catalogue. Synthetic tests: `cpu_int`,
 | Image blur | MP/s | Strided 2-D access — separates a large L2 from a small one |
 | Log parsing | MB/s | Linear byte scan through a backtracking regex |
 | Video encode | fps | Software H.264 — sustained all-core vector load (needs ffmpeg) |
+| STREAM Triad | MB/s | The memory-bandwidth standard, comparable to published figures |
+| LINPACK (HPL) | GFLOPS | Dense LU with partial pivoting — the TOP500 metric |
+| CoreMark-style | iter/s | Embedded integer kernel mix (not a certified CoreMark score) |
+| LLM prefill | tokens/s | Prompt processing — compute-bound GEMM |
+| LLM decode | tokens/s | Token generation — memory-bandwidth-bound weight streaming |
+| Input pipeline | samples/s | Decode/crop/flip/normalise — the usual training bottleneck |
+| Dataframes | queries/s | filter, group-by, join, sort across pandas/polars/duckdb |
 
 ### Machine-learning workloads, with no framework required
 
@@ -761,7 +1076,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-324 tests, standard library only (they run with or without the optional tiers).
+406 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 
@@ -781,4 +1096,9 @@ Full reference docs in [`docs/`](docs/README.md):
 - **Python 3.8+** (standard library only; `psutil` optional for richer detection)
 - A C compiler is **optional** — only for the native engine
 - `ffmpeg` on `PATH` is **optional** — only for the `video` encode benchmark
+- `perf` (Linux) is **optional** — only for `--counters`; PMU counters are not
+  reachable on macOS or Windows without privileged drivers
+- `numactl` (Linux) is **optional** — only for the NUMA bandwidth matrix
+- NumPy is **optional** — enables LINPACK and the CPU LLM backend
+- PyTorch is **optional** — the only way to reach a GPU for `--datascience`
 - TOML config files need Python 3.11+; JSON config works on every version

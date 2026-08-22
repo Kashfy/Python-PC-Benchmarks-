@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pcbench"
-version = "10.0"
+version = "11.0"
 description = "Cross-platform PC benchmark and diagnostics tool"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "Kashfy" }]
 keywords = ["benchmark", "diagnostics", "hardware", "performance", "cpu",
-            "memory", "disk", "thermal"]
+            "memory", "disk", "thermal", "stream", "linpack", "numa",
+            "llm", "perf-counters", "fio"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -35,6 +36,8 @@ gpu = ["pyopencl>=2023.1", "nvidia-ml-py>=12.0"]
 crypto = ["cryptography>=41.0", "zstandard>=0.21", "lz4>=4.0", "blake3>=0.4"]
 system = ["psutil>=5.9", "py-cpuinfo>=9.0", "rich>=13.0",
           "matplotlib>=3.7", "scikit-learn>=1.3"]
+# Dataframe engines for the analytics benchmarks.
+data = ["numpy>=1.24", "polars>=0.20", "pandas>=2.0", "duckdb>=0.10"]
 # Large and hardware-specific; install deliberately.
 ml = ["torch>=2.0", "onnxruntime>=1.16"]
 all = [
@@ -43,6 +46,7 @@ all = [
     "cryptography>=41.0", "zstandard>=0.21", "lz4>=4.0", "blake3>=0.4",
     "psutil>=5.9", "py-cpuinfo>=9.0", "rich>=13.0",
     "matplotlib>=3.7", "scikit-learn>=1.3",
+    "polars>=0.20", "pandas>=2.0", "duckdb>=0.10",
 ]
 # Backwards-compatible alias for the previous single extra.
 extras = ["psutil>=5.9"]

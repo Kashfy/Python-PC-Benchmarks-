@@ -304,6 +304,49 @@ Config files are found by walking up from the working directory
 Python 3.11+; JSON works everywhere. Precedence is command line > `PCBENCH_*`
 environment > config file > defaults.
 
+### Analysis depth
+
+| Flag | Description |
+|------|-------------|
+| `--counters` | PMU counters (IPC, cache/branch misses) plus rusage; needs `perf` on Linux |
+| `--no-provenance` | Skip governor/mitigations/hugepages/microcode capture |
+| `--no-standards` | Skip STREAM, LINPACK, CoreMark-style |
+| `--no-linpack` | Skip LINPACK only |
+| `--numa` / `--numa-bandwidth` | NUMA topology; the matrix needs `numactl` |
+| `--energy` | Joules for a fixed workload |
+
+### Data science / ML
+
+| Flag | Description |
+|------|-------------|
+| `--datascience` | LLM prefill/decode, input pipeline, batch scaling, dataframes |
+| `--ds-prefill-tokens N` / `--ds-decode-tokens N` | LLM measurement lengths |
+| `--no-dataframes` | Skip the dataframe benchmarks |
+
+### Configurable I/O
+
+| Flag | Description |
+|------|-------------|
+| `--io` | Four-job suite: database, sequential, log write, mixed VM |
+| `--io-job SPEC` | `name:bs=8k,pattern=randread,qd=32,rw=70,time=5,size=1g,direct=1` |
+
+Patterns: `read`, `write`, `randread`, `randwrite`, `randrw`.
+
+### Two-node network
+
+| Flag | Description |
+|------|-------------|
+| `--net-server` | Receiving half; opens a listening port until stopped |
+| `--net-client HOST` | Measuring half: RTT, jitter, single and parallel throughput |
+| `--net-port N` / `--net-streams N` | Port and stream count |
+
+### A/B comparison
+
+| Flag | Description |
+|------|-------------|
+| `--compare-runs A.json B.json` | Mann-Whitney U per metric; exits 6 on a significant regression |
+| `--alpha P` | Significance threshold (default 0.05) |
+
 ### Other
 
 | Flag | Description |
@@ -325,7 +368,7 @@ The native engine separately accepts `--json`, `--seconds`, `--repeats`,
 | `3` | Refused — machine state would distort results |
 | `4` | Validation failure — hardware may be unstable |
 | `5` | Output directory not writable (often root-owned after a `sudo` run) |
-| `6` | A `--fail-under` / `--assert` threshold was not met |
+| `6` | A `--fail-under` / `--assert` threshold was not met, or `--compare-runs` found a significant regression |
 | `7` | Soak test produced wrong answers — hardware is unstable |
 
 Codes 3, 4, 6, and 7 are designed for scripting: a CI job or fleet sweep can
@@ -352,7 +395,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-324 cases, standard library only — no pytest, no test dependencies.
+406 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

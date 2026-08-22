@@ -68,6 +68,17 @@ BASELINES = {
     "image": 2.5,                  # megapixels/s through a separable blur
     "logparse": 80.0,              # MB/s of regex log parsing
     "video": 70.0,                 # H.264 1080p encode fps (needs ffmpeg)
+    # Industry reference workloads. Their value is that the raw figure is
+    # comparable outside this tool; the score exists so they also join the
+    # composite like everything else.
+    "stream_triad": 30_000.0,      # MB/s, STREAM's 1e6-byte convention
+    "coremark_style": 18_000.0,    # iterations/s
+    "linpack": 45.0,               # GFLOPS, HPL operation count
+    # Data-science tier.
+    "llm_prefill": 2_400.0,        # tokens/s, compute-bound phase
+    "llm_decode": 120.0,           # tokens/s, bandwidth-bound phase
+    "dataloader": 800.0,           # samples/s through the input pipeline
+    "dataframe": 11.0,             # four-query suite completions/s
 }
 
 # Deliberately *not* scored, though it is measured and reported:
@@ -120,6 +131,13 @@ _SOURCES = [
     ("image", "image", "rate"),
     ("logparse", "logparse", "rate"),
     ("video", "video", "rate"),
+    ("stream_triad", "stream_triad", "rate"),
+    ("coremark_style", "coremark_style", "rate"),
+    ("linpack", "linpack", "rate"),
+    ("llm_prefill", "llm_prefill", "rate"),
+    ("llm_decode", "llm_decode", "rate"),
+    ("dataloader", "dataloader", "rate"),
+    ("dataframe", "dataframe", "rate"),
 ]
 
 
@@ -156,12 +174,16 @@ def category_scores(subscores: dict) -> dict:
         "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
         "system": ["compile", "syscall"],
         "apps": ["sqlite", "raytrace", "image", "logparse", "video"],
+        "standards": ["stream_triad", "coremark_style", "linpack"],
+        "datascience": ["llm_prefill", "llm_decode", "dataloader",
+                        "dataframe"],
         "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
                 "gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"],
         "npu": ["npu", "npu_onnx"],
         "ml": ["nn_training", "kmeans", "knn"],
         "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu", "npu_onnx",
-               "ml_train", "ml_infer", "nn_training", "kmeans", "knn"],
+               "ml_train", "ml_infer", "nn_training", "kmeans", "knn",
+               "llm_prefill", "llm_decode"],
     }
     out = {}
     for name, keys in groups.items():

@@ -17,12 +17,19 @@ from . import config as config_mod
 from . import container as container_mod
 from . import cores as cores_mod
 from . import diagnose
+from . import counters as counters_mod
+from . import datascience as ds_mod
 from . import export as export_mod
 from . import gates as gates_mod
 from . import health
+from . import iobench
 from . import monitor as monitor_mod
+from . import numa as numa_mod
+from . import provenance
 from . import reference
 from . import soak as soak_mod
+from . import standards as standards_mod
+from . import stats as stats_mod
 from . import storage as storage_mod
 from . import plugins as plugins_mod
 from . import interference
@@ -256,6 +263,66 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--list-tests", action="store_true",
                    help="List every test and profile, then exit")
 
+    g = p.add_argument_group("analysis depth")
+    g.add_argument("--counters", action="store_true",
+                   help="Collect hardware performance counters (IPC, cache "
+                        "and branch misses) around the CPU tests; needs perf "
+                        "on Linux")
+    g.add_argument("--no-provenance", action="store_true",
+                   help="Skip capture of governor, mitigations, hugepages and "
+                        "microcode")
+    g.add_argument("--no-standards", action="store_true",
+                   help="Skip STREAM, LINPACK, and the CoreMark-style suite")
+    g.add_argument("--no-linpack", action="store_true",
+                   help="Skip LINPACK only (it needs NumPy and a few seconds)")
+    g.add_argument("--numa", action="store_true",
+                   help="Report NUMA topology")
+    g.add_argument("--numa-bandwidth", action="store_true",
+                   help="Also measure the local/remote bandwidth matrix "
+                        "(needs numactl; implies --numa)")
+    g.add_argument("--energy", action="store_true",
+                   help="Measure energy-to-solution in joules for a fixed "
+                        "workload")
+
+    g = p.add_argument_group("data science / ML")
+    g.add_argument("--datascience", action="store_true",
+                   help="LLM prefill/decode tokens per second, input-pipeline "
+                        "throughput, batch scaling, and dataframe operations")
+    g.add_argument("--ds-prefill-tokens", type=int, default=256,
+                   help="Prompt length for the LLM prefill measurement")
+    g.add_argument("--ds-decode-tokens", type=int, default=32,
+                   help="Tokens to generate for the LLM decode measurement")
+    g.add_argument("--no-dataframes", action="store_true",
+                   help="Skip the dataframe benchmarks")
+
+    g = p.add_argument_group("configurable I/O")
+    g.add_argument("--io", action="store_true",
+                   help="Run the storage job suite (database, sequential, log "
+                        "write, mixed VM)")
+    g.add_argument("--io-job", action="append", default=[], metavar="SPEC",
+                   help="Custom I/O job, e.g. "
+                        "'oltp:bs=8k,pattern=randread,qd=32'. Repeatable; "
+                        "replaces the default suite")
+
+    g = p.add_argument_group("two-node network")
+    g.add_argument("--net-server", action="store_true",
+                   help="Run the receiving half and wait for a peer (opens a "
+                        "listening port)")
+    g.add_argument("--net-client", default="", metavar="HOST",
+                   help="Measure throughput, latency, and jitter against a "
+                        "peer running --net-server")
+    g.add_argument("--net-port", type=int, default=network.DEFAULT_PORT,
+                   help="Port for the two-node network test")
+    g.add_argument("--net-streams", type=int, default=4,
+                   help="Parallel streams for the two-node throughput test")
+
+    g = p.add_argument_group("A/B comparison")
+    g.add_argument("--compare-runs", nargs=2, default=None,
+                   metavar=("BASELINE.json", "CANDIDATE.json"),
+                   help="Statistically compare two saved runs and exit")
+    g.add_argument("--alpha", type=float, default=0.05,
+                   help="Significance threshold for --compare-runs")
+
     g = p.add_argument_group("other")
     g.add_argument("--no-native", action="store_true",
                    help="Skip the optional native C engine")
@@ -474,6 +541,55 @@ def main(argv=None) -> int:
         print(render_table(load_history(path), all_runs=args.all_runs))
         return 0
 
+    # A/B: compare two saved runs statistically. Exits 6 on a regression so a
+    # CI job can gate on "this change made something slower" with evidence
+    # rather than on a raw percentage that may be noise.
+    if args.compare_runs:
+        try:
+            payloads = []
+            for path in args.compare_runs:
+                with open(path, encoding="utf-8") as f:
+                    payloads.append(json.load(f))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        verdict = stats_mod.compare_payloads(payloads[0], payloads[1],
+                                             alpha=args.alpha)
+        if args.json_stdout:
+            print(json.dumps(verdict, indent=2, default=str))
+        else:
+            report_mod.hr("A/B comparison")
+            print(f"  baseline : {args.compare_runs[0]}")
+            print(f"  candidate: {args.compare_runs[1]}\n")
+            print(stats_mod.render_payload_comparison(verdict))
+        return 6 if verdict["regressions"] else 0
+
+    # The receiving half of the two-node network test. Blocks until stopped,
+    # so it cannot be combined with a benchmark run.
+    if args.net_server:
+        report_mod.hr(f"Network server on port {args.net_port}")
+        result = network.serve(args.net_port)
+        if result.get("error"):
+            print(f"error: {result['error']}", file=sys.stderr)
+            return 2
+        print(f"\n  {result['sessions']} session(s), "
+              f"{result['bytes_received'] / (1024 ** 2):,.0f} MB received")
+        return 0
+
+    # The measuring half. A network measurement is the whole job, so it does
+    # not run alongside the benchmark suite.
+    if args.net_client:
+        report_mod.hr(f"Network peer test — {args.net_client}")
+        result = network.run_peer(args.net_client, args.net_port,
+                                  min(args.seconds * 2, 10.0),
+                                  args.net_streams)
+        if args.json_stdout:
+            print(json.dumps(result, indent=2, default=str))
+        else:
+            print(network.render_peer(result))
+        failed = (result.get("latency") or {}).get("error")
+        return 2 if failed else 0
+
     # Monitor mode replaces the benchmark entirely: it answers "what is this
     # machine doing right now?", which no benchmark result can.
     if args.monitor:
@@ -583,6 +699,11 @@ def main(argv=None) -> int:
             print(f"  !!  {w}")
         print("\n  Re-run with --force to benchmark anyway.")
         return 3
+
+    # Resource counters bracket the whole benchmark phase: they are free, and
+    # page faults or involuntary context switches during it invalidate
+    # everything else that was measured.
+    counters_before = counters_mod.resource_snapshot()
 
     results: dict = {}
     run_info = dict(info, cpu_cores_logical=effective_cores)
@@ -731,6 +852,85 @@ def main(argv=None) -> int:
         else:
             npu_result = npu_mod.detect()
 
+    # rusage costs nothing and is always collected; the PMU tier only when
+    # asked, since it costs an extra subprocess run of a CPU workload.
+    counters_result = {
+        "resources": counters_mod.resource_delta(
+            counters_before, counters_mod.resource_snapshot()),
+    }
+    if args.counters:
+        if not quiet:
+            print("  reading hardware performance counters ...", flush=True)
+        counters_result["pmu"] = counters_mod.measure_command(
+            [sys.executable, "-c",
+             "import pcbench.workloads as w; w.bench_cpu_integer(1.0, 1)"])
+    counters_result["notes"] = counters_mod.interpret(
+        counters_result.get("pmu") or {}, counters_result["resources"])
+
+    # Industry reference workloads. STREAM and the CoreMark-style suite come
+    # from the native engine at no extra cost; LINPACK needs NumPy.
+    standards_result = None
+    if not args.no_standards:
+        if not quiet:
+            print("  collecting reference workloads (STREAM / LINPACK / "
+                  "CoreMark-style) ...", flush=True)
+        standards_result = standards_mod.run(
+            native, info.get("ram_total_bytes", 0),
+            with_linpack=not args.no_linpack)
+        for key, value in standards_mod.extract_rates(standards_result).items():
+            results[key] = {"rate": value}
+
+    numa_result = None
+    if args.numa or args.numa_bandwidth:
+        if not quiet:
+            print("  inspecting NUMA topology ...", flush=True)
+        numa_result = numa_mod.run(measure=args.numa_bandwidth)
+        numa_result["notes"] = numa_mod.notes(numa_result)
+
+    datascience_result = None
+    if args.datascience:
+        if not quiet:
+            print("  running the data-science tier ...", flush=True)
+        datascience_result = ds_mod.run(
+            memory_bytes=(confinement.get("effective_ram_bytes")
+                          or info.get("ram_total_bytes", 0)),
+            seconds=args.seconds,
+            skip_dataframes=args.no_dataframes)
+        for key, value in ds_mod.extract_rates(datascience_result).items():
+            results[key] = {"rate": value}
+
+    io_result = None
+    if args.io or args.io_job:
+        try:
+            jobs = ([iobench.parse_job(spec, min(args.seconds, 3.0),
+                                       args.disk_mb) for spec in args.io_job]
+                    if args.io_job
+                    else iobench.default_suite(min(args.seconds, 3.0),
+                                               args.disk_mb))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if not quiet:
+            print(f"  running {len(jobs)} storage I/O job(s) ...", flush=True)
+        io_result = iobench.run(jobs, disk_dir, quiet=quiet)
+
+    energy_result = None
+    if args.energy:
+        if not quiet:
+            print("  measuring energy to solution ...", flush=True)
+
+        def fixed_work() -> int:
+            # A fixed amount of work, so joules are comparable between
+            # machines of different speeds -- which is the entire point.
+            iterations = 2_000_000
+            total = 0
+            for i in range(iterations):
+                total += i * i
+            return iterations
+
+        energy_result = power.energy_to_solution(
+            fixed_work, info.get("cpu_model", ""), "2M integer operations")
+
     # Extra storage devices, benchmarked with the same workload as the main
     # disk test so the numbers sit side by side.
     storage_result = None
@@ -813,6 +1013,13 @@ def main(argv=None) -> int:
         "sustained": sustained,
         "soak": soak_result,
         "storage": storage_result,
+        "standards": standards_result,
+        "counters": counters_result,
+        "numa": numa_result,
+        "datascience": datascience_result,
+        "io": io_result,
+        "energy": energy_result,
+        "provenance": (None if args.no_provenance else provenance.collect()),
         "confinement": confinement,
         "confinement_warnings": confinement_warnings,
         "autoscale": autoscale_notes,
@@ -826,6 +1033,8 @@ def main(argv=None) -> int:
     # needs the finished scores, so it happens after the payload is assembled.
     payload["reference"] = reference.assess(payload)
     payload["subsystem_checks"] = reference.subsystem_checks(results)
+    if payload.get("provenance"):
+        payload["provenance_notes"] = provenance.notes(payload["provenance"])
 
     # Regression check against this machine's own history.
     if not args.no_regression:

@@ -729,10 +729,83 @@ def print_soak(result: dict | None) -> None:
     print(soak_mod.render(result))
 
 
+def print_provenance(info: dict | None, notes: list | None) -> None:
+    """Configuration that changes the numbers without changing the hardware."""
+    if not info:
+        return
+    from . import provenance as provenance_mod
+    body = provenance_mod.render(info, notes)
+    if body.strip():
+        hr("System configuration")
+        print(body)
+
+
+def print_standards(result: dict | None) -> None:
+    """STREAM, LINPACK, and the CoreMark-style suite."""
+    if not result:
+        return
+    from . import standards as standards_mod
+    body = standards_mod.render(result)
+    if body.strip():
+        hr("Reference workloads (industry standards)")
+        print(body)
+
+
+def print_counters(result: dict | None) -> None:
+    """Hardware and resource counters — why the numbers came out as they did."""
+    if not result:
+        return
+    from . import counters as counters_mod
+    body = counters_mod.render(result)
+    if body.strip():
+        hr("Performance counters")
+        print(body)
+
+
+def print_numa(result: dict | None) -> None:
+    if not result:
+        return
+    from . import numa as numa_mod
+    hr("NUMA topology")
+    print(numa_mod.render(result, result.get("notes")))
+
+
+def print_datascience(result: dict | None) -> None:
+    if not result:
+        return
+    from . import datascience as ds_mod
+    body = ds_mod.render(result)
+    if body.strip():
+        hr("Data science / ML")
+        print(body)
+
+
+def print_io(result: dict | None) -> None:
+    if not result:
+        return
+    from . import iobench
+    body = iobench.render(result)
+    if body.strip():
+        hr("Storage I/O jobs")
+        print(body)
+
+
+def print_energy(result: dict | None) -> None:
+    if not result:
+        return
+    from . import power as power_mod
+    body = power_mod.render_energy(result)
+    if body.strip():
+        hr("Energy efficiency")
+        print(body)
+
+
 def print_report(payload: dict) -> None:
     print_system(payload["system"], payload["state"], payload["warnings"])
     print_confinement(payload.get("confinement"),
                       payload.get("confinement_warnings"))
+    print_provenance(payload.get("provenance"),
+                     payload.get("provenance_notes"))
     print_results(payload["results"])
     print_apps(payload["results"])
     print_native(payload.get("native"))
@@ -747,7 +820,13 @@ def print_report(payload: dict) -> None:
     print_plugins(payload.get("plugins"))
     print_health(payload.get("health"))
     print_power(payload.get("power"), payload.get("perf_per_watt"))
+    print_standards(payload.get("standards"))
+    print_numa(payload.get("numa"))
+    print_datascience(payload.get("datascience"))
     print_storage(payload.get("storage"))
+    print_io(payload.get("io"))
+    print_energy(payload.get("energy"))
+    print_counters(payload.get("counters"))
     print_sustained(payload.get("sustained"))
     print_soak(payload.get("soak"))
     print_scores(payload["scores"])
@@ -798,6 +877,11 @@ CSV_FIELDS = [
     "nn_train_steps_s", "kmeans_dist_s", "knn_cmp_s",
     "sqlite_txn_s", "fsync_commits_s", "fsync_median_us", "raytrace_fps",
     "image_mp_s", "logparse_mb_s", "video_fps",
+    "stream_triad_mb_s", "coremark_style_iter_s", "linpack_gflops",
+    "llm_prefill_tok_s", "llm_decode_tok_s", "dataloader_samples_s",
+    "dataframe_ops_s", "ipc", "cache_miss_pct", "branch_miss_pct",
+    "cpu_governor", "mitigations_disabled", "smt_enabled", "thp",
+    "numa_nodes", "numa_remote_penalty_pct", "energy_joules",
     "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
     "cpu_celsius", "battery_health_pct", "battery_cycles",
     "sustained_temp_peak_c", "sustained_temp_rise_c",
@@ -884,6 +968,37 @@ def flatten_row(payload: dict) -> dict:
         "image_mp_s": _rate(results, "image"),
         "logparse_mb_s": _rate(results, "logparse"),
         "video_fps": _rate(results, "video"),
+        # Reference workloads: the only figures in this row that mean anything
+        # outside this tool, which makes them the most valuable to keep.
+        "stream_triad_mb_s": _rate(results, "stream_triad"),
+        "coremark_style_iter_s": _rate(results, "coremark_style"),
+        "linpack_gflops": _rate(results, "linpack"),
+        "llm_prefill_tok_s": _rate(results, "llm_prefill"),
+        "llm_decode_tok_s": _rate(results, "llm_decode"),
+        "dataloader_samples_s": _rate(results, "dataloader"),
+        "dataframe_ops_s": _rate(results, "dataframe"),
+        # Counters and configuration: without these, two rows that differ by
+        # 20% look like a hardware difference when they are a settings one.
+        "ipc": ((payload.get("counters") or {}).get("pmu") or {}).get("ipc", ""),
+        "cache_miss_pct": (((payload.get("counters") or {}).get("pmu") or {})
+                           .get("cache_miss_rate_pct", "")),
+        "branch_miss_pct": (((payload.get("counters") or {}).get("pmu") or {})
+                            .get("branch_miss_rate_pct", "")),
+        "cpu_governor": (((payload.get("provenance") or {}).get("frequency")
+                          or {}).get("governor") or ""),
+        "mitigations_disabled": len(
+            ((payload.get("provenance") or {}).get("mitigations") or {})
+            .get("vulnerable", []) or []),
+        "smt_enabled": (((payload.get("provenance") or {}).get("smt") or {})
+                        .get("enabled", "")),
+        "thp": (((payload.get("provenance") or {}).get("memory") or {})
+                .get("transparent_hugepages") or ""),
+        "numa_nodes": ((payload.get("numa") or {}).get("topology") or {})
+                      .get("nodes", ""),
+        "numa_remote_penalty_pct": ((payload.get("numa") or {})
+                                    .get("bandwidth") or {})
+                                   .get("remote_penalty_pct", ""),
+        "energy_joules": (payload.get("energy") or {}).get("joules", ""),
         "net_loopback_mb_s": round(
             (payload.get("network") or {}).get("loopback_mb_s", 0) or 0, 1),
         "power_watts": power.get("package_w") or "",

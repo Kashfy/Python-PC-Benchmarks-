@@ -72,6 +72,23 @@ TIERS: dict[str, dict] = {
             Package("blake3", "blake3", "BLAKE3 hashing alongside SHA-256", 2),
         ],
     },
+    "data": {
+        "summary": "Dataframe engines for the analytics benchmarks, and "
+                   "LINPACK's optimised BLAS",
+        "packages": [
+            Package("numpy", "numpy",
+                    "LINPACK/HPL GFLOPS and the CPU LLM backend", 20,
+                    critical=True),
+            Package("polars", "polars",
+                    "Columnar dataframe engine — filter, group-by, join, sort",
+                    35),
+            Package("pandas", "pandas",
+                    "The reference dataframe API most analysis is written in",
+                    45),
+            Package("duckdb", "duckdb",
+                    "Embedded analytical SQL over the same data", 40),
+        ],
+    },
     "system": {
         "summary": "Better sensors, richer output, and reference ML",
         "packages": [

@@ -18,17 +18,24 @@ Python-PC-Benchmarks-/
 │   ├── limits.py       # hardware-safety caps (memory/disk/wear/thermal)
 │   ├── optional.py     # registry of optional packages, grouped in tiers
 │   ├── config.py       # config files (TOML/JSON) and PCBENCH_* variables
+│   ├── stats.py        # confidence intervals, Mann-Whitney U, A/B verdicts
 │   ├── cli.py          # argument parsing and run orchestration
 │   │   ── inventory and state ──
 │   ├── system.py       # hardware inventory, CPU features, machine state
 │   ├── thermal.py      # temperatures in Celsius, fans, battery health
 │   ├── power.py        # power draw + perf-per-watt
 │   ├── container.py    # container / cgroup / cloud / CI confinement
+│   ├── provenance.py   # governor, mitigations, hugepages, SMT, microcode
+│   ├── counters.py     # PMU counters via perf, plus rusage everywhere
+│   ├── numa.py         # NUMA topology and local/remote bandwidth matrix
 │   ├── storage.py      # mount enumeration, device classification
 │   ├── monitor.py      # live telemetry mode (no benchmarking)
 │   │   ── stdlib benchmarks ──
 │   ├── workloads.py    # cpu, memory, disk (queue depth), real-world
 │   ├── apps.py         # application-shaped: sqlite, fsync, raytrace, video
+│   ├── standards.py    # STREAM, LINPACK/HPL, CoreMark-style
+│   ├── iobench.py      # fio-shaped configurable storage jobs
+│   ├── datascience.py  # LLM prefill/decode, input pipeline, dataframes
 │   ├── mlbench.py      # pure-Python ML: NN training, k-means, k-NN
 │   ├── cores.py        # per-core scaling analysis and hybrid detection
 │   ├── sysbench.py     # compile benchmark, OS latency, CPU frequency
@@ -59,7 +66,7 @@ Python-PC-Benchmarks-/
 │   ├── export.py       # Prometheus, JUnit XML, SQLite, Markdown
 │   └── regression.py   # run-over-run regression detection
 ├── plugins/            # drop-in user benchmarks (auto-discovered)
-├── tests/              # 324 stdlib unittest cases
+├── tests/              # 406 stdlib unittest cases
 └── docs/
 ```
 
@@ -229,9 +236,16 @@ for each selected test:
        └─ Exception       → {"error": ...}                (run continues)
    │
 native.run()            unless --no-native
+standards.run()         STREAM + CoreMark-style from the native payload,
+                        LINPACK via NumPy; unless --no-standards
 accel.inventory()       always (cheap)
 accel.run()             Apple only, unless --no-accel/--no-gpu/--no-npu
    └─ headline GPU/NPU rates folded into `results` so they score normally
+counters.*()            rusage always; PMU tier only with --counters
+numa.run()              if --numa / --numa-bandwidth
+datascience.run()       if --datascience
+iobench.run()           if --io / --io-job
+power.energy_to_solution()  if --energy
 storage.run()           if --disk-all / --disk-path
 run_sustained()         if --sustained
 soak.run()              if --soak   (last: longest phase, exit 7 on errors)
@@ -265,6 +279,13 @@ One `payload` dict per run, written verbatim to JSON:
   "storage":   { "devices": [ { "mount": "/mnt/data", "disk": {...} } ] },
   "confinement": { "container": "Docker", "cpu_quota_cores": 2.0, ... },
   "reference": { "class": "workstation", "flag": "balanced", ... },
+  "standards": { "stream": {...}, "linpack": {...}, "coremark_style": {...} },
+  "provenance": { "mitigations": {...}, "frequency": {...}, "smt": {...} },
+  "counters":  { "pmu": { "ipc": 1.9, ... }, "resources": {...} },
+  "numa":      { "topology": {...}, "bandwidth": { "matrix": {...} } },
+  "datascience": { "llm": {...}, "dataloader": {...}, "dataframes": {...} },
+  "io":        { "jobs": [ { "name": "database", "iops": 49548, ... } ] },
+  "energy":    { "joules": 412.5, "units_per_joule": 4850.0, ... },
   "gates":     [ { "name": "composite>=250", "passed": true, ... } ],
   "scores":    { "subscores": {...}, "composite": 349.0 }
 }
