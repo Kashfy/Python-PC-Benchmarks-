@@ -186,34 +186,113 @@ def assess(payload: dict) -> dict:
 # --------------------------------------------------------------------------- #
 # Per-category sanity checks
 # --------------------------------------------------------------------------- #
-#: Absolute floors below which a subsystem is suspect regardless of class.
-#: These are set where the hardware itself is implausible, not merely slow, so
-#: that firing one always means "go look at this".
+#: Absolute floors below which a subsystem is worth a second look. A floor
+#: firing is an *observation*, not a verdict: the same number can mean a fault
+#: or an entirely normal slow medium, and which one it is depends on context
+#: the floor alone does not have.
+#:
+#: An earlier version asserted a fault directly, and flagged a healthy
+#: Raspberry Pi 4 on an SD card twice (SD cards sustain 20-45 MB/s by design,
+#: and "SD card" was not even among the listed causes) and told the owner of a
+#: working 5400rpm hard disk that "on an SSD it indicates a real fault".
 FLOORS = {
-    "disk_read": (80.0, "MB/s",
-                  "sequential read this low means a hard disk, a failing SSD, "
-                  "a USB 2.0 enclosure, or a filesystem in a degraded state"),
-    "disk_write": (40.0, "MB/s",
-                   "sequential write this low suggests a full or failing "
-                   "drive, SMR media, or an exhausted SSD write cache"),
-    "disk_iops": (200.0, "IOPS",
-                  "random read IOPS in this range is rotational-media "
-                  "territory; on an SSD it indicates a real fault"),
-    "memory": (800.0, "MB/s",
-               "memory bandwidth this low points at single-channel operation, "
-               "a downclocked module, or heavy contention"),
+    "disk_read": (80.0, "MB/s"),
+    "disk_write": (40.0, "MB/s"),
+    "disk_iops": (200.0, "IOPS"),
+    "memory": (800.0, "MB/s"),
 }
 
+#: Sequential read below this makes a slow *medium* (SD card, eMMC, USB, hard
+#: disk) far more likely than a fault, because a failing SSD characteristically
+#: loses random performance while retaining much of its sequential throughput.
+SLOW_MEDIUM_READ_MB_S = 150.0
 
-def subsystem_checks(results: dict) -> list[dict]:
-    """Flag subsystems whose absolute figures are implausible for the class."""
-    out = []
+#: Single-core anchor below which the machine is single-board-computer class,
+#: where modest storage and memory figures are the expected specification
+#: rather than a symptom.
+SBC_ANCHOR = 60.0
+
+
+def _storage_context(results: dict, anchor: float | None) -> dict:
+    """What the *other* measurements say about the storage medium.
+
+    Cross-checking beats guessing: a failing SSD loses random-access
+    performance while keeping much of its sequential throughput, so low
+    sequential *and* low random together indicate a slow medium rather than a
+    damaged fast one.
+    """
+    disk = results.get("disk") if isinstance(results.get("disk"), dict) else {}
+    read = disk.get("read_rate")
+    iops = disk.get("random_read_iops")
+    slow_sequential = isinstance(read, (int, float)) and 0 < read < SLOW_MEDIUM_READ_MB_S
+    low_iops = isinstance(iops, (int, float)) and 0 < iops < FLOORS["disk_iops"][0]
+    return {
+        "slow_medium_likely": slow_sequential,
+        "rotational_pattern": slow_sequential and low_iops,
+        "sbc_class": anchor is not None and anchor < SBC_ANCHOR,
+    }
+
+
+def _explain(metric: str, value: float, context: dict) -> tuple[str, str]:
+    """Return ``(severity, explanation)`` for a floor that fired."""
+    sbc = context.get("sbc_class")
+
+    if metric in ("disk_read", "disk_write"):
+        if context.get("rotational_pattern"):
+            return ("expected", (
+                "sequential and random figures are both low, which is the "
+                "signature of a slow medium — a hard disk, SD card, eMMC or "
+                "USB drive — rather than of a fast device that has degraded"))
+        if sbc:
+            return ("expected", (
+                "normal for a single-board computer booting from SD or eMMC; "
+                "moving the working set to USB 3 or NVMe is the upgrade path, "
+                "not a repair"))
+        return ("investigate", (
+            "low sequential throughput on a machine whose CPU suggests it "
+            "should have faster storage. Likely an SD card, USB enclosure, or "
+            "network mount; if it is meant to be an internal SSD, check the "
+            "drive's health and how full it is"))
+
+    if metric == "disk_iops":
+        if context.get("slow_medium_likely"):
+            return ("expected", (
+                "consistent with rotational or flash-card media, whose random "
+                "performance is genuinely this low"))
+        return ("investigate", (
+            "random-read IOPS this low alongside healthy sequential "
+            "throughput is the characteristic signature of a failing SSD, or "
+            "of a filesystem or virtualisation layer serialising I/O"))
+
+    if metric == "memory":
+        if sbc:
+            return ("expected", (
+                "normal for a single-board computer; these parts have narrow "
+                "memory buses by design"))
+        return ("investigate", (
+            "memory bandwidth this low on a machine of this class points at "
+            "single-channel operation, a downclocked or mismatched module, or "
+            "heavy contention during the run"))
+    return ("investigate", "")
+
+
+def subsystem_checks(results: dict,
+                     subscores: dict | None = None) -> list[dict]:
+    """Flag subsystems whose absolute figures warrant a look.
+
+    ``subscores`` supplies the machine's own single-core anchor, which is what
+    separates "slow for this class of machine" from "slow full stop".
+    """
+    anchor = single_thread_anchor(subscores or {})
+    context = _storage_context(results, anchor)
+
     sources = {
         "disk_read": ("disk", "read_rate"),
         "disk_write": ("disk", "write_rate"),
         "disk_iops": ("disk", "random_read_iops"),
         "memory": ("memory", "rate"),
     }
+    out = []
     for key, (result_key, field) in sources.items():
         entry = results.get(result_key)
         if not isinstance(entry, dict) or entry.get("skipped"):
@@ -221,10 +300,12 @@ def subsystem_checks(results: dict) -> list[dict]:
         value = entry.get(field)
         if not isinstance(value, (int, float)) or value <= 0:
             continue
-        floor, unit, explanation = FLOORS[key]
-        if value < floor:
-            out.append({"metric": key, "value": round(value, 1), "unit": unit,
-                        "floor": floor, "note": explanation})
+        floor, unit = FLOORS[key]
+        if value >= floor:
+            continue
+        severity, note = _explain(key, value, context)
+        out.append({"metric": key, "value": round(value, 1), "unit": unit,
+                    "floor": floor, "severity": severity, "note": note})
     return out
 
 
@@ -240,7 +321,10 @@ def render(assessment: dict, checks: list[dict] | None = None) -> str:
     if assessment.get("verdict"):
         lines.append(f"  Assessment : {assessment['verdict']}")
     for check in checks or []:
-        lines.append(f"  !  {check['metric']} = {check['value']} "
+        # "expected" findings are context, not problems; marking them the same
+        # way as a suspected fault is what made a healthy Pi look broken.
+        mark = "i " if check.get("severity") == "expected" else "! "
+        lines.append(f"  {mark} {check['metric']} = {check['value']} "
                      f"{check['unit']} (below {check['floor']}): "
                      f"{check['note']}")
     return "\n".join(lines)

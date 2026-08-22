@@ -1051,7 +1051,8 @@ def main(argv=None) -> int:
     # Placing the machine and checking it against its own single-core anchor
     # needs the finished scores, so it happens after the payload is assembled.
     payload["reference"] = reference.assess(payload)
-    payload["subsystem_checks"] = reference.subsystem_checks(results)
+    payload["subsystem_checks"] = reference.subsystem_checks(
+        results, scores.get("subscores"))
     if payload.get("provenance"):
         payload["provenance_notes"] = provenance.notes(payload["provenance"])
 

@@ -59,6 +59,16 @@ def _to_float(v) -> float | None:
         return None
 
 
+#: Prior runs needed before a metric's own variability can be estimated.
+#: Below this, a change is reported but labelled provisional -- variance
+#: cannot be inferred from one or two samples.
+MIN_RUNS_FOR_SPREAD = 3
+
+#: How many robust standard deviations a change must exceed to count as
+#: outside a metric's normal run-to-run variation.
+SPREAD_MULTIPLIER = 3.0
+
+
 def _baseline(history: list[dict], current: dict) -> dict | None:
     """Median of each metric across this host's comparable prior runs.
 
@@ -88,7 +98,30 @@ def _baseline(history: list[dict], current: dict) -> dict | None:
                 if f is not None]
         if vals:
             base[col] = statistics.median(vals)
+            # Keep the spread, not just the centre. A fixed percentage
+            # threshold treats every metric as equally repeatable, and they
+            # are not: sequential disk throughput routinely swings 30% between
+            # runs on the same machine while integer CPU work varies under 1%.
+            # Without this, the noisy metrics generate most of the "findings".
+            base.setdefault("_spread", {})[col] = _mad(vals)
+            base.setdefault("_samples", {})[col] = len(vals)
     return base
+
+
+def _mad(values: list[float]) -> float:
+    """Median absolute deviation — a spread measure that ignores outliers.
+
+    Chosen over standard deviation because the histories being summarised are
+    short and frequently contain exactly the one-off bad run this check exists
+    to avoid being fooled by. Scaled by 1.4826 so it estimates the standard
+    deviation of a normal distribution, which makes the multiplier below
+    interpretable in the usual way.
+    """
+    import statistics
+    if len(values) < 2:
+        return 0.0
+    centre = statistics.median(values)
+    return 1.4826 * statistics.median([abs(v - centre) for v in values])
 
 
 def analyze(current_row: dict, history: list[dict],
@@ -110,18 +143,44 @@ def analyze(current_row: dict, history: list[dict],
         if now is None or not was:
             continue
         delta = (now - was) / was
-        if abs(delta) >= threshold:
-            findings.append({
-                "metric": label,
-                "column": col,
-                "current": round(now, 1),
-                "baseline": round(was, 1),
-                "change_pct": round(delta * 100, 1),
-                "direction": "faster" if delta > 0 else "slower",
-            })
+        if abs(delta) < threshold:
+            continue
+
+        samples = (base.get("_samples") or {}).get(col, 0)
+        spread = (base.get("_spread") or {}).get(col, 0.0)
+        finding = {
+            "metric": label,
+            "column": col,
+            "current": round(now, 1),
+            "baseline": round(was, 1),
+            "change_pct": round(delta * 100, 1),
+            "direction": "faster" if delta > 0 else "slower",
+            "prior_runs": samples,
+        }
+
+        # With enough history the metric's own variability decides whether a
+        # change is real. Below that there is nothing to estimate it from, and
+        # the finding is reported as provisional rather than suppressed.
+        if samples >= MIN_RUNS_FOR_SPREAD and spread > 0:
+            deviations = abs(now - was) / spread
+            finding["deviations_from_normal"] = round(deviations, 1)
+            finding["typical_spread_pct"] = round(100.0 * spread / was, 1)
+            finding["confidence"] = ("outside normal variation"
+                                     if deviations >= SPREAD_MULTIPLIER
+                                     else "within normal variation")
+        elif samples >= MIN_RUNS_FOR_SPREAD:
+            finding["confidence"] = "outside normal variation"
+        else:
+            finding["confidence"] = "provisional"
+        findings.append(finding)
 
     findings.sort(key=lambda f: f["change_pct"])   # worst regressions first
-    regressions = [f for f in findings if f["direction"] == "slower"]
+    # Only a change the metric's own history cannot explain counts as a
+    # regression. A metric that swings this much routinely is reported, but it
+    # does not raise the alarm.
+    regressions = [f for f in findings
+                   if f["direction"] == "slower"
+                   and f.get("confidence") != "within normal variation"]
     return {
         "status": "regression" if regressions else "ok",
         "baseline_runs": base["_runs"],
@@ -150,9 +209,32 @@ def render(result: dict) -> str:
 
     for f in result["findings"]:
         mark = "▼" if f["direction"] == "slower" else "▲"
+        note = ""
+        if f.get("confidence") == "within normal variation":
+            note = (f"   (within this metric's normal ±"
+                    f"{f.get('typical_spread_pct', 0):.0f}% spread)")
+        elif f.get("confidence") == "provisional":
+            note = f"   (provisional — only {f.get('prior_runs', 0)} prior run)"
         lines.append(f"    {mark} {f['metric']:<20} {f['change_pct']:+.1f}%  "
-                     f"({f['baseline']:,.0f} → {f['current']:,.0f})")
+                     f"({f['baseline']:,.0f} → {f['current']:,.0f}){note}")
     if result["regression_count"]:
-        lines.append(f"  ⚠ {result['regression_count']} metric(s) regressed. "
-                     f"Check cooling, background load, or hardware health.")
+        lines.append(f"  ⚠ {result['regression_count']} metric(s) regressed "
+                     f"beyond their normal variation. Most likely causes, in "
+                     f"order: background load during the run, thermal "
+                     f"throttling, a changed setting, then hardware health.")
+    elif result["findings"]:
+        # "Provisional" and "within normal variation" are different states and
+        # must not share a summary: one means the change is explained by known
+        # noise, the other means there is not yet enough history to judge.
+        provisional = [f for f in result["findings"]
+                       if f.get("confidence") == "provisional"]
+        if provisional:
+            lines.append(
+                f"  ? {len(provisional)} change(s) seen, but with "
+                f"{result['baseline_runs']} prior run(s) there is not enough "
+                f"history to tell a real change from normal variation. A few "
+                f"more runs will settle it.")
+        else:
+            lines.append("  ✓ Changes seen are within each metric's normal "
+                         "run-to-run variation.")
     return "\n".join(lines)

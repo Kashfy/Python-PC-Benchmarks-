@@ -3698,3 +3698,170 @@ class TestScoringDocumentation(unittest.TestCase):
 
     def test_fsync_is_documented_as_unscored_and_is(self):
         self.assertNotIn("fsync", scoring.BASELINES)
+
+
+# --------------------------------------------------------------------------- #
+class TestSubsystemFloorContext(unittest.TestCase):
+    """A floor firing is an observation; whether it is a fault needs context.
+
+    Regression test: the absolute floors flagged a healthy Raspberry Pi 4 on an
+    SD card twice (SD cards sustain 20-45 MB/s by design) and told the owner of
+    a working 5400rpm hard disk that "on an SSD it indicates a real fault".
+    """
+
+    SBC = {"cpu_int": 35.0, "cpu_float": 40.0, "hashing": 30.0, "json": 32.0}
+    FAST = {"cpu_int": 300.0, "cpu_float": 320.0, "hashing": 290.0,
+            "json": 310.0}
+
+    @staticmethod
+    def _sev(checks, metric):
+        for c in checks:
+            if c["metric"] == metric:
+                return c["severity"]
+        return None
+
+    def test_sd_card_on_an_sbc_is_expected_not_a_fault(self):
+        checks = reference.subsystem_checks(
+            {"disk": {"read_rate": 45.0, "write_rate": 25.0,
+                      "random_read_iops": 2500.0}}, self.SBC)
+        self.assertTrue(checks)
+        for c in checks:
+            self.assertEqual(c["severity"], "expected", c["metric"])
+            self.assertIn("single-board", c["note"])
+
+    def test_narrow_memory_bus_on_an_sbc_is_expected(self):
+        checks = reference.subsystem_checks({"memory": {"rate": 700.0}},
+                                            self.SBC)
+        self.assertEqual(self._sev(checks, "memory"), "expected")
+
+    def test_working_hard_disk_is_recognised_by_its_pattern(self):
+        # Low sequential *and* low random is a slow medium, not a fast one
+        # that has degraded.
+        checks = reference.subsystem_checks(
+            {"disk": {"read_rate": 75.0, "write_rate": 60.0,
+                      "random_read_iops": 120.0}}, self.FAST)
+        self.assertTrue(checks)
+        for c in checks:
+            self.assertEqual(c["severity"], "expected", c["metric"])
+
+    def test_failing_ssd_is_still_caught(self):
+        # Healthy sequential with collapsed random is the signature that
+        # matters, and it must survive the added context.
+        checks = reference.subsystem_checks(
+            {"disk": {"read_rate": 2500.0, "write_rate": 1800.0,
+                      "random_read_iops": 90.0}}, self.FAST)
+        self.assertEqual(self._sev(checks, "disk_iops"), "investigate")
+        self.assertTrue(any("failing SSD" in c["note"] for c in checks))
+
+    def test_single_channel_memory_on_a_fast_machine_is_investigated(self):
+        checks = reference.subsystem_checks({"memory": {"rate": 600.0}},
+                                            self.FAST)
+        self.assertEqual(self._sev(checks, "memory"), "investigate")
+        self.assertIn("single-channel", checks[0]["note"])
+
+    def test_healthy_modern_machine_reports_nothing(self):
+        self.assertEqual(reference.subsystem_checks(
+            {"disk": {"read_rate": 2500.0, "write_rate": 1800.0,
+                      "random_read_iops": 90000.0},
+             "memory": {"rate": 20000.0}}, self.FAST), [])
+
+    def test_slow_storage_without_a_cpu_anchor_is_investigated_not_excused(self):
+        # With no anchor the machine class is unknown, so the tool must not
+        # assume "probably an SBC" and wave a real problem through.
+        checks = reference.subsystem_checks(
+            {"disk": {"read_rate": 45.0, "write_rate": 25.0,
+                      "random_read_iops": 40000.0}}, {})
+        self.assertEqual(self._sev(checks, "disk_read"), "investigate")
+
+    def test_render_marks_expected_findings_differently(self):
+        checks = reference.subsystem_checks(
+            {"memory": {"rate": 700.0}}, self.SBC)
+        text = reference.render({"class": "embedded / SBC"}, checks)
+        self.assertIn("i ", text)
+        self.assertNotIn("!  memory", text)
+
+    def test_every_floor_metric_has_an_explanation_for_both_severities(self):
+        for metric in reference.FLOORS:
+            for context in ({"sbc_class": True, "slow_medium_likely": True,
+                             "rotational_pattern": True},
+                            {"sbc_class": False, "slow_medium_likely": False,
+                             "rotational_pattern": False}):
+                severity, note = reference._explain(metric, 1.0, context)
+                self.assertIn(severity, ("expected", "investigate"))
+                self.assertTrue(note, f"{metric} has no explanation")
+
+
+# --------------------------------------------------------------------------- #
+class TestRegressionUsesHistoricalSpread(unittest.TestCase):
+    """A fixed percentage threshold treats every metric as equally repeatable.
+
+    They are not: sequential disk throughput swings tens of percent between
+    runs on the same machine while integer CPU work varies under 1%. Judging
+    both against one threshold makes the noisy metrics generate most of the
+    findings — observed on a real machine reporting disk_write +134.6% on one
+    run and "no significant change" on the next.
+    """
+
+    @staticmethod
+    def _row(ts, **kw):
+        row = {"hostname": "host", "timestamp_utc": ts, "cfg_disk_mb": "256",
+               "cfg_mem_mb": "64", "python_version": "3.14",
+               "python_impl": "CPython", "cores_logical": "10"}
+        row.update({k: str(v) for k, v in kw.items()})
+        return row
+
+    def test_noisy_metric_within_its_own_spread_is_not_a_regression(self):
+        history = [self._row(f"t{i}", disk_write_mb_s=v)
+                   for i, v in enumerate([3018, 7081, 4605, 6200, 3400])]
+        result = regression.analyze(
+            self._row("now", disk_write_mb_s=3100), history)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["findings"], "the change should still be shown")
+        self.assertEqual(result["findings"][0]["confidence"],
+                         "within normal variation")
+
+    def test_stable_metric_moving_is_a_real_regression(self):
+        history = [self._row(f"t{i}", cpu_int_primes_s=v)
+                   for i, v in enumerate([2_270_000, 2_265_000, 2_272_000,
+                                          2_268_000, 2_271_000])]
+        result = regression.analyze(
+            self._row("now", cpu_int_primes_s=1_700_000), history)
+        self.assertEqual(result["status"], "regression")
+        self.assertEqual(result["findings"][0]["confidence"],
+                         "outside normal variation")
+
+    def test_too_little_history_is_provisional_not_confident(self):
+        result = regression.analyze(
+            self._row("now", disk_write_mb_s=7081),
+            [self._row("t0", disk_write_mb_s=3018)])
+        self.assertEqual(result["findings"][0]["confidence"], "provisional")
+        self.assertIn("not enough history", regression.render(result))
+
+    def test_provisional_is_not_summarised_as_normal_variation(self):
+        text = regression.render(regression.analyze(
+            self._row("now", disk_write_mb_s=7081),
+            [self._row("t0", disk_write_mb_s=3018)]))
+        self.assertNotIn("within each metric's normal", text)
+
+    def test_provisional_slowdown_still_counts_as_a_regression(self):
+        # With no way to rule it out, the conservative reading wins.
+        result = regression.analyze(
+            self._row("now", cpu_int_primes_s=1_000_000),
+            [self._row("t0", cpu_int_primes_s=2_000_000)])
+        self.assertEqual(result["status"], "regression")
+
+    def test_mad_ignores_a_single_outlier(self):
+        steady = [100.0, 101.0, 99.0, 100.0, 100.0]
+        self.assertLess(regression._mad(steady), 3.0)
+        self.assertLess(regression._mad(steady + [10_000.0]), 5.0)
+
+    def test_mad_of_one_sample_is_zero(self):
+        self.assertEqual(regression._mad([5.0]), 0.0)
+
+    def test_spread_is_reported_so_the_reader_can_judge(self):
+        history = [self._row(f"t{i}", disk_write_mb_s=v)
+                   for i, v in enumerate([3018, 7081, 4605, 6200, 3400])]
+        result = regression.analyze(
+            self._row("now", disk_write_mb_s=3100), history)
+        self.assertIn("typical_spread_pct", result["findings"][0])
+        self.assertIn("%", regression.render(result))

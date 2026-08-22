@@ -792,6 +792,50 @@ The figure to watch alongside it is **available spare**. Wear is a projection;
 spare blocks falling below the drive's own threshold means the drive is
 consuming its reserve now.
 
+## A subsystem is flagged but the hardware is fine
+
+Check the marker. From v11.8 these findings carry a severity:
+
+- `i` — **expected for this machine.** An SD card on a single-board computer,
+  or a hard disk, genuinely performs at these figures. Nothing is wrong.
+- `!` — **worth investigating.** The number is out of line with what the rest
+  of this machine's measurements imply.
+
+Earlier versions asserted a fault from the absolute number alone, which flagged
+a healthy Raspberry Pi 4 on an SD card twice (SD cards sustain 20-45 MB/s by
+design) and told the owner of a working 5400rpm hard disk that "on an SSD it
+indicates a real fault".
+
+The distinction that does the work is the *pattern*, not the threshold: a
+failing SSD loses random-access performance while keeping much of its
+sequential throughput, so **low sequential and low random together** indicate a
+slow medium, while **healthy sequential with collapsed random** is the
+signature of a real fault.
+
+## A regression is reported that vanishes on the next run
+
+Check the note beside the finding. From v11.8 each change is judged against
+that metric's own historical variability rather than a single percentage:
+
+```
+    ▼ Disk write   -32.7%  (4,605 → 3,100)   (within this metric's normal ±51% spread)
+  ✓ Changes seen are within each metric's normal run-to-run variation.
+```
+
+Sequential disk throughput routinely swings tens of percent between runs on the
+same machine, while integer CPU work varies under 1%. A single ±10% threshold
+treats them as equally repeatable, so the noisy metrics produced most of the
+findings.
+
+With fewer than three prior runs there is nothing to estimate variability from,
+and the finding says so — `(provisional — only 1 prior run)`. That is not the
+same as "within normal variation", and the summary line distinguishes them. A
+few more runs settle it.
+
+A slowdown that is still flagged after several runs is real. In rough order of
+likelihood: background load during the run, thermal throttling, a changed
+setting, then hardware health.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

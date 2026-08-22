@@ -35,7 +35,6 @@ rather than substituting something weaker and calling it the same thing.
 
 from __future__ import annotations
 
-import os
 import platform
 import re
 import resource
