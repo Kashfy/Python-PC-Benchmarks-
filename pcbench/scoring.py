@@ -60,7 +60,24 @@ BASELINES = {
     "lz4": 800.0,                  # MB/s LZ4
     "blake3": 1_000.0,             # MB/s BLAKE3
     "gpu_opencl": 1_000.0,         # GFLOPS via OpenCL
+    # Application-shaped workloads. These are the scores that answer "will
+    # this machine be good at my job?" rather than "how fast is this
+    # subsystem?", so they carry the same weight as the synthetic ones.
+    "sqlite": 50_000.0,            # SQLite OLTP transactions/s
+    "raytrace": 150.0,             # ray-traced frames/s
+    "image": 2.5,                  # megapixels/s through a separable blur
+    "logparse": 80.0,              # MB/s of regex log parsing
+    "video": 70.0,                 # H.264 1080p encode fps (needs ffmpeg)
 }
+
+# Deliberately *not* scored, though it is measured and reported:
+#
+# ``fsync`` — durable-commit latency is the most useful storage diagnostic
+# there is, but the operation being timed is not the same across platforms.
+# macOS needs ``F_FULLFSYNC`` to reach the medium where Linux's ``fsync``
+# suffices, and the two differ by two orders of magnitude on identical
+# hardware. Folding that into a cross-platform composite would make the score
+# a measurement of the operating system's flush semantics.
 
 # Which result key and field each score is derived from.
 _SOURCES = [
@@ -98,6 +115,11 @@ _SOURCES = [
     ("lz4", "lz4", "rate"),
     ("blake3", "blake3", "rate"),
     ("gpu_opencl", "gpu_opencl", "rate"),
+    ("sqlite", "sqlite", "rate"),
+    ("raytrace", "raytrace", "rate"),
+    ("image", "image", "rate"),
+    ("logparse", "logparse", "rate"),
+    ("video", "video", "rate"),
 ]
 
 
@@ -133,6 +155,7 @@ def category_scores(subscores: dict) -> dict:
         "memory": ["memory", "mem_scaling"],
         "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
         "system": ["compile", "syscall"],
+        "apps": ["sqlite", "raytrace", "image", "logparse", "video"],
         "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
                 "gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"],
         "npu": ["npu", "npu_onnx"],

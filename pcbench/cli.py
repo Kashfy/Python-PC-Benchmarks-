@@ -12,9 +12,18 @@ from datetime import datetime, timezone
 
 from . import __version__
 from . import accel as accel_mod
+from . import apps as apps_mod
+from . import config as config_mod
+from . import container as container_mod
 from . import cores as cores_mod
 from . import diagnose
+from . import export as export_mod
+from . import gates as gates_mod
 from . import health
+from . import monitor as monitor_mod
+from . import reference
+from . import soak as soak_mod
+from . import storage as storage_mod
 from . import plugins as plugins_mod
 from . import interference
 from . import cryptobench
@@ -37,24 +46,65 @@ from .scoring import compute_scores
 from .sustained import run_sustained
 from .system import inventory, machine_state, state_warnings
 
-TESTS = ["cpu_int", "cpu_float", "cpu_multi", "cores", "compression",
-         "hashing", "json", "memory", "mem_scaling", "cache_sweep", "disk",
-         "nn_training", "kmeans", "knn", "compile", "latency"]
+#: Synthetic tests: each isolates one subsystem, which is what makes them
+#: useful for diagnosis.
+SYNTHETIC_TESTS = ["cpu_int", "cpu_float", "cpu_multi", "cores", "compression",
+                   "hashing", "json", "memory", "mem_scaling", "cache_sweep",
+                   "disk", "nn_training", "kmeans", "knn", "compile",
+                   "latency"]
+
+#: Application-shaped tests: each mixes subsystems the way real software does,
+#: which is what makes them useful for deciding whether a machine suits a job.
+APP_TESTS = ["sqlite", "fsync", "raytrace", "image", "logparse", "video"]
+
+TESTS = SYNTHETIC_TESTS + APP_TESTS
+
+#: One-line descriptions for ``--list-tests``.
+DESCRIPTIONS = {
+    "cpu_int": "Integer math, single core (primes/s)",
+    "cpu_float": "Floating-point math, single core (iters/s)",
+    "cpu_multi": "Integer math across every core (primes/s)",
+    "cores": "Per-core-count scaling curve and efficiency-core detection",
+    "compression": "zlib compress+decompress round-trip (MB/s)",
+    "hashing": "SHA-256, reaching hardware crypto instructions (MB/s)",
+    "json": "JSON parse throughput (MB/s)",
+    "memory": "Large-buffer memory copy bandwidth (MB/s)",
+    "mem_scaling": "Memory bandwidth against concurrent readers (MB/s)",
+    "cache_sweep": "Latency across working-set sizes; reveals cache levels",
+    "disk": "Sequential read/write, random IOPS, queue-depth sweep",
+    "nn_training": "Pure-Python MLP training steps/s",
+    "kmeans": "k-means distance computations/s",
+    "knn": "k-nearest-neighbour comparisons/s",
+    "compile": "C compiles per minute (needs a compiler on PATH)",
+    "latency": "Syscall, context-switch, and process-spawn latency",
+    **apps_mod.DESCRIPTIONS,
+}
 
 # Curated subsets for common situations, so a user does not have to know
-# which of sixteen tests matter for their machine.
+# which of twenty-two tests matter for their machine.
 PROFILES = {
     "quick": ["cpu_int", "cpu_multi", "memory", "disk"],
+    "tiny": ["cpu_int", "memory"],
     "cpu": ["cpu_int", "cpu_float", "cpu_multi", "cores", "compression",
             "hashing", "json"],
     "ai": ["cpu_multi", "nn_training", "kmeans", "knn", "memory"],
-    "dev": ["cpu_int", "cpu_multi", "compile", "disk", "latency", "json"],
-    "storage": ["disk"],
+    "dev": ["cpu_int", "cpu_multi", "compile", "disk", "latency", "json",
+            "sqlite", "logparse"],
+    "storage": ["disk", "fsync"],
     "laptop": ["cpu_int", "cpu_multi", "cores", "memory", "disk", "latency"],
     "server": ["cpu_multi", "cores", "memory", "mem_scaling", "disk",
-               "latency", "compression"],
+               "latency", "compression", "sqlite", "fsync"],
+    "apps": ["sqlite", "fsync", "raytrace", "image", "logparse", "video"],
+    "database": ["sqlite", "fsync", "disk", "memory", "cpu_multi"],
+    "media": ["video", "image", "raytrace", "cpu_multi", "memory", "disk"],
+    "workstation": ["cpu_int", "cpu_multi", "cores", "memory", "mem_scaling",
+                    "disk", "compile", "raytrace", "video"],
+    "ci": ["cpu_int", "cpu_multi", "memory", "disk", "compile", "sqlite"],
 }
-DEFAULT_TESTS = list(TESTS)
+# ``video`` is excluded from the default set: it is a fixed multi-second
+# encode rather than a time-boxed loop, and it needs ffmpeg installed. Ask for
+# it with ``--only video`` or ``--profile media``.
+DEFAULT_TESTS = SYNTHETIC_TESTS + [t for t in APP_TESTS if t != "video"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,9 +199,69 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-optional", action="store_true",
                    help="Skip all benchmarks that need optional packages")
 
+    g = p.add_argument_group("storage devices")
+    g.add_argument("--disk-path", default="", metavar="PATH",
+                   help="Comma-separated mount points to benchmark storage on "
+                        "(in addition to the main run)")
+    g.add_argument("--disk-all", action="store_true",
+                   help="Benchmark every writable local filesystem found")
+    g.add_argument("--list-devices", action="store_true",
+                   help="List mounted storage and whether each can be "
+                        "benchmarked, then exit")
+
+    g = p.add_argument_group("stability / monitoring")
+    g.add_argument("--soak", metavar="DURATION", default=None,
+                   help="Burn-in: run validating work for this long and count "
+                        "wrong answers, e.g. 30m, 4h")
+    g.add_argument("--soak-workers", type=int, default=0,
+                   help="Load processes for the soak test (0 = all cores)")
+    g.add_argument("--monitor", metavar="DURATION", default=None,
+                   help="Watch clocks, temperature, load, and memory for this "
+                        "long instead of benchmarking, e.g. 60s, 10m")
+    g.add_argument("--monitor-interval", type=float, default=1.0,
+                   help="Seconds between monitor samples")
+    g.add_argument("--monitor-power", action="store_true",
+                   help="Also sample power draw while monitoring (costs a "
+                        "privileged subprocess per sample on macOS)")
+    g.add_argument("--monitor-trace", default="", metavar="PATH",
+                   help="Write raw monitor samples to this CSV file")
+
+    g = p.add_argument_group("integration / CI")
+    g.add_argument("--prometheus", default="", metavar="PATH",
+                   help="Write Prometheus exposition text (for a node_exporter "
+                        "textfile collector)")
+    g.add_argument("--junit", default="", metavar="PATH",
+                   help="Write a JUnit XML report, so CI renders results and "
+                        "regressions as tests")
+    g.add_argument("--sqlite", default="", metavar="PATH",
+                   help="Append this run to a SQLite history database")
+    g.add_argument("--markdown", default="", metavar="PATH",
+                   help="Write a Markdown summary for an issue or PR comment")
+    g.add_argument("--fail-under", type=float, default=None, metavar="SCORE",
+                   help="Exit non-zero when the composite score is below this")
+    g.add_argument("--assert", dest="assert_", action="append", default=[],
+                   metavar="EXPR",
+                   help="Threshold that must hold, e.g. 'disk.read_rate>=500'. "
+                        "Repeatable; a failure exits non-zero")
+
+    g = p.add_argument_group("configuration")
+    g.add_argument("--config", default="", metavar="PATH",
+                   help="Read settings from this TOML/JSON file instead of "
+                        "searching for one")
+    g.add_argument("--no-config", action="store_true",
+                   help="Ignore any pcbench.toml and PCBENCH_* variables")
+    g.add_argument("--init-config", nargs="?", const="pcbench.toml",
+                   default=None, metavar="PATH",
+                   help="Write a commented starter config file and exit")
+    g.add_argument("--list-tests", action="store_true",
+                   help="List every test and profile, then exit")
+
     g = p.add_argument_group("other")
     g.add_argument("--no-native", action="store_true",
                    help="Skip the optional native C engine")
+    g.add_argument("--no-autoscale", action="store_true",
+                   help="Do not shrink test sizes on small or CPU-limited "
+                        "machines")
     g.add_argument("--force", action="store_true",
                    help="Run even when machine state would distort results")
     return p
@@ -213,6 +323,13 @@ def _runners(args, info, disk_dir) -> dict:
             min(s, 0.5), 64, info.get("ram_total_bytes", 0)),
         "compile": lambda: sysbench.bench_compile(max(1, min(r, 3))),
         "latency": lambda: sysbench.bench_latency_suite(),
+        # Application-shaped workloads.
+        "sqlite": lambda: apps_mod.bench_sqlite(s, r),
+        "fsync": lambda: apps_mod.bench_fsync(s, disk_dir),
+        "raytrace": lambda: apps_mod.bench_raytrace(s, r),
+        "image": lambda: apps_mod.bench_image(s, r),
+        "logparse": lambda: apps_mod.bench_logparse(s, r),
+        "video": lambda: apps_mod.bench_video(s, disk_dir),
     }
 
 
@@ -254,13 +371,139 @@ def _check_output_writable(out_dir: str) -> str | None:
     return None
 
 
+def list_tests() -> str:
+    """Human-readable catalogue of tests and profiles."""
+    lines = ["Synthetic tests (one subsystem each):"]
+    for name in SYNTHETIC_TESTS:
+        default = " " if name in DEFAULT_TESTS else "-"
+        lines.append(f"  {default} {name:<14} {DESCRIPTIONS.get(name, '')}")
+    lines.append("")
+    lines.append("Application tests (subsystems mixed as real software does):")
+    for name in APP_TESTS:
+        default = " " if name in DEFAULT_TESTS else "-"
+        lines.append(f"  {default} {name:<14} {DESCRIPTIONS.get(name, '')}")
+    lines.append("")
+    lines.append("  ('-' marks a test excluded from the default run)")
+    lines.append("")
+    lines.append("Profiles (--profile NAME):")
+    for name, tests in PROFILES.items():
+        lines.append(f"    {name:<14} {', '.join(tests)}")
+    return "\n".join(lines)
+
+
+def _autoscale(args, info: dict, confinement: dict, quiet: bool) -> list[str]:
+    """Shrink workload sizes to fit a small or confined machine.
+
+    Defaults sized for a laptop are actively harmful on the machines this tool
+    most needs to work on. A 256 MB disk test on a Raspberry Pi with a 16 GB
+    card is a meaningful fraction of the card; a 64 MB memory test on a 512 MB
+    board pushes it into swap; sixteen workers inside a half-core container all
+    contend for the same slice. Each adjustment is reported, because a silently
+    different workload is a silently incomparable result.
+    """
+    notes: list[str] = []
+    ram = confinement.get("effective_ram_bytes") or info.get("ram_total_bytes") or 0
+    cores = confinement.get("effective_cores") or info.get("cpu_cores_logical") or 1
+    gb = ram / (1024 ** 3) if ram else 0
+
+    if gb and gb < 2:
+        # Sub-2 GB machines: SBCs, minimal cloud instances, tight containers.
+        if args.mem_mb > 16:
+            args.mem_mb = 16
+            notes.append(f"memory test reduced to 16 MB for a "
+                         f"{gb:.1f} GB machine")
+        if args.disk_mb > 64:
+            args.disk_mb = 64
+            notes.append(f"disk test reduced to 64 MB for a "
+                         f"{gb:.1f} GB machine")
+    elif gb and gb < 4:
+        if args.mem_mb > 32:
+            args.mem_mb = 32
+            notes.append(f"memory test reduced to 32 MB for a "
+                         f"{gb:.1f} GB machine")
+        if args.disk_mb > 128:
+            args.disk_mb = 128
+            notes.append(f"disk test reduced to 128 MB for a "
+                         f"{gb:.1f} GB machine")
+
+    if confinement.get("cpu_quota_cores") and cores < (info.get(
+            "cpu_cores_logical") or 1):
+        notes.append(f"multicore tests will use {cores} worker(s) to match "
+                     f"the CPU quota rather than "
+                     f"{info.get('cpu_cores_logical')} host cores")
+
+    if notes and not quiet:
+        for note in notes:
+            print(f"  ~ {note}")
+    return notes
+
+
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.list_tests:
+        print(list_tests())
+        return 0
+
+    if args.init_config is not None:
+        try:
+            path = config_mod.write_sample(args.init_config)
+        except config_mod.ConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        print(f"wrote {path}")
+        return 0
+
+    config_info: dict = {}
+    if not args.no_config:
+        try:
+            config_info = config_mod.apply(args, parser,
+                                           args.config or None)
+        except config_mod.ConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+
+    if args.list_devices:
+        inv = storage_mod.inventory(args.disk_mb)
+        print(_render_devices(inv))
+        return 0
+
     if args.compare:
         path = os.path.join(args.output_dir, "benchmarks.csv")
         print(render_table(load_history(path), all_runs=args.all_runs))
+        return 0
+
+    # Monitor mode replaces the benchmark entirely: it answers "what is this
+    # machine doing right now?", which no benchmark result can.
+    if args.monitor:
+        try:
+            seconds = parse_duration(args.monitor)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        info = inventory()
+        watching = args.json_stdout
+        if not watching:
+            report_mod.hr(f"Live monitor — {seconds:.0f}s "
+                          f"at {args.monitor_interval:g}s intervals")
+        result = monitor_mod.run(seconds, args.monitor_interval, _repo_root(),
+                                 info.get("cpu_model", ""), quiet=watching,
+                                 with_power=args.monitor_power)
+        if args.monitor_trace:
+            try:
+                monitor_mod.save_trace(result, args.monitor_trace)
+            except OSError as e:
+                print(f"  ! could not write trace: {e}", file=sys.stderr)
+        if watching:
+            print(json.dumps({"tool": "pcbench", "mode": "monitor",
+                              "version": __version__, "system": info,
+                              "monitor": result}, indent=2, default=str))
+        else:
+            report_mod.hr("Summary")
+            print(monitor_mod.render(result))
+            if args.monitor_trace:
+                print(f"\n  trace: {args.monitor_trace}")
         return 0
 
     if args.quick:
@@ -278,7 +521,12 @@ def main(argv=None) -> int:
         selected = select_tests(args.only, args.skip)
         sustained_seconds = (parse_duration(args.sustained)
                              if args.sustained else None)
-    except ValueError as e:
+        soak_seconds = parse_duration(args.soak) if args.soak else None
+        # Malformed assertions are caught here rather than after the run: a
+        # typo in a CI gate must not cost ten minutes to discover.
+        for expression in args.assert_:
+            gates_mod.parse(expression)
+    except (ValueError, gates_mod.GateError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
@@ -303,10 +551,29 @@ def main(argv=None) -> int:
     state["battery"] = thermal_mod.battery_health() or None
     warnings = state_warnings(state)
 
+    # What this process is actually allowed to use, which in a container, a
+    # cgroup, or a CI runner is not what the hardware has.
+    confinement = container_mod.detect(info.get("cpu_cores_logical"),
+                                       info.get("ram_total_bytes", 0))
+    confinement_warnings = container_mod.warnings(confinement)
+
     if not quiet:
         report_mod.hr(f"PC Benchmark & Diagnostics v{__version__}")
         print(f"  seconds/test={args.seconds}  repeats={args.repeats}  "
               f"tests={','.join(selected) or 'none'}")
+        if config_info.get("path"):
+            print(f"  config: {config_info['path']} "
+                  f"({len(config_info.get('applied') or {})} setting(s))")
+        for note in confinement_warnings:
+            print(f"  i  {note}")
+
+    autoscale_notes = ([] if args.no_autoscale
+                       else _autoscale(args, info, confinement, quiet))
+
+    # Multicore workloads size themselves to the *effective* core count so a
+    # quota-limited container does not spawn workers that only contend.
+    effective_cores = confinement.get("effective_cores") or info[
+        "cpu_cores_logical"]
 
     # Distorting conditions are worth stopping for: a result taken on battery
     # or under load looks like a hardware difference but is not.
@@ -318,7 +585,10 @@ def main(argv=None) -> int:
         return 3
 
     results: dict = {}
-    runners = _runners(args, info, disk_dir)
+    run_info = dict(info, cpu_cores_logical=effective_cores)
+    if confinement.get("effective_ram_bytes"):
+        run_info["ram_total_bytes"] = confinement["effective_ram_bytes"]
+    runners = _runners(args, run_info, disk_dir)
     for name in selected:
         if not quiet:
             print(f"  running {name} ...", flush=True)
@@ -461,14 +731,45 @@ def main(argv=None) -> int:
         else:
             npu_result = npu_mod.detect()
 
+    # Extra storage devices, benchmarked with the same workload as the main
+    # disk test so the numbers sit side by side.
+    storage_result = None
+    if args.disk_path or args.disk_all:
+        requested = [p.strip() for p in args.disk_path.split(",") if p.strip()]
+        inv = storage_mod.inventory(args.disk_mb)
+        chosen = storage_mod.targets(inv, requested or None, args.disk_all)
+        if chosen:
+            if not quiet:
+                print(f"  benchmarking {len(chosen)} storage device(s) ...",
+                      flush=True)
+            storage_result = storage_mod.run(chosen, min(args.seconds, 3.0),
+                                             max(1, min(args.repeats, 2)),
+                                             args.disk_mb)
+            storage_result["inventory"] = inv
+        else:
+            storage_result = {"devices": [], "inventory": inv,
+                              "note": "no writable local filesystem qualified"}
+
     sustained = None
     if sustained_seconds:
-        workers = args.sustained_workers or info["cpu_cores_logical"]
+        workers = args.sustained_workers or effective_cores
         if not quiet:
             print(f"  running sustained load for {sustained_seconds:.0f}s "
                   f"on {workers} worker(s) ...", flush=True)
         sustained = run_sustained(sustained_seconds, args.sustained_window,
                                   workers, _repo_root())
+
+    # Burn-in. Runs last because it is the longest phase by far and everything
+    # before it should already be recorded if the machine falls over.
+    soak_result = None
+    if soak_seconds:
+        workers = args.soak_workers or effective_cores
+        if not quiet:
+            print(f"  soaking for {soak_seconds:.0f}s on {workers} worker(s) "
+                  f"— press Ctrl-C to stop early and keep the findings ...",
+                  flush=True)
+        soak_result = soak_mod.run(soak_seconds, workers,
+                                   script_dir=_repo_root(), quiet=quiet)
 
     scores = compute_scores(results)
     if plugin_results:
@@ -510,11 +811,21 @@ def main(argv=None) -> int:
         "power": power_info,
         "perf_per_watt": ppw,
         "sustained": sustained,
+        "soak": soak_result,
+        "storage": storage_result,
+        "confinement": confinement,
+        "confinement_warnings": confinement_warnings,
+        "autoscale": autoscale_notes,
+        "config_file": config_info or None,
         "scores": scores,
         "bottleneck": diagnose.analyse(scores),
         "plugins": plugin_results,
         "health": health_result,
     }
+    # Placing the machine and checking it against its own single-core anchor
+    # needs the finished scores, so it happens after the payload is assembled.
+    payload["reference"] = reference.assess(payload)
+    payload["subsystem_checks"] = reference.subsystem_checks(results)
 
     # Regression check against this machine's own history.
     if not args.no_regression:
@@ -523,10 +834,20 @@ def main(argv=None) -> int:
         payload["regression"] = regression.analyze(
             current_row, history, args.regression_threshold / 100.0)
 
+    # Threshold gates. Evaluated before output so their verdicts can be
+    # embedded in the payload, the JUnit report, and the terminal summary.
+    gate_results = gates_mod.evaluate(payload, list(args.assert_),
+                                      args.fail_under)
+    if gate_results:
+        payload["gates"] = gate_results
+
     if args.json_stdout:
         print(json.dumps(payload, indent=2, default=str))
     else:
         report_mod.print_report(payload)
+        if gate_results:
+            report_mod.hr("Thresholds")
+            print(gates_mod.render(gate_results))
 
     if not args.no_save:
         try:
@@ -547,10 +868,61 @@ def main(argv=None) -> int:
         except OSError as e:
             print(f"  ! could not save results: {e}", file=sys.stderr)
 
+    # Integration exports are written even with --no-save: their whole purpose
+    # is to feed another system, and "do not litter the results directory" is
+    # not a reason to withhold a file the user named explicitly.
+    for label, path, writer in (
+            ("PROM", args.prometheus, export_mod.save_prometheus),
+            ("SQLITE", args.sqlite, export_mod.save_sqlite),
+            ("MD", args.markdown, export_mod.save_markdown)):
+        if not path:
+            continue
+        try:
+            writer(payload, path)
+            if not quiet:
+                print(f"  {label}: {path}")
+        except Exception as e:
+            # An export failing must never discard a finished benchmark: the
+            # results are already printed and saved by this point.
+            print(f"  ! could not write {path}: {e}", file=sys.stderr)
+    if args.junit:
+        try:
+            export_mod.save_junit(payload, args.junit, gate_results)
+            if not quiet:
+                print(f"  JUNIT: {args.junit}")
+        except OSError as e:
+            print(f"  ! could not write {args.junit}: {e}", file=sys.stderr)
+
+    # Exit codes, most severe first, so a caller checking `$?` gets the worst
+    # thing that happened rather than the last.
     if any(isinstance(v, dict) and v.get("validation_failed")
            for v in results.values()):
         return 4
+    if soak_result and soak_result.get("errors"):
+        return 7
+    if gates_mod.failed(gate_results):
+        return 6
     return 0
+
+
+def _render_devices(inv: dict) -> str:
+    """Table of mounted storage and whether each can be benchmarked."""
+    devices = inv.get("devices", [])
+    if not devices:
+        return "  no mounted filesystems could be enumerated"
+    lines = [f"  {'MOUNT':<28} {'KIND':<22} {'FREE':>9}  STATUS"]
+    lines.append("  " + "-" * 76)
+    for d in devices:
+        free = d.get("free_bytes")
+        free_text = f"{free / (1024 ** 3):.1f} GB" if free else "?"
+        status = ("benchmarkable" if d["benchmarkable"]
+                  else f"skip: {d.get('skip_reason', 'unavailable')}")
+        lines.append(f"  {d['mount'][:28]:<28} {(d.get('kind') or '?')[:22]:<22} "
+                     f"{free_text:>9}  {status}")
+    lines.append("")
+    lines.append(f"  {inv.get('benchmarkable_count', 0)} device(s) can be "
+                 f"benchmarked. Use --disk-all, or --disk-path MOUNT[,MOUNT].")
+    return "\n".join(lines)
 
 
 def _repo_root() -> str:

@@ -17,13 +17,18 @@ Python-PC-Benchmarks-/
 │   ├── core.py         # timing, statistics, warm-up, validation
 │   ├── limits.py       # hardware-safety caps (memory/disk/wear/thermal)
 │   ├── optional.py     # registry of optional packages, grouped in tiers
+│   ├── config.py       # config files (TOML/JSON) and PCBENCH_* variables
 │   ├── cli.py          # argument parsing and run orchestration
 │   │   ── inventory and state ──
 │   ├── system.py       # hardware inventory, CPU features, machine state
 │   ├── thermal.py      # temperatures in Celsius, fans, battery health
 │   ├── power.py        # power draw + perf-per-watt
+│   ├── container.py    # container / cgroup / cloud / CI confinement
+│   ├── storage.py      # mount enumeration, device classification
+│   ├── monitor.py      # live telemetry mode (no benchmarking)
 │   │   ── stdlib benchmarks ──
 │   ├── workloads.py    # cpu, memory, disk (queue depth), real-world
+│   ├── apps.py         # application-shaped: sqlite, fsync, raytrace, video
 │   ├── mlbench.py      # pure-Python ML: NN training, k-means, k-NN
 │   ├── cores.py        # per-core scaling analysis and hybrid detection
 │   ├── sysbench.py     # compile benchmark, OS latency, CPU frequency
@@ -33,6 +38,7 @@ Python-PC-Benchmarks-/
 │   ├── diagnose.py     # bottleneck analysis, spec sheet
 │   ├── plugins.py      # discover and run user benchmarks
 │   ├── sustained.py    # thermal / sustained-load mode
+│   ├── soak.py         # long-duration burn-in with error accounting
 │   │   ── optional-package benchmarks ──
 │   ├── numeric.py      # BLAS matmul, FFT, LAPACK (numpy, scipy)
 │   ├── cryptobench.py  # AES-GCM, Zstandard, LZ4, BLAKE3
@@ -48,9 +54,12 @@ Python-PC-Benchmarks-/
 │   ├── scoring.py      # baselines, subscores, composite
 │   ├── report.py       # console / JSON / CSV / HTML output
 │   ├── compare.py      # cross-device ranking from CSV history
+│   ├── reference.py    # performance classes and the balance check
+│   ├── gates.py        # pass/fail thresholds for CI and monitoring
+│   ├── export.py       # Prometheus, JUnit XML, SQLite, Markdown
 │   └── regression.py   # run-over-run regression detection
 ├── plugins/            # drop-in user benchmarks (auto-discovered)
-├── tests/              # 238 stdlib unittest cases
+├── tests/              # 324 stdlib unittest cases
 └── docs/
 ```
 
@@ -202,11 +211,17 @@ measures two things Python cannot express meaningfully:
 
 ```
 parse_args()
-   ├─ --compare?  → render CSV history and exit
-   ├─ --quick presets, validate --only/--skip, parse --sustained duration
+   ├─ --list-tests / --init-config / --list-devices / --compare → print, exit 0
+   ├─ config.apply()   config file + PCBENCH_* (command line still wins)
+   ├─ --monitor?  → telemetry session, summary, exit 0 (no benchmarking)
+   ├─ --quick presets, validate --only/--skip/--assert, parse durations
+   │      malformed assertions fail here, not after ten minutes of work
    │
 inventory() + machine_state() + state_warnings()
    └─ warnings and not --force  → print and exit 3
+container.detect()      cgroup quota / affinity / memory cap / cloud / CI
+   └─ workloads sized to *effective* cores and RAM, not the host's
+_autoscale()            shrink test sizes on small machines (unless disabled)
    │
 for each selected test:
      runners[name]()
@@ -217,11 +232,16 @@ native.run()            unless --no-native
 accel.inventory()       always (cheap)
 accel.run()             Apple only, unless --no-accel/--no-gpu/--no-npu
    └─ headline GPU/NPU rates folded into `results` so they score normally
+storage.run()           if --disk-all / --disk-path
 run_sustained()         if --sustained
+soak.run()              if --soak   (last: longest phase, exit 7 on errors)
 compute_scores()        normalize vs BASELINES, geometric mean
+reference.assess()      performance class + balance vs the single-core anchor
+gates.evaluate()        --fail-under / --assert   (exit 6 on failure)
    │
 build payload  →  console report | --json-stdout
-   └─ save_json() · append_csv() · save_html()
+   ├─ save_json() · append_csv() · save_html() · save_spec_sheet()
+   └─ save_prometheus() · save_junit() · save_sqlite() · save_markdown()
 ```
 
 ## Data model
@@ -241,6 +261,11 @@ One `payload` dict per run, written verbatim to JSON:
   "accelerators": { "gpus": [...], "npus": [...], "benchmark_supported": true },
   "accel":     { "results": [...], "gpu": {...}, "ane": {...} },
   "sustained": { "peak_rate": ..., "droop_percent": 13.4, ... },
+  "soak":      { "units_completed": 1.2e7, "errors": 0, "verdict": "STABLE ..." },
+  "storage":   { "devices": [ { "mount": "/mnt/data", "disk": {...} } ] },
+  "confinement": { "container": "Docker", "cpu_quota_cores": 2.0, ... },
+  "reference": { "class": "workstation", "flag": "balanced", ... },
+  "gates":     [ { "name": "composite>=250", "passed": true, ... } ],
   "scores":    { "subscores": {...}, "composite": 349.0 }
 }
 ```

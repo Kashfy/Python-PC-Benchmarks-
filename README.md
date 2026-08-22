@@ -237,6 +237,231 @@ python3 benchmark.py --compare
   rpi5 (Raspberry Pi 5)                   88    900,000   3,400,000       310        95    6,100   (14% of best)
 ```
 
+## Application workloads — "will this machine be good at my job?"
+
+The synthetic tests isolate one subsystem each, which is right for diagnosis
+and wrong for deciding whether a machine suits a task. Real software mixes
+subsystems in ratios no single synthetic test reproduces, so six workloads
+model the shapes real software actually has:
+
+| Test | Unit | Models | Why it is different from the synthetic tests |
+|------|------|--------|---------------------------------------------|
+| `sqlite` | txn/s | Databases, API request handlers | B-tree pointer chasing and index scans; cache-latency bound, indifferent to peak bandwidth |
+| `fsync` | commits/s | Database durability | Time for one flush that actually reaches the medium — the hard ceiling on write throughput |
+| `raytrace` | frames/s | Rendering, physics, simulation | Branchy scalar float math on a cache-resident working set |
+| `image` | MP/s | Image and video filters | Strided 2-D access that punishes a small L2 specifically |
+| `logparse` | MB/s | ETL, log ingestion, build output | Linear byte scan through a backtracking regex |
+| `video` | fps | Media production | Software H.264; the workload that finds inadequate cooling first |
+
+Every one validates its own output — a renderer producing the wrong pixel or a
+database returning the wrong row count reports a hardware fault, not a fast
+result.
+
+Three notes on how these are measured:
+
+- **`fsync` is measured but never scored.** macOS needs `F_FULLFSYNC` to reach
+  the medium where Linux's `fsync` suffices, and the two differ by two orders
+  of magnitude on identical hardware. Scoring it would measure the operating
+  system's flush semantics rather than the drive. It is reported because it is
+  the single most useful storage diagnostic there is — and a result above
+  100,000 commits/s is flagged, because that means the drive is acknowledging
+  flushes it has not performed.
+- **`video` calibrates itself.** A fixed frame count cannot serve both ends of
+  the hardware range: 300 frames is under a second on a modern desktop and
+  several minutes on a single-board computer. A short probe encode measures the
+  machine, then the real encode is sized from it.
+- **`video` needs `ffmpeg` on `PATH`** and is excluded from the default run.
+  Ask for it with `--only video` or `--profile media`.
+
+## Containers, cloud, and CI
+
+A benchmark inside a container measures the slice the scheduler hands out, not
+the hardware underneath — and the two differ by an order of magnitude. A cgroup
+`cpu.max` of half a core leaves `os.cpu_count()` still reporting 16, so a naive
+multicore test spawns 16 workers that fight over 0.5 cores and produce a number
+that looks like catastrophic hardware failure.
+
+Every run detects and reports:
+
+- **Container runtime** — Docker, Podman, Kubernetes, LXC, containerd
+- **cgroup limits** — CPU quota (v1 and v2), CPU affinity/cpuset, memory cap
+- **Cloud provider** — from local DMI strings only; no metadata endpoint is
+  ever contacted, because a diagnostics tool has no business phoning a third
+  party on every run
+- **CI system** — GitHub Actions, GitLab, CircleCI, Jenkins, Buildkite, and others
+
+Workloads are then sized to the **effective** resources rather than the host's,
+and the context is recorded in the CSV so a container run and a bare-metal run
+never get compared as though they were the same machine.
+
+The same machinery auto-scales for small hardware: under 4 GB of RAM the memory
+and disk tests shrink so a Raspberry Pi or a minimal cloud instance is not
+pushed into swap. Every adjustment is printed, because a silently different
+workload is a silently incomparable result. Disable with `--no-autoscale`.
+
+## Live monitoring — "why is my computer slow *right now*?"
+
+Half of what people want from a benchmark tool is not a score. Monitor mode
+samples the things that explain performance and names the cause:
+
+```bash
+pcbench --monitor 60s --monitor-trace slow.csv
+```
+
+```
+    time     MHz     °C   CPU%   mem%   load
+  ------------------------------------------
+     0.0    4210   51.8     12     78   2.90
+     1.1    4180   52.1     31     79   2.90
+     ...
+
+  CPU clock (MHz)    min    1400  mean  3120  max   4210  ██▇▆▄▂▁▁
+  CPU temp (°C)      min    51.8  mean  84.2  max   97.6  ▁▃▅▆▇███
+
+  - clock speed varied by 67% while peaking at 98 °C — thermal throttling;
+    check airflow, dust, and thermal paste
+```
+
+The distinction it draws is the one that decides what you actually do: clocks
+collapsing **with the chip hot** is thermal throttling and needs cooling;
+clocks collapsing **while it stays cool** is a power or current limit and is
+fixable in settings.
+
+## Stability soak (burn-in)
+
+A benchmark asks "how fast?". A soak asks "for how long, without getting
+anything wrong?" — different questions with different answers. Hardware that
+posts an excellent score can still corrupt data: an overclock stable for three
+seconds routinely produces a wrong answer somewhere in the next three hours.
+
+```bash
+pcbench --soak 4h
+```
+
+Every core runs self-validating work — modular exponentiation checked against
+Fermat's little theorem, compression round-trips, SHA-256, and walking memory
+patterns — for as long as you ask. Errors are **counted**, not stopped at, and
+timestamped, because time-to-first-error is what distinguishes a machine that
+fails after four hours from one that fails after four minutes. Ctrl-C keeps
+every finding so far. Wrong answers exit `7`.
+
+## Storage: every device, not just the one you are standing on
+
+Most machines have more than one drive, and the interesting one is rarely the
+one the tool happens to be running from.
+
+```bash
+pcbench --list-devices          # what is mounted and what can be tested
+pcbench --disk-all              # benchmark every writable local filesystem
+pcbench --disk-path /mnt/data,/mnt/scratch
+```
+
+Mounts that would produce meaningless numbers or cause harm are refused with a
+reason: tmpfs/ramfs (measures RAM and consumes it), network filesystems
+(measures the network), read-only media, and anything without enough free
+headroom. An explicitly named path always overrides the heuristics — you may
+know something they do not.
+
+Rotational media is detected on Linux, because a random-read figure that is
+alarming on an SSD is completely normal on a hard disk, and without that the
+diagnosis would be wrong.
+
+## CI, monitoring, and fleets
+
+**Thresholds.** Regression detection compares against this machine's own
+history, which cannot answer acceptance ("every machine we deploy must reach
+250") or fleet health ("alert when any node's disk drops below 500 MB/s" — no
+history needed). Assertions read the way a person would say them:
+
+```bash
+pcbench --fail-under 250 \
+        --assert 'disk.read_rate>=500' \
+        --assert 'sustained.droop_pct<=15'
+```
+
+A bare name resolves to the **score** (baseline = 100); `name.rate` resolves to
+the raw figure. Every verdict says which it used, so a gate never passes or
+fails for a reason you cannot see. A metric that was not measured **fails** —
+treating "not measured" as "threshold met" is how acceptance checks quietly
+stop checking anything. Failures exit `6`.
+
+**Exports.** JSON and CSV cover a human looking back at a run; these cover the
+systems results need to arrive in:
+
+```bash
+pcbench --prometheus /var/lib/node_exporter/textfile_collector/pcbench.prom \
+        --junit results/junit.xml \
+        --sqlite results/history.db \
+        --markdown results/summary.md
+```
+
+- **Prometheus** — machine identity goes in labels, not metric names, so a
+  fleet aggregates cleanly and `min by (host)` works. Written atomically, since
+  a collector will happily read a half-finished file.
+- **JUnit XML** — benchmarks, detected regressions, and failed gates all become
+  test cases, so performance problems appear in the same tab as failing unit
+  tests instead of buried in job logs.
+- **SQLite** — extracted columns for the fast queries, plus the whole payload,
+  so a question nobody anticipated is still answerable years later.
+- **Markdown** — for pasting into an issue or PR comment.
+
+## Configuration files
+
+A benchmark is only comparable to another benchmark run the same way, and
+nothing in the output reveals that two people typed slightly different flags.
+A config file makes the run definition a file that gets committed and copied to
+every machine:
+
+```bash
+pcbench --init-config          # writes a commented pcbench.toml
+```
+
+```toml
+[run]
+seconds = 5
+repeats = 5
+profile = "server"
+
+[output]
+prometheus = "/var/lib/node_exporter/textfile_collector/pcbench.prom"
+
+[gates]
+fail_under = 250
+assertions = ["disk.read_rate>=500", "sustained.droop_pct<=20"]
+```
+
+Precedence is command line > `PCBENCH_*` environment > config file > defaults —
+increasing specificity. The file is found by walking up from the working
+directory, so a repository-level config applies to every run inside it.
+
+## Performance class — interpreting a single run
+
+The composite is relative to a fixed baseline, which makes runs comparable to
+each other and tells a first-time user nothing. So every run is also placed:
+
+```
+  Class      : workstation
+               Serious multi-core throughput. Suited to large builds,
+               simulation, video work, and running several VMs at once.
+  Balance    : ~416 expected (range 187–1041) from a single-core score of 316
+               across 10 physical / 10 logical cores
+  Assessment : composite 443, balanced against this machine's own cores.
+```
+
+The balance check is anchored on the machine's **own measured single-core
+performance**, not on its CPU name. An earlier design predicted the score from
+architecture and core count; that cannot work, because "ARM64" covers both an
+Apple M-series chip and a Raspberry Pi, whose per-core throughput differs by
+more than 10x — and any such model flags every single-board computer as broken.
+Anchoring on measured silicon makes the question answerable: given how fast one
+core of *this* chip is, do the other subsystems keep up? A composite far below
+the anchor means a specific subsystem is dragging, and the check holds equally
+on a Pi and on a 96-core server.
+
+Absolute floors are checked separately, where a figure is implausible rather
+than merely slow — sequential reads under 80 MB/s, random reads under 200 IOPS,
+memory bandwidth under 800 MB/s — each with what it usually means.
+
 ## Options
 
 | Flag | Default | Meaning |
@@ -244,7 +469,7 @@ python3 benchmark.py --compare
 | `--seconds N` | `3.0` | Duration per test, per repeat |
 | `--repeats M` | `3` | Repeats per test (median reported) |
 | `--only a,b` | all | Subset of tests (see below) |
-| `--profile NAME` | — | Preset selection: `quick`, `cpu`, `ai`, `dev`, `storage`, `laptop`, `server` |
+| `--profile NAME` | — | Preset selection: `quick`, `tiny`, `cpu`, `ai`, `dev`, `storage`, `laptop`, `server`, `apps`, `database`, `media`, `workstation`, `ci` |
 | `--skip a,b` | none | Exclude tests |
 | `--quick` | off | Fast pass (1s × 2 repeats) |
 | `--disk-mb K` | `256` | Disk test file size |
@@ -270,10 +495,52 @@ python3 benchmark.py --compare
 | `--no-regression` | off | Skip run-over-run regression detection |
 | `--regression-threshold P` | `10` | Percent change that counts as a regression |
 | `--force` | off | Run despite distorting machine state |
+| `--no-autoscale` | off | Do not shrink test sizes on small or CPU-limited machines |
+| `--list-tests` | — | List every test and profile, then exit |
 
-Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
-`memory`, `mem_scaling`, `cache_sweep`, `disk`, `nn_training`, `kmeans`,
-`knn`, `cores`, `compile`, `latency`.
+**Storage devices**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--list-devices` | — | List mounted storage and whether each can be benchmarked |
+| `--disk-all` | off | Benchmark every writable local filesystem |
+| `--disk-path P[,P]` | — | Benchmark specific mount points |
+
+**Stability & monitoring**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--soak D` | off | Burn-in: run validating work for `D` and count wrong answers |
+| `--soak-workers N` | all cores | Load processes for the soak |
+| `--monitor D` | off | Watch clocks, temperature, load, memory for `D` instead of benchmarking |
+| `--monitor-interval N` | `1.0` | Seconds between monitor samples |
+| `--monitor-power` | off | Also sample power draw while monitoring |
+| `--monitor-trace P` | — | Write raw monitor samples to a CSV |
+
+**Integration / CI**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--prometheus P` | — | Write Prometheus exposition text (node_exporter textfile collector) |
+| `--junit P` | — | Write a JUnit XML report |
+| `--sqlite P` | — | Append the run to a SQLite history database |
+| `--markdown P` | — | Write a Markdown summary for an issue or PR |
+| `--fail-under N` | — | Exit non-zero when the composite is below `N` |
+| `--assert EXPR` | — | Threshold that must hold, e.g. `disk.read_rate>=500`; repeatable |
+
+**Configuration**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--config P` | auto | Read settings from this TOML/JSON file |
+| `--no-config` | off | Ignore `pcbench.toml` and `PCBENCH_*` variables |
+| `--init-config [P]` | — | Write a commented starter config and exit |
+
+Run `pcbench --list-tests` for the full catalogue. Synthetic tests: `cpu_int`,
+`cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`, `memory`,
+`mem_scaling`, `cache_sweep`, `disk`, `nn_training`, `kmeans`, `knn`, `cores`,
+`compile`, `latency`. Application tests: `sqlite`, `fsync`, `raytrace`,
+`image`, `logparse`, `video`.
 
 ## What each test measures
 
@@ -295,6 +562,12 @@ Tests: `cpu_int`, `cpu_float`, `cpu_multi`, `compression`, `hashing`, `json`,
 | Neural net training | steps/s | **Real** MLP forward + backprop + SGD, pure Python |
 | K-means clustering | distances/s | Lloyd's algorithm — the canonical unsupervised workload |
 | K-NN search | comparisons/s | Brute-force similarity search (vector-DB style) |
+| Database (SQLite) | txn/s | Real storage-engine OLTP: index scans, aggregates, updates |
+| Durable commits | commits/s | One flush that reaches the medium — the ceiling on DB writes |
+| Ray tracing | frames/s | Branchy scalar float math, cache-resident working set |
+| Image blur | MP/s | Strided 2-D access — separates a large L2 from a small one |
+| Log parsing | MB/s | Linear byte scan through a backtracking regex |
+| Video encode | fps | Software H.264 — sustained all-core vector load (needs ffmpeg) |
 
 ### Machine-learning workloads, with no framework required
 
@@ -466,6 +739,9 @@ latency**, which maps the cache hierarchy precisely:
 | `2` | Invalid arguments |
 | `3` | Refused: machine state would distort results (use `--force`) |
 | `4` | **Validation failure — hardware may be unstable** |
+| `5` | Results directory is not writable |
+| `6` | A `--fail-under` / `--assert` threshold was not met |
+| `7` | **Soak test produced wrong answers — hardware is unstable** |
 
 ## Native engine
 
@@ -485,7 +761,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-238 tests, standard library only (they run with or without the optional tiers).
+324 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 
@@ -504,3 +780,5 @@ Full reference docs in [`docs/`](docs/README.md):
 
 - **Python 3.8+** (standard library only; `psutil` optional for richer detection)
 - A C compiler is **optional** — only for the native engine
+- `ffmpeg` on `PATH` is **optional** — only for the `video` encode benchmark
+- TOML config files need Python 3.11+; JSON config works on every version

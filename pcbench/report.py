@@ -625,9 +625,116 @@ def print_scores(scores: dict) -> None:
     print(f"  {'COMPOSITE':<16}: {scores['composite']:>9.1f}")
 
 
+def print_apps(results: dict) -> None:
+    """Application-shaped results.
+
+    Kept in their own section rather than folded into the subsystem groups: the
+    point of these numbers is that they are *not* attributable to one
+    subsystem, and grouping them under "CPU" or "disk" would undo that.
+    """
+    keys = ("sqlite", "raytrace", "image", "logparse", "video", "fsync")
+    if not any(isinstance(results.get(k), dict) for k in keys):
+        return
+    hr("Application workloads")
+    _metric(results, "sqlite", "Database (SQLite OLTP)", "txn/s")
+    _metric(results, "raytrace", "Rendering (ray tracer)", "frames/s")
+    _metric(results, "image", "Image processing (blur)", "MP/s")
+    _metric(results, "logparse", "Log parsing (regex)", "MB/s")
+
+    video = results.get("video")
+    if isinstance(video, dict):
+        if video.get("skipped"):
+            _row("Video encode", "skipped", f"  {video.get('reason', '')}")
+        else:
+            _row("Video encode (H.264)", fmt(video.get("rate")),
+                 f" fps  ({video.get('codec', '')})")
+
+    fsync = results.get("fsync")
+    if isinstance(fsync, dict) and not fsync.get("skipped"):
+        _row("Durable commits", fmt(fsync.get("rate")),
+             f" /s  ({fsync.get('median_us', 0):.0f} µs median, "
+             f"{fsync.get('p99_us', 0):.0f} µs p99, "
+             f"{fsync.get('mechanism', 'fsync')})")
+        if fsync.get("caution"):
+            print(f"      ! {fsync['caution']}")
+
+
+def print_confinement(info: dict | None, notes: list | None) -> None:
+    """Container, cgroup, cloud, and CI context.
+
+    Printed even when nothing is confined, because "bare metal, nothing
+    limiting this run" is itself the fact that makes the rest of the report
+    comparable to another machine's.
+    """
+    if not info:
+        return
+    interesting = [(k, info.get(k)) for k in
+                   ("container", "cloud", "ci") if info.get(k)]
+    if not interesting and not info.get("constrained"):
+        return
+    hr("Execution environment")
+    for key, value in interesting:
+        _kv({"container": "Container", "cloud": "Cloud",
+             "ci": "CI system"}[key], value)
+    if info.get("cpu_quota_cores"):
+        _kv("CPU quota", f"{info['cpu_quota_cores']:g} core(s) of "
+                         f"{info.get('host_cores')} on the host")
+    if info.get("cpu_affinity_cores"):
+        _kv("CPU affinity", f"{info['cpu_affinity_cores']} core(s)")
+    if info.get("memory_limit_bytes"):
+        _kv("Memory limit",
+            f"{info['memory_limit_bytes'] / (1024 ** 3):.1f} GB")
+    _kv("Benchmarked with", f"{info.get('effective_cores')} core(s)")
+    for note in notes or []:
+        print(f"      i {note}")
+
+
+def print_reference(assessment: dict | None, checks: list | None) -> None:
+    """Performance class and the balance check against the machine's own cores."""
+    if not assessment or not assessment.get("class"):
+        return
+    hr("Performance class")
+    from . import reference as reference_mod
+    print(reference_mod.render(assessment, checks))
+
+
+def print_storage(result: dict | None) -> None:
+    """Per-device storage results, when extra devices were benchmarked."""
+    if not result or not result.get("devices"):
+        return
+    hr("Storage devices")
+    for entry in result["devices"]:
+        label = f"{entry['mount']} ({entry.get('kind') or '?'})"
+        if entry.get("skipped"):
+            _row(label, "skipped", f"  {entry.get('reason', '')}")
+            continue
+        disk = entry.get("disk") or {}
+        _row(label, "", "")
+        _row("  read", fmt(disk.get("read_rate")), " MB/s")
+        _row("  write", fmt(disk.get("write_rate")), " MB/s")
+        if disk.get("random_read_iops"):
+            _row("  random read", fmt(disk.get("random_read_iops")), " IOPS")
+        fsync = entry.get("fsync") or {}
+        if fsync.get("rate"):
+            _row("  durable commits", fmt(fsync.get("rate")),
+                 f" /s  ({fsync.get('median_us', 0):.0f} µs)")
+
+
+def print_soak(result: dict | None) -> None:
+    """Burn-in verdict. The headline is stability, not speed."""
+    if not result:
+        return
+    hr("Stability soak")
+    from . import soak as soak_mod
+    print(soak_mod.render(result))
+
+
 def print_report(payload: dict) -> None:
     print_system(payload["system"], payload["state"], payload["warnings"])
+    print_confinement(payload.get("confinement"),
+                      payload.get("confinement_warnings"))
     print_results(payload["results"])
+    print_apps(payload["results"])
     print_native(payload.get("native"))
     print_accelerators(payload.get("accelerators"), payload.get("accel"))
     print_numeric(payload.get("numeric"))
@@ -640,8 +747,12 @@ def print_report(payload: dict) -> None:
     print_plugins(payload.get("plugins"))
     print_health(payload.get("health"))
     print_power(payload.get("power"), payload.get("perf_per_watt"))
+    print_storage(payload.get("storage"))
     print_sustained(payload.get("sustained"))
+    print_soak(payload.get("soak"))
     print_scores(payload["scores"])
+    print_reference(payload.get("reference"),
+                    payload.get("subsystem_checks"))
     print_bottleneck(payload.get("bottleneck"))
     print_regression(payload.get("regression"))
     _print_validation(payload["results"])
@@ -685,10 +796,14 @@ CSV_FIELDS = [
     "ml_train_samples_s", "ml_infer_samples_s",
     "npu_onnx_gflops", "npu_onnx_device",
     "nn_train_steps_s", "kmeans_dist_s", "knn_cmp_s",
+    "sqlite_txn_s", "fsync_commits_s", "fsync_median_us", "raytrace_fps",
+    "image_mp_s", "logparse_mb_s", "video_fps",
     "net_loopback_mb_s", "power_watts", "power_estimated", "score_per_watt",
     "cpu_celsius", "battery_health_pct", "battery_cycles",
     "sustained_temp_peak_c", "sustained_temp_rise_c",
-    "sustained_droop_pct", "composite_score",
+    "sustained_droop_pct",
+    "container", "cloud", "ci", "effective_cores", "soak_errors",
+    "composite_score",
 ]
 
 
@@ -760,6 +875,15 @@ def flatten_row(payload: dict) -> dict:
         "nn_train_steps_s": _rate(results, "nn_training"),
         "kmeans_dist_s": _rate(results, "kmeans"),
         "knn_cmp_s": _rate(results, "knn"),
+        # Application workloads: recorded alongside the synthetic ones so
+        # regression detection covers them too.
+        "sqlite_txn_s": _rate(results, "sqlite"),
+        "fsync_commits_s": _rate(results, "fsync"),
+        "fsync_median_us": _rate(results, "fsync", "median_us"),
+        "raytrace_fps": _rate(results, "raytrace"),
+        "image_mp_s": _rate(results, "image"),
+        "logparse_mb_s": _rate(results, "logparse"),
+        "video_fps": _rate(results, "video"),
         "net_loopback_mb_s": round(
             (payload.get("network") or {}).get("loopback_mb_s", 0) or 0, 1),
         "power_watts": power.get("package_w") or "",
@@ -773,6 +897,15 @@ def flatten_row(payload: dict) -> dict:
         "sustained_temp_peak_c": sus.get("temp_peak_celsius", ""),
         "sustained_temp_rise_c": sus.get("temp_rise_celsius", ""),
         "sustained_droop_pct": sus.get("droop_percent", ""),
+        # Execution context: without it, a container run and a bare-metal run
+        # look identical in the history file and get compared as though they
+        # were the same machine.
+        "container": (payload.get("confinement") or {}).get("container") or "",
+        "cloud": (payload.get("confinement") or {}).get("cloud") or "",
+        "ci": (payload.get("confinement") or {}).get("ci") or "",
+        "effective_cores": (payload.get("confinement") or {})
+                           .get("effective_cores", ""),
+        "soak_errors": (payload.get("soak") or {}).get("errors", ""),
         "composite_score": payload["scores"]["composite"],
     }
 

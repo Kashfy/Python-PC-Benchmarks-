@@ -253,11 +253,63 @@ Apple-only (Metal + Core ML); see
 
 For real measured power on macOS, run the whole tool with `sudo`.
 
+### Storage devices
+
+| Flag | Description |
+|------|-------------|
+| `--list-devices` | List mounts and whether each can be benchmarked, then exit |
+| `--disk-all` | Benchmark every writable local filesystem |
+| `--disk-path P[,P]` | Benchmark named mount points (overrides the safety heuristics) |
+
+### Stability and monitoring
+
+| Flag | Description |
+|------|-------------|
+| `--soak D` | Burn-in for `D`; counts wrong answers instead of stopping at the first |
+| `--soak-workers N` | Load processes for the soak (0 = all cores) |
+| `--monitor D` | Live telemetry for `D` instead of benchmarking |
+| `--monitor-interval N` | Seconds between monitor samples |
+| `--monitor-power` | Also sample power draw (a privileged subprocess per sample on macOS) |
+| `--monitor-trace P` | Write raw monitor samples to CSV |
+
+### Integration and CI
+
+| Flag | Description |
+|------|-------------|
+| `--prometheus P` | Prometheus exposition text, written atomically |
+| `--junit P` | JUnit XML: benchmarks, regressions, and gates as test cases |
+| `--sqlite P` | Append the run to a SQLite history database |
+| `--markdown P` | Markdown summary for an issue or PR comment |
+| `--fail-under N` | Exit 6 when the composite is below `N` |
+| `--assert EXPR` | Threshold that must hold; repeatable. Exit 6 on failure |
+
+Assertion syntax is `NAME OP VALUE` with `>=`, `<=`, `>`, `<`, `==`, `!=`.
+A bare `NAME` resolves to the **score** (baseline = 100); `NAME.field` resolves
+to the raw payload value (`disk.read_rate`, `sqlite.rate`,
+`sustained.droop_pct`). `category.cpu` addresses a rollup. Every verdict states
+which source it used. A metric that was not measured **fails** rather than
+passing silently.
+
+### Configuration
+
+| Flag | Description |
+|------|-------------|
+| `--config P` | Read settings from this TOML/JSON file |
+| `--no-config` | Ignore `pcbench.toml` and `PCBENCH_*` variables |
+| `--init-config [P]` | Write a commented starter config and exit |
+| `--list-tests` | List every test and profile, then exit |
+
+Config files are found by walking up from the working directory
+(`pcbench.toml`, `.pcbench.toml`, `pcbench.json`, `.pcbench.json`). TOML needs
+Python 3.11+; JSON works everywhere. Precedence is command line > `PCBENCH_*`
+environment > config file > defaults.
+
 ### Other
 
 | Flag | Description |
 |------|-------------|
 | `--no-native` | Skip the C engine |
+| `--no-autoscale` | Do not shrink test sizes on small or CPU-limited machines |
 | `--force` | Run despite distorting machine state |
 | `--version` | Print version |
 
@@ -271,11 +323,15 @@ The native engine separately accepts `--json`, `--seconds`, `--repeats`,
 | `0` | Success |
 | `2` | Invalid arguments |
 | `3` | Refused — machine state would distort results |
-| `5` | Output directory not writable (often root-owned after a `sudo` run) |
 | `4` | Validation failure — hardware may be unstable |
+| `5` | Output directory not writable (often root-owned after a `sudo` run) |
+| `6` | A `--fail-under` / `--assert` threshold was not met |
+| `7` | Soak test produced wrong answers — hardware is unstable |
 
-Codes 3 and 4 are designed for scripting: a CI job or fleet sweep can treat
-them distinctly from a normal failure.
+Codes 3, 4, 6, and 7 are designed for scripting: a CI job or fleet sweep can
+treat each distinctly from a normal failure. When several apply, the most
+severe is returned — 4 (a wrong answer during the benchmark) outranks 7
+(a wrong answer during the soak), which outranks 6 (merely too slow).
 
 ## Output artifacts
 
@@ -286,6 +342,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 | `benchmark_<host>_<timestamp>.json` | Full payload for one run |
 | `benchmarks.csv` | One row per run, for comparison |
 | `report_<host>_<timestamp>.html` | Self-contained report (`--html`) |
+| `spec_<host>_<timestamp>.md` | One-page spec sheet (`--spec-sheet`) |
 | `benchmarks.csv.v2.bak` | Auto-archived history from an older schema |
 | `ane_model.mlmodel` | Generated Neural Engine benchmark model (regenerated as needed) |
 
@@ -295,7 +352,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-238 cases, standard library only — no pytest, no test dependencies.
+324 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

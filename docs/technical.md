@@ -43,6 +43,65 @@ variance.
 | **Memory** | MB/s | Sustained copy bandwidth (`memmove`) |
 | **Cache sweep** | MB/s | Bandwidth vs. working-set size |
 | **Disk** | MB/s + IOPS | Sequential write/read and 4 KiB random reads |
+| **Database (SQLite)** | txn/s | Storage-engine OLTP: index scan, aggregate, update |
+| **Durable commits** | commits/s | One flush that reaches the medium (`fsync` / `F_FULLFSYNC`) |
+| **Ray tracing** | frames/s | Branchy scalar float math on a cache-resident scene |
+| **Image blur** | MP/s | Strided 2-D access across a buffer larger than L1 |
+| **Log parsing** | MB/s | Linear byte scan through a backtracking regex |
+| **Video encode** | fps | Software H.264 — sustained all-core vector load |
+
+### Why the application workloads matter
+
+The synthetic tests isolate one subsystem each, which is what makes them useful
+for diagnosis and useless for deciding whether a machine suits a job. Real
+software mixes subsystems in ratios no single synthetic test reproduces:
+
+- A **database** is small random reads, an fsync-bound write path, and B-tree
+  pointer chasing. It is bound by cache and storage *latency* and nearly
+  indifferent to peak sequential bandwidth.
+- A **renderer** is branchy float math over a working set that fits in L2, with
+  almost no memory traffic — the opposite balance.
+- **Log and text processing** is a byte-at-a-time scan bounded by memory
+  bandwidth and branch prediction.
+- **Image processing** walks memory with a stride equal to the row width, which
+  is the access pattern that separates a large L2 from a small one.
+- **Video encoding** is the only common desktop workload that saturates every
+  core *and* the vector units for minutes at a time, which is why it is the
+  workload that finds inadequate cooling first.
+
+Each validates its own output against a known answer, on the same contract as
+the synthetic tests: a renderer that produces the wrong pixel or a database
+that returns the wrong row count is reporting a hardware fault, not speed.
+
+#### Durable commits, and why they are not scored
+
+`fsync` measures the ceiling on real database write throughput, and it is
+invisible to sequential-bandwidth tests: a consumer SSD that writes 3 GB/s may
+still commit only a few hundred transactions per second, while an enterprise
+drive with power-loss protection commits tens of thousands.
+
+It is deliberately excluded from the composite. On macOS, plain `fsync` only
+pushes data into the drive's volatile buffer; `F_FULLFSYNC` is what makes it
+durable, and the two differ by roughly two orders of magnitude on identical
+hardware. pcbench uses `F_FULLFSYNC` there so the number is honest — but that
+means the operation being timed is not the same across platforms, and folding
+it into a cross-platform score would measure the operating system's flush
+semantics rather than the drive. A result above 100,000 commits/s is flagged,
+because no device can persist that many writes: the stack is acknowledging
+flushes it has not performed.
+
+#### Calibrating the video encode
+
+A fixed frame count cannot serve both ends of the hardware range this tool
+targets. Three hundred 1080p frames is under a second on a modern desktop —
+short enough that process startup dominates the measurement — and several
+minutes on a single-board computer. So a short probe encode measures the
+machine first (also paying libx264's one-off setup cost, which should not land
+in the result), and the real encode is sized from the probe to fill the
+requested budget, bounded at 60–3000 frames and 120 seconds. The source is
+`testsrc2` rather than `testsrc`: flat colour bars are trivially compressible,
+which turns the benchmark into a measurement of how fast x264 can skip
+macroblocks.
 
 ### Why the real-world workloads matter
 

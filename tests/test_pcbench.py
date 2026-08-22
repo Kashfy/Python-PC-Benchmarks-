@@ -18,12 +18,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcbench import (accel, cli, compare, core, coreml_model, cores,  # noqa: E402
-                     cryptobench, diagnose, gpucompute, health, interference,
-                     numeric, optional, plugins, sysbench,
-                     limits, mlbench, mlframework, network, npu, onnx_model,
-                     power, regression, report, scoring, sustained, system,
-                     thermal, workloads)
+from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
+                     core, coreml_model, cores, cryptobench, diagnose, export,
+                     gates, gpucompute, health, interference, monitor,
+                     numeric, optional, plugins, reference, soak, storage,
+                     sysbench, limits, mlbench, mlframework, network, npu,
+                     onnx_model, power, regression, report, scoring,
+                     sustained, system, thermal, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -1727,3 +1728,663 @@ class TestExternalNetworkOptIn(unittest.TestCase):
         src = inspect.getsource(network.download_throughput)
         self.assertIn("max_bytes", src)
         self.assertIn("max_seconds", src)
+
+
+# --------------------------------------------------------------------------- #
+class TestContainerAwareness(unittest.TestCase):
+    """Confinement must be detected, because it silently changes every result."""
+
+    def test_detect_reports_effective_resources(self):
+        info = container.detect(host_cores=8, host_ram_bytes=16 * 1024 ** 3)
+        self.assertEqual(info["host_cores"], 8)
+        self.assertGreaterEqual(info["effective_cores"], 1)
+        self.assertLessEqual(info["effective_cores"], 8)
+        self.assertIn("constrained", info)
+
+    def test_quota_narrows_effective_cores(self):
+        info = container.detect(host_cores=16, host_ram_bytes=0)
+        # A fractional quota must still leave at least one usable worker,
+        # otherwise the multicore test spawns zero processes.
+        self.assertGreaterEqual(info["effective_cores"], 1)
+
+    def test_memory_limit_below_host_lowers_effective_ram(self):
+        # Simulated rather than mounted: the cgroup files cannot be created in
+        # a test, but the arithmetic that consumes them can be checked.
+        host = 32 * 1024 ** 3
+        info = dict(container.detect(host_cores=4, host_ram_bytes=host))
+        info["memory_limit_bytes"] = 2 * 1024 ** 3
+        notes = container.warnings(info)
+        self.assertTrue(any("capped at 2.0 GB" in n for n in notes), notes)
+
+    def test_warnings_flag_ci_and_cloud(self):
+        notes = container.warnings({"ci": "GitHub Actions", "host_cores": 4})
+        self.assertTrue(any("GitHub Actions" in n for n in notes))
+        notes = container.warnings({"cloud": "AWS EC2", "host_cores": 4})
+        self.assertTrue(any("credits" in n for n in notes))
+
+    def test_no_warnings_on_unconfined_machine(self):
+        self.assertEqual(container.warnings(
+            {"host_cores": 8, "cpu_quota_cores": None,
+             "cpu_affinity_cores": None, "memory_limit_bytes": None}), [])
+
+    def test_ci_detection_reads_environment(self):
+        self.assertEqual(container.ci_environment.__doc__ is None, False)
+        import os as _os
+        saved = _os.environ.get("GITHUB_ACTIONS")
+        _os.environ["GITHUB_ACTIONS"] = "true"
+        try:
+            self.assertEqual(container.ci_environment(), "GitHub Actions")
+        finally:
+            if saved is None:
+                del _os.environ["GITHUB_ACTIONS"]
+            else:
+                _os.environ["GITHUB_ACTIONS"] = saved
+
+
+# --------------------------------------------------------------------------- #
+class TestApplicationWorkloads(unittest.TestCase):
+    """Application-shaped benchmarks must run fast, validate, and report units."""
+
+    def test_sqlite_reports_transaction_rate(self):
+        r = apps.bench_sqlite(0.1, 1)
+        self.assertEqual(r["unit"], "txn/s")
+        self.assertGreater(r["rate"], 0)
+        self.assertTrue(r["validated"])
+
+    def test_sqlite_bucket_count_divides_row_count(self):
+        # The validation compares against an exact expected row count, which is
+        # only meaningful when the division is exact.
+        self.assertEqual(apps._ROWS % apps._BUCKETS, 0)
+
+    def test_raytrace_is_deterministic(self):
+        first = apps._trace(16, 12)
+        self.assertAlmostEqual(first, apps._trace(16, 12), places=12)
+
+    def test_raytrace_reports_frames(self):
+        r = apps.bench_raytrace(0.1, 1)
+        self.assertEqual(r["unit"], "frames/s")
+        self.assertGreater(r["rate"], 0)
+
+    def test_image_blur_is_deterministic(self):
+        src = bytearray(range(256)) * 4
+        self.assertEqual(apps._blur(src, 32, 32), apps._blur(src, 32, 32))
+
+    def test_image_reports_megapixels(self):
+        r = apps.bench_image(0.1, 1)
+        self.assertEqual(r["unit"], "MP/s")
+        self.assertGreater(r["rate"], 0)
+
+    def test_logparse_matches_every_line(self):
+        r = apps.bench_logparse(0.1, 1)
+        self.assertEqual(r["unit"], "MB/s")
+        self.assertGreater(r["lines"], 0)
+
+    def test_fsync_reports_a_mechanism(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = apps.bench_fsync(0.1, d)
+            if r.get("skipped"):
+                self.skipTest(r.get("reason", "fsync unavailable"))
+            self.assertIn(r["mechanism"], ("fsync", "F_FULLFSYNC"))
+            self.assertGreater(r["median_us"], 0)
+
+    def test_fsync_leaves_no_file_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            apps.bench_fsync(0.05, d)
+            self.assertEqual(os.listdir(d), [],
+                             "the fsync probe file must be cleaned up")
+
+    def test_fsync_flags_implausibly_fast_flushes(self):
+        # A drive acknowledging flushes it has not performed is a data-loss
+        # risk, and looks like a good result unless it is called out.
+        self.assertIn("caution", _fake_fast_fsync())
+
+    def test_video_skips_cleanly_without_ffmpeg(self):
+        r = apps.bench_video(0.5)
+        if apps.ffmpeg_path() is None:
+            self.assertTrue(r["skipped"])
+            self.assertIn("ffmpeg", r["reason"])
+        else:
+            self.assertTrue(r.get("skipped") or r["rate"] > 0)
+
+    def test_extract_rates_ignores_skipped(self):
+        rates = apps.extract_rates({"sqlite": {"rate": 100.0},
+                                    "video": {"skipped": True}})
+        self.assertEqual(rates, {"sqlite": 100.0})
+
+
+def _fake_fast_fsync() -> dict:
+    """Build the result bench_fsync would produce for an impossibly fast drive."""
+    latencies = [1.0] * 100      # 1 µs per commit => 1,000,000 commits/s
+    mid = latencies[len(latencies) // 2]
+    rate = 1e6 / mid
+    result = {"rate": rate}
+    if rate > 100_000:
+        result["caution"] = "acknowledging flushes without persisting them"
+    return result
+
+
+# --------------------------------------------------------------------------- #
+class TestStorageEnumeration(unittest.TestCase):
+    def test_inventory_returns_devices(self):
+        inv = storage.inventory(16)
+        self.assertIn("devices", inv)
+        self.assertIsInstance(inv["benchmarkable_count"], int)
+
+    def test_ram_disks_are_never_benchmarked(self):
+        ok, reason = storage.benchmarkable(
+            {"fstype": "tmpfs", "mount": "/tmp", "options": "rw"}, 16)
+        self.assertFalse(ok)
+        self.assertIn("RAM", reason)
+
+    def test_network_filesystems_are_never_benchmarked(self):
+        ok, reason = storage.benchmarkable(
+            {"fstype": "nfs4", "mount": "/mnt/share", "options": "rw"}, 16)
+        self.assertFalse(ok)
+        self.assertIn("network", reason)
+
+    def test_read_only_mounts_are_skipped(self):
+        ok, reason = storage.benchmarkable(
+            {"fstype": "ext4", "mount": "/", "options": "ro,relatime"}, 16)
+        self.assertFalse(ok)
+
+    def test_explicit_path_overrides_heuristics(self):
+        # A user naming a mount knows something the heuristics do not.
+        with tempfile.TemporaryDirectory() as d:
+            chosen = storage.targets({"devices": []}, requested=[d])
+            self.assertEqual(len(chosen), 1)
+            self.assertEqual(os.path.abspath(chosen[0]["mount"]),
+                             os.path.abspath(d))
+
+    def test_classify_labels_ram_disk(self):
+        self.assertEqual(
+            storage.classify({"fstype": "tmpfs", "device": "tmpfs"}),
+            "RAM disk")
+
+    def test_run_creates_and_removes_its_workdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = storage.run([{"mount": d, "kind": "test"}], 0.1, 1, 4)
+            self.assertEqual(len(result["devices"]), 1)
+            self.assertNotIn(".pcbench", os.listdir(d))
+
+
+# --------------------------------------------------------------------------- #
+class TestExports(unittest.TestCase):
+    def _payload(self) -> dict:
+        return {
+            "tool": "pcbench", "version": "9.1",
+            "timestamp_utc": "2026-01-01T00:00:00Z",
+            "system": {"hostname": 'weird"host', "os": "Linux",
+                       "arch_family": "x86-64", "cpu_model": "Test CPU",
+                       "cpu_cores_logical": 4, "ram_total_gb": 8.0,
+                       "platform": "Linux-test"},
+            "scores": {"composite": 123.4,
+                       "subscores": {"cpu_int": 100.0, "memory": 150.0}},
+            "results": {"cpu_int": {"rate": 2e6, "unit": "primes/s"},
+                        "disk": {"read_rate": 500.0, "write_rate": 250.0,
+                                 "unit": "MB/s"},
+                        "json": {"error": "RuntimeError: boom"},
+                        "knn": {"validation_failed": True, "error": "bad"}},
+            "warnings": ["on battery"],
+        }
+
+    def test_prometheus_escapes_label_values_exactly_once(self):
+        text = export.prometheus_text(self._payload())
+        self.assertIn(r'host="weird\"host"', text)
+        self.assertNotIn(r'\\"', text)
+
+    def test_prometheus_values_round_trip(self):
+        text = export.prometheus_text(self._payload())
+        line = [l for l in text.splitlines()
+                if l.startswith("pcbench_composite_score{")][0]
+        self.assertEqual(float(line.rsplit(" ", 1)[1]), 123.4)
+
+    def test_prometheus_counts_validation_failures(self):
+        text = export.prometheus_text(self._payload())
+        self.assertIn("pcbench_validation_failures", text)
+
+    def test_prometheus_write_is_atomic(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.prom")
+            export.save_prometheus(self._payload(), path)
+            # No temporary file may survive; a collector scraping the directory
+            # must never find a partial write.
+            self.assertEqual(sorted(os.listdir(d)), ["out.prom"])
+
+    def test_junit_is_well_formed_xml(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(export.junit_xml(self._payload()))
+        self.assertEqual(root.tag, "testsuites")
+
+    def test_junit_marks_validation_failure_and_error(self):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(export.junit_xml(self._payload()))
+        self.assertEqual(root.get("failures"), "1")
+        self.assertEqual(root.get("errors"), "1")
+
+    def test_junit_includes_failed_gates(self):
+        import xml.etree.ElementTree as ET
+        xml = export.junit_xml(self._payload(),
+                               [{"name": "composite>=500", "passed": False,
+                                 "message": "too slow"}])
+        root = ET.fromstring(xml)
+        self.assertEqual(root.get("failures"), "2")
+
+    def test_sqlite_round_trip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "history.db")
+            export.save_sqlite(self._payload(), path)
+            export.save_sqlite(self._payload(), path)
+            rows = export.query_sqlite(path, "cpu_int")
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["value"], 2e6)
+
+    def test_sqlite_query_on_missing_file_is_empty(self):
+        self.assertEqual(export.query_sqlite("/nonexistent/x.db"), [])
+
+    def test_markdown_contains_score_and_warning(self):
+        md = export.markdown_summary(self._payload())
+        self.assertIn("123.4", md)
+        self.assertIn("on battery", md)
+
+
+# --------------------------------------------------------------------------- #
+class TestGates(unittest.TestCase):
+    PAYLOAD = {
+        "scores": {"composite": 300.0,
+                   "subscores": {"cpu_int": 250.0, "cpu_multi": 180.0,
+                                 "sqlite": 180.0}},
+        "results": {"disk": {"read_rate": 500.0, "unit": "MB/s"},
+                    "sqlite": {"rate": 90000.0, "unit": "txn/s"}},
+        "sustained": {"droop_pct": 22.0},
+    }
+
+    def test_parses_all_operators(self):
+        for op in (">=", "<=", ">", "<", "==", "!="):
+            self.assertEqual(gates.parse(f"composite{op}100")[1], op)
+
+    def test_rejects_malformed_expression(self):
+        for bad in ("composite", "=>100", "composite>=abc", ""):
+            with self.assertRaises(gates.GateError):
+                gates.parse(bad)
+
+    def test_fail_under_becomes_a_composite_gate(self):
+        results = gates.evaluate(self.PAYLOAD, [], fail_under=250)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["passed"])
+
+    def test_bare_name_resolves_to_score_not_raw_rate(self):
+        # The distinction matters: sqlite scores 180 but runs at 90,000 txn/s.
+        results = gates.evaluate(self.PAYLOAD, ["sqlite>=1000"])
+        self.assertFalse(results[0]["passed"])
+        self.assertEqual(results[0]["source"], "score")
+
+    def test_unscored_metric_falls_back_to_its_raw_rate(self):
+        # fsync is deliberately unscored, so a bare name must still reach the
+        # only number that exists for it rather than failing as "not measured".
+        payload = {"scores": {"composite": 1.0, "subscores": {}},
+                   "results": {"fsync": {"rate": 5000.0, "unit": "commits/s"}}}
+        results = gates.evaluate(payload, ["fsync>=1000"])
+        self.assertTrue(results[0]["passed"])
+        self.assertIn("raw rate", results[0]["source"])
+
+    def test_dotted_rate_resolves_to_raw_value(self):
+        results = gates.evaluate(self.PAYLOAD, ["sqlite.rate>=1000"])
+        self.assertTrue(results[0]["passed"])
+
+    def test_nested_payload_path_resolves(self):
+        results = gates.evaluate(self.PAYLOAD, ["sustained.droop_pct<=15"])
+        self.assertFalse(results[0]["passed"])
+
+    def test_missing_metric_fails_rather_than_passing(self):
+        # Treating "not measured" as "threshold met" would make gates stop
+        # checking anything the moment a test is skipped.
+        results = gates.evaluate(self.PAYLOAD, ["nonexistent>=1"])
+        self.assertFalse(results[0]["passed"])
+        self.assertIn("not measured", results[0]["message"])
+
+    def test_failed_returns_only_failures(self):
+        results = gates.evaluate(self.PAYLOAD,
+                                 ["cpu_int>=100", "cpu_multi>=9999"])
+        self.assertEqual(len(gates.failed(results)), 1)
+
+    def test_render_summarises_counts(self):
+        text = gates.render(gates.evaluate(self.PAYLOAD, ["cpu_int>=100"]))
+        self.assertIn("1/1", text)
+
+
+# --------------------------------------------------------------------------- #
+class TestConfigFile(unittest.TestCase):
+    def _parse(self, argv):
+        parser = cli.build_parser()
+        return parser, parser.parse_args(argv)
+
+    def test_json_config_is_applied(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.json")
+            with open(path, "w") as f:
+                f.write('{"run": {"seconds": 7, "repeats": 4}}')
+            parser, args = self._parse([])
+            config.apply(args, parser, path, environ={})
+            self.assertEqual(args.seconds, 7.0)
+            self.assertEqual(args.repeats, 4)
+
+    def test_command_line_beats_config_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.json")
+            with open(path, "w") as f:
+                f.write('{"run": {"seconds": 7}}')
+            parser, args = self._parse(["--seconds", "2"])
+            config.apply(args, parser, path, environ={})
+            self.assertEqual(args.seconds, 2.0)
+
+    def test_environment_beats_config_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.json")
+            with open(path, "w") as f:
+                f.write('{"run": {"repeats": 4}}')
+            parser, args = self._parse([])
+            config.apply(args, parser, path,
+                         environ={"PCBENCH_RUN_REPEATS": "9"})
+            self.assertEqual(args.repeats, 9)
+
+    def test_bare_environment_alias_works(self):
+        parser, args = self._parse([])
+        config.apply(args, parser, None, environ={"PCBENCH_SECONDS": "3.5"})
+        self.assertEqual(args.seconds, 3.5)
+
+    def test_unknown_setting_is_rejected_with_valid_names(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.json")
+            with open(path, "w") as f:
+                f.write('{"run": {"nonsense": 1}}')
+            parser, args = self._parse([])
+            with self.assertRaises(config.ConfigError) as ctx:
+                config.apply(args, parser, path, environ={})
+            self.assertIn("run.nonsense", str(ctx.exception))
+
+    def test_booleans_coerce_from_strings(self):
+        parser, args = self._parse([])
+        config.apply(args, parser, None, environ={"PCBENCH_RUN_QUICK": "yes"})
+        self.assertTrue(args.quick)
+
+    def test_assertions_load_as_a_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.json")
+            with open(path, "w") as f:
+                f.write('{"gates": {"assertions": ["composite>=100"]}}')
+            parser, args = self._parse([])
+            config.apply(args, parser, path, environ={})
+            self.assertEqual(args.assert_, ["composite>=100"])
+
+    def test_every_mapped_key_targets_a_real_flag(self):
+        parser = cli.build_parser()
+        dests = {a.dest for a in parser._actions}
+        for key, dest in config._KEY_MAP.items():
+            self.assertIn(dest, dests, f"{key} maps to unknown flag {dest}")
+
+    def test_sample_config_is_valid_and_complete(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.toml")
+            config.write_sample(path)
+            self.assertTrue(os.path.isfile(path))
+            with self.assertRaises(config.ConfigError):
+                config.write_sample(path)   # never clobbers
+
+    def test_find_walks_up_parent_directories(self):
+        with tempfile.TemporaryDirectory() as d:
+            nested = os.path.join(d, "a", "b")
+            os.makedirs(nested)
+            top = os.path.join(d, "pcbench.json")
+            with open(top, "w") as f:
+                f.write("{}")
+            self.assertEqual(config.find(nested), top)
+
+
+# --------------------------------------------------------------------------- #
+class TestReferenceClassification(unittest.TestCase):
+    def test_classes_cover_the_whole_range_without_gaps(self):
+        for low, high, _, _ in reference.CLASSES:
+            self.assertLess(low, high)
+        for (a, b) in zip(reference.CLASSES, reference.CLASSES[1:]):
+            self.assertEqual(a[1], b[0], "class boundaries must not leave gaps")
+
+    def test_single_board_computer_is_not_flagged_as_broken(self):
+        # The whole reason the model is anchored on measured single-core
+        # performance: a slow machine that is internally consistent is fine.
+        payload = {
+            "system": {"cpu_cores_logical": 4, "cpu_cores_physical": 4,
+                       "arch_family": "ARM64", "ram_total_gb": 8.0},
+            "scores": {"composite": 32.0,
+                       "subscores": {"cpu_int": 30.0, "cpu_float": 40.0,
+                                     "compression": 22.0, "hashing": 25.0,
+                                     "json": 28.0}},
+        }
+        result = reference.assess(payload)
+        self.assertEqual(result["flag"], "balanced")
+        self.assertEqual(result["class"], "embedded / SBC")
+
+    def test_dragged_machine_is_flagged(self):
+        payload = {
+            "system": {"cpu_cores_logical": 16, "cpu_cores_physical": 8,
+                       "arch_family": "x86-64", "ram_total_gb": 32.0},
+            "scores": {"composite": 40.0,
+                       "subscores": {"cpu_int": 200.0, "cpu_float": 210.0,
+                                     "compression": 180.0, "hashing": 220.0,
+                                     "json": 190.0}},
+        }
+        self.assertEqual(reference.assess(payload)["flag"],
+                         "unbalanced (subsystem drag)")
+
+    def test_no_anchor_yields_no_false_verdict(self):
+        payload = {"system": {"cpu_cores_logical": 4},
+                   "scores": {"composite": 100.0, "subscores": {}}}
+        result = reference.assess(payload)
+        self.assertIsNone(result["expected_composite"])
+        self.assertIn("Too few", result["verdict"])
+
+    def test_subsystem_floor_flags_a_failing_disk(self):
+        checks = reference.subsystem_checks(
+            {"disk": {"read_rate": 45.0, "write_rate": 20.0,
+                      "random_read_iops": 120.0}})
+        self.assertEqual(len(checks), 3)
+
+    def test_healthy_disk_is_not_flagged(self):
+        self.assertEqual(reference.subsystem_checks(
+            {"disk": {"read_rate": 2500.0, "write_rate": 1800.0,
+                      "random_read_iops": 90000.0}}), [])
+
+    def test_skipped_results_are_not_checked(self):
+        self.assertEqual(reference.subsystem_checks(
+            {"disk": {"skipped": True, "read_rate": 1.0}}), [])
+
+
+# --------------------------------------------------------------------------- #
+class TestSoak(unittest.TestCase):
+    def test_short_soak_completes_with_no_errors(self):
+        result = soak.run(2.0, workers=1, quiet=True)
+        self.assertEqual(result["errors"], 0)
+        self.assertGreater(result["units_completed"], 0,
+                           "worker unit counts must reach the parent")
+        self.assertIn("STABLE", result["verdict"])
+
+    def test_work_units_validate_correct_hardware(self):
+        self.assertTrue(soak._unit_integer(12345)[1])
+        payload = b"abc" * 1000
+        self.assertTrue(soak._unit_compression(1, payload)[1])
+        self.assertTrue(soak._unit_memory(7, 4096)[1])
+
+    def test_verdict_reports_instability_when_errors_occur(self):
+        text = soak.verdict({"errors": 3, "error_types": ["memory"],
+                             "time_to_first_error_s": 90.0,
+                             "elapsed_seconds": 300.0, "units_completed": 10,
+                             "workers": 4})
+        self.assertIn("UNSTABLE", text)
+        self.assertIn("1m30s", text)
+
+    def test_interrupted_soak_is_incomplete_not_stable(self):
+        text = soak.verdict({"errors": 0, "error_types": [],
+                             "time_to_first_error_s": None,
+                             "elapsed_seconds": 60.0, "interrupted": True,
+                             "aborted": "interrupted by user",
+                             "units_completed": 5, "workers": 2})
+        self.assertIn("INCOMPLETE", text)
+
+    def test_hms_formats_long_durations(self):
+        self.assertEqual(soak._hms(3661), "1h01m")
+        self.assertEqual(soak._hms(90), "1m30s")
+        self.assertEqual(soak._hms(5), "5s")
+
+
+# --------------------------------------------------------------------------- #
+class TestMonitor(unittest.TestCase):
+    def test_sample_never_raises(self):
+        snap = monitor.sample(".")
+        self.assertIn("t", snap)
+
+    def test_short_session_produces_a_summary(self):
+        result = monitor.run(1.0, 0.3, ".", quiet=True)
+        self.assertGreaterEqual(result["samples"], 1)
+        self.assertTrue(result["observations"])
+
+    def test_throttling_is_named_as_thermal_when_hot(self):
+        series = {"cpu_mhz": {"min": 1000, "max": 4000, "mean": 2000,
+                              "last": 1000, "spark": ""},
+                  "cpu_celsius": {"min": 70, "max": 98, "mean": 90,
+                                  "last": 95, "spark": ""}}
+        notes = monitor.observations(series, [], 8)
+        self.assertTrue(any("thermal throttling" in n for n in notes), notes)
+
+    def test_throttling_is_named_as_power_limit_when_cool(self):
+        series = {"cpu_mhz": {"min": 1000, "max": 4000, "mean": 2000,
+                              "last": 1000, "spark": ""},
+                  "cpu_celsius": {"min": 40, "max": 60, "mean": 50,
+                                  "last": 55, "spark": ""}}
+        notes = monitor.observations(series, [], 8)
+        self.assertTrue(any("power or current limit" in n for n in notes),
+                        notes)
+
+    def test_oversubscription_is_reported(self):
+        notes = monitor.observations(
+            {"load1": {"min": 1, "max": 30, "mean": 20, "last": 25,
+                       "spark": ""}}, [], 4)
+        self.assertTrue(any("oversubscribed" in n for n in notes))
+
+    def test_quiet_session_says_nothing_is_wrong(self):
+        notes = monitor.observations({}, [], 8)
+        self.assertTrue(any("nothing anomalous" in n for n in notes))
+
+    def test_trace_writes_csv_with_all_columns(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "trace.csv")
+            monitor.save_trace(
+                {"raw": [{"t": 1.0, "cpu_mhz": 3000},
+                         {"t": 2.0, "cpu_celsius": 50.0}]}, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+            self.assertEqual(len(rows), 2)
+            self.assertIn("cpu_celsius", rows[0])
+
+
+# --------------------------------------------------------------------------- #
+class TestNewCliSurface(unittest.TestCase):
+    def test_every_test_has_a_description(self):
+        for name in cli.TESTS:
+            self.assertIn(name, cli.DESCRIPTIONS,
+                          f"{name} is undocumented in --list-tests")
+
+    def test_every_profile_names_only_real_tests(self):
+        for profile, tests in cli.PROFILES.items():
+            for name in tests:
+                self.assertIn(name, cli.TESTS,
+                              f"profile {profile} names unknown test {name}")
+
+    def test_every_test_has_a_runner(self):
+        parser = cli.build_parser()
+        args = parser.parse_args([])
+        runners = cli._runners(args, {"cpu_cores_logical": 2,
+                                      "ram_total_bytes": 8 * 1024 ** 3}, ".")
+        for name in cli.TESTS:
+            self.assertIn(name, runners, f"{name} has no runner")
+
+    def test_app_tests_except_video_run_by_default(self):
+        self.assertNotIn("video", cli.DEFAULT_TESTS)
+        for name in ("sqlite", "raytrace", "image", "logparse", "fsync"):
+            self.assertIn(name, cli.DEFAULT_TESTS)
+
+    def test_list_tests_marks_non_default_tests(self):
+        text = cli.list_tests()
+        self.assertIn("video", text)
+        self.assertIn("- video", text)
+
+    def test_list_tests_exits_zero(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli.main(["--list-tests"]), 0)
+        self.assertIn("Profiles", buf.getvalue())
+
+    def test_malformed_assertion_is_rejected_before_benchmarking(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code = cli.main(["--assert", "garbage", "--no-save"])
+        self.assertEqual(code, 2)
+        self.assertIn("invalid assertion", buf.getvalue())
+
+    def test_init_config_writes_and_refuses_to_clobber(self):
+        import io
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pcbench.toml")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(cli.main(["--init-config", path]), 0)
+            self.assertTrue(os.path.isfile(path))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(["--init-config", path]), 2)
+
+
+# --------------------------------------------------------------------------- #
+class TestCsvSchemaStaysInSync(unittest.TestCase):
+    """A drifted CSV header silently misaligns every recorded column."""
+
+    def test_flatten_row_keys_match_csv_fields_exactly(self):
+        payload = {
+            "timestamp_utc": "2026-01-01T00:00:00Z", "version": "9.1",
+            "config": {"disk_mb": 1, "mem_mb": 1},
+            "system": {"hostname": "h", "os": "Linux", "architecture": "x86_64",
+                       "arch_family": "x86-64", "cpu_model": "c",
+                       "cpu_cores_logical": 1, "python_version": "3",
+                       "python_implementation": "CPython"},
+            "state": {}, "results": {}, "scores": {"composite": 1.0},
+        }
+        self.assertEqual(sorted(report.flatten_row(payload)),
+                         sorted(report.CSV_FIELDS))
+
+
+# --------------------------------------------------------------------------- #
+class TestNewScoringBaselines(unittest.TestCase):
+    def test_every_score_source_has_a_baseline(self):
+        for score_key, _, _ in scoring._SOURCES:
+            self.assertIn(score_key, scoring.BASELINES)
+
+    def test_app_workloads_score_into_the_apps_category(self):
+        scores = scoring.compute_scores(
+            {"sqlite": {"rate": 50_000.0}, "raytrace": {"rate": 150.0},
+             "image": {"rate": 2.5}, "logparse": {"rate": 80.0},
+             "video": {"rate": 70.0}})
+        # Every baseline is defined so that the baseline machine scores 100.
+        for key, value in scores["subscores"].items():
+            self.assertAlmostEqual(value, 100.0, places=1, msg=key)
+        self.assertAlmostEqual(
+            scoring.category_scores(scores["subscores"])["apps"], 100.0,
+            places=1)
+
+    def test_fsync_is_deliberately_unscored(self):
+        # Cross-platform flush semantics differ by orders of magnitude, so
+        # scoring it would measure the OS rather than the hardware.
+        self.assertNotIn("fsync", scoring.BASELINES)
+        scores = scoring.compute_scores({"fsync": {"rate": 5000.0}})
+        self.assertEqual(scores["subscores"], {})

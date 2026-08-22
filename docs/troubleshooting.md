@@ -380,6 +380,102 @@ called for frozen builds.
 Errors mentioning `isqrt` or `fmean` mean Python < 3.8. Run with a newer
 interpreter, e.g. `python3.12 benchmark.py`.
 
+## Multi-core results look like a much slower machine (containers)
+
+Inside a container or a cgroup, `os.cpu_count()` still reports the host's core
+count while the scheduler hands out a fraction of one. Sixteen workers then
+contend over half a core and the result looks like catastrophic hardware
+failure.
+
+pcbench detects this and reports it in the **Execution environment** section:
+
+```
+  Container        : Docker
+  CPU quota        : 0.5 core(s) of 16 on the host
+  Benchmarked with : 1 core(s)
+```
+
+Workloads are sized to the effective allowance automatically. If the section is
+absent, nothing is limiting the run. On cgroup v1 systems the quota lives in
+`/sys/fs/cgroup/cpu/cpu.cfs_quota_us`; on v2, `/sys/fs/cgroup/cpu.max`.
+
+## Durable commits (fsync) look absurdly fast or absurdly slow
+
+Both are informative, and neither is a bug:
+
+- **Above 100,000 commits/s** is flagged. No storage device can persist that
+  many 4 KiB writes per second; the drive or filesystem is acknowledging
+  flushes without performing them, which means data loss on power failure.
+  Common with virtual disks, `nobarrier` mounts, and some USB enclosures.
+- **A few hundred per second on macOS** is correct. macOS is measured with
+  `F_FULLFSYNC`, which actually reaches the medium, where a plain `fsync` would
+  only reach the drive's volatile buffer and report a number two orders of
+  magnitude higher. This is also why `fsync` is deliberately excluded from the
+  composite score: it would measure the operating system's flush semantics
+  rather than the hardware.
+
+## The video benchmark is skipped
+
+It needs `ffmpeg` with `libx264` on `PATH`, and it is excluded from the default
+run. Install ffmpeg, then ask for it with `--only video` or `--profile media`.
+The reported reason distinguishes "not found" from "the installed ffmpeg may
+lack libx264".
+
+## Thresholds fail with "was not measured in this run"
+
+The metric the assertion names did not produce a value — usually because its
+test was not selected, or was skipped for missing hardware or packages. This
+is deliberate: treating an unmeasured metric as passing is how an acceptance
+check quietly stops checking anything.
+
+Check what the name resolves to. A bare name is the **score**; `name.rate` is
+the raw figure, and they differ by orders of magnitude:
+
+```bash
+pcbench --assert 'sqlite>=250'        # score, baseline = 100
+pcbench --assert 'sqlite.rate>=50000' # transactions per second
+```
+
+Every verdict prints which source it used, in brackets.
+
+## The soak reported wrong answers (exit code 7)
+
+The machine computed an incorrect result under sustained load. This is a
+hardware finding, not a tool bug — the work units are validated against
+independently known answers (Fermat's little theorem, compression round-trips,
+SHA-256 digests, walking memory patterns), so a mismatch means the hardware
+returned something wrong.
+
+In rough order of likelihood: an unstable CPU or memory overclock (including
+XMP/EXPO profiles), failing RAM, inadequate cooling, or marginal power
+delivery. `time_to_first_error_s` narrows it down — failures within seconds
+point at an overclock, while failures after hours point at heat or power.
+Reset to stock clocks and re-run; if errors persist, test one memory module at
+a time.
+
+## Performance class says "unbalanced (subsystem drag)"
+
+The composite is far below what this machine's own single-core score implies,
+which means one subsystem is holding the rest back rather than the CPU being
+slow. Look at the Bottleneck Analysis section for which category is lowest,
+and at any absolute-floor warnings printed underneath the assessment.
+
+The check is anchored on measured single-core performance rather than the CPU
+model name, so it is equally valid on a Raspberry Pi and a 96-core server. If
+too few single-threaded tests ran to anchor on, it says so instead of guessing.
+
+## Config file settings are being ignored
+
+In precedence order, a command-line flag always wins over `PCBENCH_*`
+environment variables, which win over the config file. If a flag is on the
+command line, the file cannot override it — that is by design.
+
+Other causes: the file is not in the working directory or any parent (search
+order is `pcbench.toml`, `.pcbench.toml`, `pcbench.json`, `.pcbench.json`);
+`--no-config` is set; or the interpreter is older than 3.11, which cannot read
+TOML — use a `.json` config there. An unknown setting is a hard error listing
+every valid name, so a typo never silently does nothing.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:
