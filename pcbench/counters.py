@@ -37,10 +37,18 @@ from __future__ import annotations
 
 import platform
 import re
-import resource
 import shutil
 import subprocess
 import time
+
+# `resource` is POSIX-only and does not exist on Windows. Importing it at
+# module scope made `import pcbench.cli` raise ModuleNotFoundError there, which
+# stopped the whole tool from starting -- not merely this section. Anything
+# platform-specific has to be imported where it is used, or guarded like this.
+try:
+    import resource
+except ImportError:                                     # Windows
+    resource = None
 
 #: perf events requested. Names rather than raw codes so perf maps them to
 #: whatever the local microarchitecture actually calls them.
@@ -61,6 +69,9 @@ def resource_snapshot(children: bool = False) -> dict:
     over, and comparing counts across runs of different lengths is how a
     perfectly healthy long run gets flagged as contended.
     """
+    if resource is None:
+        return _windows_snapshot(children)
+
     who = resource.RUSAGE_CHILDREN if children else resource.RUSAGE_SELF
     try:
         r = resource.getrusage(who)
@@ -80,6 +91,53 @@ def resource_snapshot(children: bool = False) -> dict:
     }
 
 
+def _windows_snapshot(children: bool = False) -> dict:
+    """The same counters on Windows, via psutil.
+
+    Windows has no getrusage. psutil exposes the equivalents through
+    GetProcessMemoryInfo and GetProcessTimes, so the section works wherever
+    psutil is installed and reports itself unavailable where it is not --
+    rather than taking the whole tool down, which is what the unguarded import
+    used to do.
+
+    Child totals are not aggregated: Windows does not maintain them the way
+    RUSAGE_CHILDREN does, and summing live children would silently miss any
+    that had already exited.
+    """
+    if children:
+        return {"wall_clock": time.monotonic(),
+                "note": "Windows does not accumulate counters for exited "
+                        "children"}
+    try:
+        import psutil
+    except ImportError:
+        return {"wall_clock": time.monotonic(),
+                "note": "resource counters need psutil on Windows "
+                        "(pip install psutil)"}
+    try:
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        switches = proc.num_ctx_switches()
+        times = proc.cpu_times()
+        return {
+            "wall_clock": time.monotonic(),
+            "user_s": times.user,
+            "system_s": times.system,
+            "max_rss_bytes": getattr(mem, "peak_wset", mem.rss),
+            # Windows reports one page-fault total rather than splitting minor
+            # from major, so it is recorded as minor and major is left absent
+            # instead of being invented.
+            "minor_faults": getattr(mem, "num_page_faults", 0),
+            "block_input": 0,
+            "block_output": 0,
+            "voluntary_switches": switches.voluntary,
+            "involuntary_switches": switches.involuntary,
+        }
+    except Exception as e:
+        return {"wall_clock": time.monotonic(),
+                "note": f"could not read Windows counters: {e}"}
+
+
 def _rss_bytes(maxrss: int) -> int:
     """``ru_maxrss`` is kilobytes on Linux and bytes on macOS/BSD."""
     return maxrss if platform.system() == "Darwin" else maxrss * 1024
@@ -90,21 +148,27 @@ def resource_delta(before: dict, after: dict) -> dict:
     if not before or not after:
         return {}
     out = {}
-    for key in after:
-        if key == "max_rss_bytes":
-            out[key] = max(after[key], before.get(key, 0))
-        elif key == "wall_clock":
+    for key, value in after.items():
+        if key == "wall_clock":
             continue
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            # Carries a note rather than a counter (Windows without psutil).
+            out[key] = value
+            continue
+        if key == "max_rss_bytes":
+            out[key] = max(value, before.get(key, 0) or 0)
         else:
-            out[key] = after[key] - before.get(key, 0)
+            out[key] = value - (before.get(key, 0) or 0)
 
     elapsed = after.get("wall_clock", 0) - before.get("wall_clock", 0)
     if elapsed > 0:
         out["elapsed_s"] = round(elapsed, 2)
-        out["involuntary_switches_per_s"] = round(
-            out.get("involuntary_switches", 0) / elapsed, 1)
-        out["major_faults_per_s"] = round(
-            out.get("major_faults", 0) / elapsed, 2)
+        if isinstance(out.get("involuntary_switches"), (int, float)):
+            out["involuntary_switches_per_s"] = round(
+                out["involuntary_switches"] / elapsed, 1)
+        # Absent on Windows, where the OS reports a single page-fault total.
+        if isinstance(out.get("major_faults"), (int, float)):
+            out["major_faults_per_s"] = round(out["major_faults"] / elapsed, 2)
     return out
 
 
@@ -396,6 +460,9 @@ def render(result: dict | None) -> str:
                 lines.append(f"  {label:<26}: {pmu[key]}{unit}")
 
     res = result.get("resources") or {}
+    if res.get("note") and "involuntary_switches" not in res:
+        lines.append(f"  Resource counters         : {res['note']}")
+        res = {}
     if res:
         rate = res.get("involuntary_switches_per_s")
         suffix = (f"  ({rate:,.0f}/s over {res.get('elapsed_s', 0):,.0f}s)"
@@ -405,9 +472,14 @@ def render(result: dict | None) -> str:
         lines.append("      (mostly from the disk test's blocking reads and "
                      "the latency test, which measures context switches by "
                      "making them; not a contention signal)")
-        lines.append(f"  Page faults (minor/major) : "
-                     f"{res.get('minor_faults', 0):,} / "
-                     f"{res.get('major_faults', 0):,}")
+        if isinstance(res.get("major_faults"), (int, float)):
+            lines.append(f"  Page faults (minor/major) : "
+                         f"{res.get('minor_faults', 0):,} / "
+                         f"{res['major_faults']:,}")
+        elif isinstance(res.get("minor_faults"), (int, float)):
+            lines.append(f"  Page faults               : "
+                         f"{res['minor_faults']:,}  (Windows reports one "
+                         f"total, not minor/major)")
         if res.get("max_rss_bytes"):
             lines.append(f"  Peak resident memory      : "
                          f"{res['max_rss_bytes'] / (1024 ** 2):,.0f} MB")

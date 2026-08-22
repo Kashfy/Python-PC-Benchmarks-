@@ -8,6 +8,7 @@ no test dependencies to install:
 
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import math
@@ -3865,3 +3866,110 @@ class TestRegressionUsesHistoricalSpread(unittest.TestCase):
             self._row("now", disk_write_mb_s=3100), history)
         self.assertIn("typical_spread_pct", result["findings"][0])
         self.assertIn("%", regression.render(result))
+
+
+# --------------------------------------------------------------------------- #
+class TestWindowsCompatibility(unittest.TestCase):
+    """No POSIX-only module may be imported at module scope.
+
+    Regression test for a total failure on Windows: `counters.py` imported
+    `resource` at module scope, so `import pcbench.cli` raised
+    ModuleNotFoundError and the tool would not start at all — not merely that
+    one section. It went undetected because the suite only ever ran on macOS.
+    """
+
+    #: Modules the CPython standard library does not provide on Windows.
+    #: `posix` is deliberately absent: CPython's own shutil and selectors
+    #: import it on a POSIX host, so treating it as forbidden would flag the
+    #: stdlib rather than this package.
+    POSIX_ONLY = {"resource", "fcntl", "pwd", "grp", "termios", "tty", "pty",
+                  "syslog", "spwd", "crypt"}
+
+    def test_no_module_level_posix_only_imports(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for name in sorted(os.listdir(os.path.join(root, "pcbench"))):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, "pcbench", name)
+            with open(path, encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                else:
+                    continue
+                # col_offset 0 means module scope; anything indented sits
+                # inside a function and only runs where it is reached.
+                if node.col_offset != 0:
+                    continue
+                for imported in names:
+                    if imported.split(".")[0] in self.POSIX_ONLY:
+                        offenders.append(f"{name}:{node.lineno} {imported}")
+        self.assertEqual(
+            offenders, [],
+            "these imports crash the whole tool on Windows; import them "
+            "inside the function that needs them, or guard with try/except")
+
+    def test_every_module_imports_without_posix_only_modules(self):
+        """Simulate Windows by making those modules unimportable."""
+        import importlib
+        import pkgutil
+        import pcbench
+
+        blocked = self.POSIX_ONLY
+
+        class Blocker:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in blocked:
+                    raise ImportError(f"No module named '{name}'")
+                return None
+
+        saved_modules = {k: v for k, v in sys.modules.items()
+                         if k.split(".")[0] in blocked or k.startswith("pcbench")}
+        blocker = Blocker()
+        sys.meta_path.insert(0, blocker)
+        try:
+            for key in list(sys.modules):
+                if key.split(".")[0] in blocked or key.startswith("pcbench"):
+                    del sys.modules[key]
+            import pcbench as fresh
+            failures = []
+            for mod in pkgutil.iter_modules(fresh.__path__):
+                try:
+                    importlib.import_module(f"pcbench.{mod.name}")
+                except Exception as e:
+                    failures.append(f"pcbench.{mod.name}: {e}")
+            self.assertEqual(failures, [])
+        finally:
+            sys.meta_path.remove(blocker)
+            for key in list(sys.modules):
+                if key.split(".")[0] in blocked or key.startswith("pcbench"):
+                    del sys.modules[key]
+            sys.modules.update(saved_modules)
+
+    def test_counters_degrade_without_resource(self):
+        # The module must still answer, with a note rather than an exception.
+        snapshot = counters._windows_snapshot()
+        self.assertIn("wall_clock", snapshot)
+        delta = counters.resource_delta(snapshot, counters._windows_snapshot())
+        self.assertIsInstance(delta, dict)
+        # And the renderer must not assume every field is numeric.
+        counters.render({"resources": delta, "notes": []})
+
+    def test_render_handles_a_note_only_snapshot(self):
+        text = counters.render({"resources": {
+            "wall_clock": 1.0, "note": "needs psutil on Windows"}})
+        self.assertIn("psutil", text)
+
+    def test_delta_tolerates_missing_major_fault_counter(self):
+        # Windows reports one page-fault total; major must not be invented.
+        before = {"wall_clock": 0.0, "minor_faults": 10,
+                  "involuntary_switches": 5, "max_rss_bytes": 1}
+        after = {"wall_clock": 10.0, "minor_faults": 30,
+                 "involuntary_switches": 25, "max_rss_bytes": 2}
+        delta = counters.resource_delta(before, after)
+        self.assertEqual(delta["involuntary_switches_per_s"], 2.0)
+        self.assertNotIn("major_faults_per_s", delta)

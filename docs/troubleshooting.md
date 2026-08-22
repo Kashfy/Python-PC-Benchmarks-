@@ -836,6 +836,34 @@ A slowdown that is still flagged after several runs is real. In rough order of
 likelihood: background load during the run, thermal throttling, a changed
 setting, then hardware health.
 
+## Windows: "The term '.venv/bin/python' is not recognized"
+
+A virtual environment puts its interpreter in `Scripts\` on Windows, not
+`bin/`:
+
+```powershell
+.venv\Scripts\python.exe benchmark.py
+```
+
+`install.py` prints the right path for the platform when it finishes. The
+zero-install route (`python3 benchmark.py`) works on every platform and needs
+no virtual environment at all.
+
+## Windows: "ModuleNotFoundError: No module named 'resource'"
+
+A bug in v11.0 through v11.7, fixed in v11.9. `resource` is POSIX-only and was
+imported at module scope, so `import pcbench.cli` failed and the tool would not
+start at all on Windows — not merely that one section.
+
+Update to v11.9 or later. If you must stay on an older version, the section can
+be disabled only by editing the source, because the failure happens at import
+time before any flag is parsed.
+
+On Windows the resource counters now come from psutil instead
+(`pip install psutil`), which supplies context switches, page faults and peak
+working set. Windows reports a single page-fault total rather than splitting
+minor from major, so only the total is shown.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

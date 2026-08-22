@@ -49,8 +49,13 @@ confirm:
 
 ```bash
 python3 install.py            # interactive; --list to preview, --tier to pick
-.venv/bin/python benchmark.py
+.venv/bin/python benchmark.py             # macOS / Linux
+.venv\Scripts\python.exe benchmark.py     # Windows
 ```
+
+`install.py` prints the correct path for your platform when it finishes — a
+virtual environment puts its interpreter in `bin/` on macOS and Linux and in
+`Scripts\` on Windows, so the two are not interchangeable.
 
 | Tier | Unlocks | Why the stdlib can't |
 |------|---------|----------------------|
@@ -1208,7 +1213,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-497 tests, standard library only (they run with or without the optional tiers).
+502 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 
