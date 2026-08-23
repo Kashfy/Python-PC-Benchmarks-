@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import os
+import random
 import re
 import resource
 import time
@@ -3973,3 +3974,197 @@ class TestWindowsCompatibility(unittest.TestCase):
         delta = counters.resource_delta(before, after)
         self.assertEqual(delta["involuntary_switches_per_s"], 2.0)
         self.assertNotIn("major_faults_per_s", delta)
+
+
+# --------------------------------------------------------------------------- #
+class TestPortablePositionalIO(unittest.TestCase):
+    """`os.pread`/`os.pwrite` are POSIX-only.
+
+    Regression test: the whole storage section died on Windows with "module
+    'os' has no attribute 'pread'". The fallback is seek+read, which is two
+    operations against a shared file pointer — so threads need private
+    descriptors or they silently read the wrong offsets.
+    """
+
+    PAGE = 4096
+    BLOCKS = 64
+
+    def _stamped_file(self, directory):
+        """A file whose every block records its own index."""
+        path = os.path.join(directory, "stamped.bin")
+        with open(path, "wb") as f:
+            for i in range(self.BLOCKS):
+                f.write(str(i).encode().ljust(self.PAGE, b"."))
+        return path
+
+    def test_fallback_reads_the_correct_bytes(self):
+        original = workloads.HAS_PREAD
+        workloads.HAS_PREAD = False
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = self._stamped_file(d)
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    for i in range(self.BLOCKS):
+                        block = workloads.pread(fd, self.PAGE, i * self.PAGE)
+                        self.assertEqual(int(block.split(b".")[0]), i)
+                finally:
+                    os.close(fd)
+        finally:
+            workloads.HAS_PREAD = original
+
+    def test_threads_with_private_descriptors_read_correctly(self):
+        import threading
+        original = workloads.HAS_PREAD
+        workloads.HAS_PREAD = False
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = self._stamped_file(d)
+                shared = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+                wrong = []
+
+                def reader(seed):
+                    fd, owned = workloads.open_reader(path, shared)
+                    try:
+                        rnd = random.Random(seed)
+                        for _ in range(500):
+                            i = rnd.randrange(self.BLOCKS)
+                            block = workloads.pread(fd, self.PAGE,
+                                                    i * self.PAGE)
+                            if int(block.split(b".")[0]) != i:
+                                wrong.append(i)
+                    finally:
+                        if owned:
+                            os.close(fd)
+
+                threads = [threading.Thread(target=reader, args=(s,))
+                           for s in range(6)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+                os.close(shared)
+                self.assertEqual(wrong, [], "private descriptors must not race")
+        finally:
+            workloads.HAS_PREAD = original
+
+    def test_open_reader_gives_a_private_fd_only_when_needed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._stamped_file(d)
+            shared = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            try:
+                original = workloads.HAS_PREAD
+                workloads.HAS_PREAD = True
+                fd, owned = workloads.open_reader(path, shared)
+                self.assertFalse(owned, "pread needs no private descriptor")
+                self.assertEqual(fd, shared)
+
+                workloads.HAS_PREAD = False
+                fd, owned = workloads.open_reader(path, shared)
+                self.assertTrue(owned)
+                self.assertNotEqual(fd, shared)
+                os.close(fd)
+            finally:
+                workloads.HAS_PREAD = original
+                os.close(shared)
+
+    def test_pwrite_fallback_lands_at_the_right_offset(self):
+        original = workloads.HAS_PREAD
+        workloads.HAS_PREAD = False
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "w.bin")
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    os.write(fd, b"\x00" * (self.PAGE * 4))
+                    workloads.pwrite(fd, b"MARK", self.PAGE * 2)
+                    self.assertEqual(
+                        workloads.pread(fd, 4, self.PAGE * 2), b"MARK")
+                finally:
+                    os.close(fd)
+        finally:
+            workloads.HAS_PREAD = original
+
+    def test_disk_benchmark_runs_on_the_fallback_path(self):
+        original = workloads.HAS_PREAD
+        workloads.HAS_PREAD = False
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                result = workloads.bench_disk(0.2, 1, 8, d)
+                if result.get("skipped"):
+                    self.skipTest(result.get("error", "disk unavailable"))
+                self.assertGreater(result["random_read_iops"], 0)
+        finally:
+            workloads.HAS_PREAD = original
+
+
+# --------------------------------------------------------------------------- #
+class TestCompilerSelection(unittest.TestCase):
+    """A bare clang on Windows needs a Visual Studio installation.
+
+    Regression test: on a real Windows machine clang was picked, failed with
+    "unable to find a Visual Studio installation", and took the native engine,
+    STREAM, the CoreMark-style suite and the compile benchmark with it.
+    """
+
+    def test_windows_prefers_self_contained_gcc_over_clang(self):
+        order = native._CANDIDATES_WINDOWS
+        self.assertLess(order.index("gcc"), order.index("clang"),
+                        "MinGW gcc is self-contained; clang needs Visual Studio")
+        self.assertLess(order.index("cl"), order.index("clang"))
+
+    def test_msvc_is_recognised_including_full_paths(self):
+        for path in ("cl", "cl.exe", "clang-cl",
+                     r"C:\Program Files\MSVC\bin\cl.exe"):
+            self.assertTrue(native.is_msvc(path), path)
+        for path in ("gcc", "cc", "clang", r"C:\mingw\bin\gcc.exe",
+                     "/usr/bin/cc"):
+            self.assertFalse(native.is_msvc(path), path)
+
+    def test_msvc_gets_its_own_flag_dialect(self):
+        cmd = native.build_command("cl", "engine.c", "engine.exe")
+        self.assertIn("/O2", cmd)
+        self.assertIn("/Fe:engine.exe", cmd)
+        self.assertNotIn("-lm", cmd)
+
+    def test_gnu_dialect_is_unchanged_on_posix(self):
+        cmd = native.build_command("gcc", "engine.c", "engine")
+        self.assertIn("-O2", cmd)
+        self.assertIn("-o", cmd)
+
+    def test_no_compiler_message_is_actionable_per_platform(self):
+        hint = native._no_compiler_hint()
+        self.assertTrue(hint)
+        if os.name == "nt":
+            self.assertIn("MinGW", hint)
+
+    def test_compile_benchmark_shares_the_ordering(self):
+        # Both must make the same choice, or one succeeds while the other
+        # reports a failure on the same machine.
+        candidates = native.compiler_candidates()
+        chosen = sysbench._find_cc()
+        if candidates:
+            self.assertIsNotNone(chosen)
+            self.assertIn(os.path.basename(chosen).split(".")[0],
+                          candidates[0])
+
+
+# --------------------------------------------------------------------------- #
+class TestWindowsGpuVram(unittest.TestCase):
+    """WMI's AdapterRAM is a 32-bit field and lies about large cards.
+
+    Regression test: an RTX 5070 Ti with 16 GB reported 4293918720 bytes and
+    the tool printed "4.0 GB" as fact.
+    """
+
+    def test_capped_value_is_rejected(self):
+        # The exact figure the real machine reported.
+        self.assertGreaterEqual(4_293_918_720, accel._ADAPTER_RAM_CAP)
+
+    def test_plausible_small_values_are_still_trusted(self):
+        for ram in (536_870_912, 2_147_483_648, 3_221_225_472):
+            self.assertLess(ram, accel._ADAPTER_RAM_CAP)
+
+    def test_registry_reader_degrades_to_empty(self):
+        # No PowerShell on this platform; it must return {} not raise.
+        self.assertIsInstance(accel._gpu_vram_from_registry(), dict)

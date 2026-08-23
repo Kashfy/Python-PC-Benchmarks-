@@ -864,6 +864,49 @@ On Windows the resource counters now come from psutil instead
 working set. Windows reports a single page-fault total rather than splitting
 minor from major, so only the total is shown.
 
+## Windows: "module 'os' has no attribute 'pread'"
+
+A bug through v11.9, fixed in v11.10. `os.pread` and `os.pwrite` are POSIX-only,
+so the entire storage section failed on Windows — sequential throughput, IOPS,
+the queue-depth sweep and the `--io` job suite all skipped.
+
+Positional I/O now falls back to seek-then-read where the syscall is missing.
+Because that is two operations against a shared file pointer, each thread in
+the queue-depth tests gets its own descriptor; sharing one races and reads the
+wrong offsets *silently*, which was measured at 9 wrong reads in 16,000 during
+development.
+
+## Windows: native engine, STREAM and CoreMark all skipped
+
+If the error mentions `unable to find a Visual Studio installation`, a bare
+`clang` was chosen. LLVM's clang on Windows relies on Visual Studio for its
+headers and linker, so it cannot build anything on its own.
+
+From v11.10 the build tries every available compiler in turn and keeps the
+first that actually produces a binary, preferring self-contained MinGW `gcc`,
+then MSVC `cl` (with its own `/O2 /Fe:` flag dialect), then clang. If all fail,
+each failure is reported rather than a misleading "no compiler found".
+
+To fix it, install a working compiler:
+
+```powershell
+winget install BrechtSanders.WinLibs.POSIX.UCRT   # MinGW-w64: gcc on PATH
+```
+
+or open a **Visual Studio Developer Command Prompt**, where `cl` works. This
+also restores the `compile` benchmark, which shares the same compiler choice.
+
+## Windows: GPU shows 4.0 GB on a card with more
+
+`Win32_VideoController.AdapterRAM` is a 32-bit field, so every card with 4 GB
+or more reports a value pinned just below 4 GiB. An RTX 5070 Ti with 16 GB
+reported 4293918720 bytes and earlier versions printed "4.0 GB" as fact.
+
+From v11.10 the 64-bit `HardwareInformation.qwMemorySize` value written by the
+driver is read from the display-class registry key instead. Where that cannot
+be read, VRAM is reported as unknown with the reason — saying nothing beats
+saying 4 GB about a 16 GB card.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

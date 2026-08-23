@@ -236,6 +236,11 @@ def run_job(job: JobSpec, directory: str) -> dict:
         def worker(slot: int) -> None:
             rnd = random.Random(1000 + slot)
             position = slot % blocks
+            # Windows has no positional read, so the fallback is seek+read on
+            # the file pointer. Sharing one descriptor between threads would
+            # race on that pointer and read from the wrong offset -- silently
+            # wrong rather than an error -- so each reader gets its own.
+            my_fd, owned = wl.open_reader(path, fd)
             try:
                 while not stop.is_set():
                     if job.is_random:
@@ -246,11 +251,13 @@ def run_job(job: JobSpec, directory: str) -> dict:
                     is_read = _choose_read(job, rnd)
                     t0 = clock()
                     if is_read:
-                        data = os.pread(fd, job.block_size, offset)
+                        data = wl.pread(my_fd, job.block_size, offset)
                         n = len(data)
                         read_ops[slot] += 1
                     else:
-                        n = os.pwrite(fd, payload, offset)
+                        # The per-thread descriptor is read-only, so writes go
+                        # through the shared one.
+                        n = wl.pwrite(fd, payload, offset)
                         write_ops[slot] += 1
                     latency = (clock() - t0) * 1e6
                     if len(latencies[slot]) < 200_000:
@@ -259,6 +266,12 @@ def run_job(job: JobSpec, directory: str) -> dict:
                     bytes_done[slot] += n
             except OSError as e:
                 errors.append(str(e))
+            finally:
+                if owned:
+                    try:
+                        os.close(my_fd)
+                    except OSError:
+                        pass
 
         threads = [threading.Thread(target=worker, args=(i,), daemon=True)
                    for i in range(job.queue_depth)]

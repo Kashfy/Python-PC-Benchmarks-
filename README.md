@@ -1213,7 +1213,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-502 tests, standard library only (they run with or without the optional tiers).
+516 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

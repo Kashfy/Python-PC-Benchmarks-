@@ -70,11 +70,16 @@ int main(void) {
 
 
 def _find_cc() -> str | None:
-    for cc in ("cc", "clang", "gcc"):
-        path = shutil.which(cc)
-        if path:
-            return path
-    return None
+    """First available C compiler, in the platform's preferred order.
+
+    Shares the ordering with the native engine so both make the same choice —
+    notably preferring MinGW's self-contained gcc over a bare clang on
+    Windows, which needs a Visual Studio installation it frequently does not
+    have.
+    """
+    from .native import compiler_candidates
+    candidates = compiler_candidates()
+    return shutil.which(candidates[0]) if candidates else None
 
 
 def bench_compile(repeats: int = 3) -> dict:

@@ -147,6 +147,47 @@ def _float_or_none(v) -> float | None:
         return None
 
 
+#: Win32_VideoController.AdapterRAM is a 32-bit DWORD. Any card with 4 GB or
+#: more reports a value pinned just below 4 GiB -- an RTX 5070 Ti with 16 GB
+#: reported 4293918720 bytes, which the tool printed as "4.0 GB". Values at or
+#: above this are treated as capped rather than published as fact.
+_ADAPTER_RAM_CAP = 4_000_000_000
+
+
+def _gpu_vram_from_registry() -> dict:
+    """Accurate VRAM per adapter from the display-class registry key.
+
+    ``HardwareInformation.qwMemorySize`` is a 64-bit value written by the
+    driver, so unlike AdapterRAM it is correct above 4 GB. Keyed by adapter
+    description so it can be matched back to the WMI listing.
+    """
+    script = (
+        "$p='HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+        "{4d36e968-e325-11ce-bfc1-08002be10318}'; "
+        "Get-ChildItem $p -ErrorAction SilentlyContinue | ForEach-Object { "
+        "  $k = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue; "
+        "  if ($k.'HardwareInformation.qwMemorySize') { "
+        "    [pscustomobject]@{ name=$k.DriverDesc; "
+        "      bytes=[uint64]$k.'HardwareInformation.qwMemorySize' } } "
+        "} | ConvertTo-Json -Compress"
+    )
+    raw = _run(["powershell", "-NoProfile", "-Command", script])
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    out = {}
+    for item in data:
+        name, size = item.get("name"), item.get("bytes")
+        if name and isinstance(size, (int, float)) and size > 0:
+            out[str(name).strip().lower()] = int(size)
+    return out
+
+
 def _gpus_windows() -> list[dict]:
     out = _run(["powershell", "-NoProfile", "-Command",
                 "Get-CimInstance Win32_VideoController | "
@@ -160,18 +201,34 @@ def _gpus_windows() -> list[dict]:
         return []
     if isinstance(data, dict):
         data = [data]
+
+    registry = _gpu_vram_from_registry()
     gpus = []
     for item in data:
+        name = item.get("Name") or "unknown"
         ram = item.get("AdapterRAM")
-        gpus.append({
-            "name": item.get("Name") or "unknown",
-            # AdapterRAM is a signed 32-bit field, so it misreports anything
-            # at or above 4 GB; drop it rather than publish a wrong number.
-            "vram_mb": (ram / (1024 * 1024)
-                        if isinstance(ram, (int, float)) and 0 < ram < 2 ** 32
-                        else None),
+
+        # Prefer the 64-bit registry value; fall back to AdapterRAM only when
+        # it is small enough to be trustworthy.
+        vram_bytes = registry.get(str(name).strip().lower())
+        source = "registry qwMemorySize" if vram_bytes else None
+        if not vram_bytes and isinstance(ram, (int, float)) \
+                and 0 < ram < _ADAPTER_RAM_CAP:
+            vram_bytes, source = int(ram), "WMI AdapterRAM"
+
+        entry = {
+            "name": name,
+            "vram_mb": vram_bytes / (1024 * 1024) if vram_bytes else None,
+            "vram_source": source,
             "driver": item.get("DriverVersion"),
-        })
+        }
+        if not vram_bytes and isinstance(ram, (int, float)) \
+                and ram >= _ADAPTER_RAM_CAP:
+            # Saying nothing beats saying 4 GB about a 16 GB card.
+            entry["vram_note"] = (
+                "WMI reports a 32-bit value capped near 4 GB and the driver "
+                "registry entry was unreadable, so VRAM is unknown")
+        gpus.append(entry)
     return [{k: v for k, v in g.items() if v is not None} for g in gpus]
 
 

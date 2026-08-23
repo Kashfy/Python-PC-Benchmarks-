@@ -553,6 +553,57 @@ def clock_wall() -> float:
     return _time.time()
 
 
+# --------------------------------------------------------------------------- #
+# Portable positional I/O
+# --------------------------------------------------------------------------- #
+# `os.pread` and `os.pwrite` are POSIX-only; on Windows they do not exist and
+# the whole storage section died with "module 'os' has no attribute 'pread'".
+#
+# The obvious fallback -- lseek then read -- is *not* equivalent, because it is
+# two operations against a shared file pointer. Every queue-depth test here
+# runs several threads against one descriptor, so another thread can move the
+# pointer between the seek and the read, and the result would be silently wrong
+# rather than slow. Windows therefore gets one descriptor per thread, which is
+# what makes seek+read safe again, and is closer to what fio does anyway.
+HAS_PREAD = hasattr(os, "pread")
+
+
+def pread(fd: int, count: int, offset: int) -> bytes:
+    """Read at an absolute offset without disturbing other readers.
+
+    On a platform without `os.pread`, the caller MUST own ``fd`` exclusively.
+    Use :func:`open_reader` to obtain a private descriptor for each thread.
+    """
+    if HAS_PREAD:
+        return os.pread(fd, count, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, count)
+
+
+def pwrite(fd: int, data: bytes, offset: int) -> int:
+    """Write at an absolute offset. Same exclusivity rule as :func:`pread`."""
+    if HAS_PREAD:
+        return os.pwrite(fd, data, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.write(fd, data)
+
+
+def open_reader(path: str, shared_fd: int) -> tuple[int, bool]:
+    """Get a descriptor safe for one thread to read through.
+
+    Returns ``(fd, owned)``. Where `os.pread` exists the shared descriptor is
+    returned unchanged and ``owned`` is False, because positional reads on it
+    are already independent. Otherwise a private descriptor is opened and the
+    caller must close it.
+    """
+    if HAS_PREAD or not path:
+        return shared_fd, False
+    try:
+        return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0)), True
+    except OSError:
+        return shared_fd, False
+
+
 def _random_read_iops(fd: int, size: int, budget: float) -> float:
     """4 KiB reads at random offsets, one at a time (queue depth 1)."""
     page = 4 * KB
@@ -563,8 +614,8 @@ def _random_read_iops(fd: int, size: int, budget: float) -> float:
     while clock() - start < budget:
         # Batch to keep clock() overhead off the measured path.
         for _ in range(64):
-            os.pread(fd, page, rnd.randrange(0, max_off + 1, page)
-                     if max_off else 0)
+            pread(fd, page, rnd.randrange(0, max_off + 1, page)
+                  if max_off else 0)
         ops += 64
     return ops / (clock() - start)
 
@@ -582,7 +633,7 @@ def _random_read_latency(fd: int, size: int, samples: int = 3000) -> dict:
     for _ in range(samples):
         offset = rnd.randrange(0, max_off + 1, page) if max_off else 0
         t0 = clock()
-        os.pread(fd, page, offset)
+        pread(fd, page, offset)
         times.append((clock() - t0) * 1e6)
     times.sort()
     n = len(times)
@@ -594,7 +645,7 @@ def _random_read_latency(fd: int, size: int, samples: int = 3000) -> dict:
 
 
 def _random_read_iops_qd(fd: int, size: int, budget: float,
-                         queue_depth: int) -> float:
+                         queue_depth: int, path: str = "") -> float:
     """4 KiB random reads with ``queue_depth`` requests outstanding.
 
     Queue depth is the difference between a drive looking mediocre and looking
@@ -604,8 +655,11 @@ def _random_read_iops_qd(fd: int, size: int, budget: float,
     Real workloads keep many requests in flight, so the depth sweep shows the
     drive's actual ceiling.
 
-    Threads are used rather than async I/O because ``os.pread`` releases the
-    GIL for the duration of the syscall, so they genuinely overlap.
+    Threads are used rather than async I/O because the read syscall releases
+    the GIL for its duration, so they genuinely overlap.
+
+    ``path`` lets each thread open its own descriptor on platforms without
+    `os.pread`, where sharing one would race on the file pointer.
     """
     import threading
 
@@ -617,11 +671,21 @@ def _random_read_iops_qd(fd: int, size: int, budget: float,
     def reader(slot: int) -> None:
         rnd = random.Random(1000 + slot)
         local = 0
-        while not stop.is_set():
-            for _ in range(16):
-                os.pread(fd, page,
-                         rnd.randrange(0, max_off + 1, page) if max_off else 0)
-            local += 16
+        my_fd, owned = open_reader(path, fd)
+        try:
+            while not stop.is_set():
+                for _ in range(16):
+                    pread(my_fd, page,
+                          rnd.randrange(0, max_off + 1, page) if max_off else 0)
+                local += 16
+        except OSError:
+            pass
+        finally:
+            if owned:
+                try:
+                    os.close(my_fd)
+                except OSError:
+                    pass
         counts[slot] = local
 
     threads = [threading.Thread(target=reader, args=(i,), daemon=True)
@@ -644,7 +708,8 @@ def _random_read_iops_qd(fd: int, size: int, budget: float,
 QUEUE_DEPTHS = (1, 4, 16, 32)
 
 
-def _queue_depth_sweep(fd: int, size: int, budget: float) -> dict:
+def _queue_depth_sweep(fd: int, size: int, budget: float,
+                       path: str = "") -> dict:
     """Random-read IOPS across increasing queue depths."""
     points = []
     for qd in QUEUE_DEPTHS:
