@@ -18,6 +18,61 @@ JSON/CSV/HTML so you can compare machines over time.
 - **Optional native C engine** — auto-compiled for compiler-optimized numbers
   and real memory-latency measurement.
 
+## Contents
+
+**Start here**
+[Is it safe for my hardware?](#is-it-safe-for-my-hardware) ·
+[Two ways to run it](#two-ways-to-run-it) ·
+[Quick start](#quick-start) ·
+[Example output](#example) ·
+[What makes it reliable](#what-makes-it-reliable) ·
+[Requirements](#requirements)
+
+**Platform notes**
+[Windows and x86 users — start here](#windows-and-x86-users--start-here) ·
+[Containers, cloud, and CI](#containers-cloud-and-ci) ·
+[Native engine](#native-engine)
+
+**What it measures**
+
+| Area | Sections |
+|---|---|
+| CPU | [What each test measures](#what-each-test-measures) · [Core scaling and hybrid CPUs](#core-scaling-and-hybrid-cpus) · [System configuration](#system-configuration--the-530-nobody-records) |
+| Real software | [Application workloads](#application-workloads--will-this-machine-be-good-at-my-job) · [Reference workloads (STREAM, LINPACK, CoreMark)](#reference-workloads--numbers-that-mean-something-elsewhere) |
+| Storage | [Depth-aware storage testing](#depth-aware-storage-testing) · [Every device](#storage-every-device-not-just-the-one-you-are-standing-on) · [Configurable I/O jobs](#configurable-storage-io) · [Drive lifetime & wear](#drive-lifetime--wear) |
+| Memory | [NUMA](#numa) |
+| Accelerators | [GPU and Neural Engine](#gpu-and-neural-engine) · [NPU across vendors](#npu-support-across-vendors) · [AI training & inference](#ai-training--inference-optional-framework-tier) |
+| AI / data | [Data science & ML](#data-science--ml) · [ML without a framework](#machine-learning-workloads-with-no-framework-required) |
+| Network | [Network stack](#network-stack) · [Two-node network](#two-node-network) |
+| Power | [Power & perf-per-watt](#power--perf-per-watt) · [Energy to solution](#energy-to-solution) |
+
+**Interpreting results**
+[How the scores are calculated](#how-the-scores-are-calculated) ·
+[Performance class](#performance-class--interpreting-a-single-run) ·
+[Bottleneck analysis](#bottleneck-analysis) ·
+[Performance counters](#performance-counters--why-not-just-how-fast) ·
+[Statistical rigor](#statistical-rigor--is-this-3-real) ·
+[Regression detection](#regression-detection) ·
+[Comparing machines](#comparing-machines)
+
+**Diagnostics & stability**
+[Hardware health](#hardware-health) ·
+[Thermal / sustained load](#thermal--sustained-load-testing) ·
+[Stability soak (burn-in)](#stability-soak-burn-in) ·
+[Live monitoring](#live-monitoring--why-is-my-computer-slow-right-now)
+
+**Automation**
+[CI, monitoring, and fleets](#ci-monitoring-and-fleets) ·
+[Configuration files](#configuration-files) ·
+[Plugins](#plugins--add-your-own-benchmark) ·
+[Exit codes](#exit-codes)
+
+**Reference**
+[All options](#options) ·
+[Native engine extras](#native-engine-extras) ·
+[Tests](#tests) ·
+[Full documentation](#documentation)
+
 ## Is it safe for my hardware?
 
 **Yes.** It never writes to raw devices, never formats anything, and never
@@ -1289,7 +1344,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-521 tests, standard library only (they run with or without the optional tiers).
+526 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

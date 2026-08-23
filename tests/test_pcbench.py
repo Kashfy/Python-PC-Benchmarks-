@@ -4212,3 +4212,70 @@ class TestCpuFeatureDetection(unittest.TestCase):
         self.assertIsInstance(features, list)
         if platform.system() == "Darwin" and platform.machine().startswith("arm"):
             self.assertIn("AES", features)
+
+
+# --------------------------------------------------------------------------- #
+class TestReadmeTableOfContents(unittest.TestCase):
+    """The contents list must stay in step with the document.
+
+    A table of contents is worse than none when its links are dead or it omits
+    half the document, and both happen silently as sections are added.
+    """
+
+    @staticmethod
+    def _anchor(title: str) -> str:
+        """GitHub's heading-anchor rule: lowercase, drop punctuation, hyphenate."""
+        cleaned = re.sub(r"[^\w\s-]", "", title.strip().lower(), flags=re.UNICODE)
+        return re.sub(r"\s", "-", cleaned)
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
+            cls.text = f.read()
+        cls.headings = [(len(m.group(1)), m.group(2).strip())
+                        for m in re.finditer(r"^(#{2,3})\s+(.+)$", cls.text,
+                                             re.M)]
+        cls.anchors = {cls._anchor(t) for _, t in cls.headings}
+        start = cls.text.index("## Contents")
+        end = cls.text.index("\n## ", start + 1)
+        cls.toc = cls.text[start:end]
+        cls.links = re.findall(r"\]\(#([^)]+)\)", cls.toc)
+
+    def test_toc_exists_and_is_near_the_top(self):
+        self.assertLess(self.text.index("## Contents"), 2000,
+                        "the contents belong before the content")
+
+    def test_every_toc_link_resolves(self):
+        broken = [l for l in self.links if l not in self.anchors]
+        self.assertEqual(broken, [], "dead anchors in the table of contents")
+
+    def test_every_top_level_section_is_listed(self):
+        # Level-3 subsections may be omitted when their parent is listed;
+        # a whole level-2 section going unlinked is an oversight.
+        linked = set(self.links)
+        missing = [self._anchor(t) for level, t in self.headings
+                   if level == 2 and self._anchor(t) not in linked
+                   and self._anchor(t) != "contents"]
+        self.assertEqual(missing, [],
+                         "these sections are not reachable from the contents")
+
+    def test_no_duplicate_links(self):
+        duplicates = {l for l in self.links if self.links.count(l) > 1}
+        self.assertEqual(duplicates, set())
+
+    def test_anchor_rule_handles_the_awkward_headings(self):
+        # These are the real ones in this document, and each exercises a
+        # different part of the rule.
+        cases = {
+            "Thermal / sustained-load testing": "thermal--sustained-load-testing",
+            "Drive lifetime & wear": "drive-lifetime--wear",
+            "Configurable storage I/O": "configurable-storage-io",
+            "System configuration — the 5–30% nobody records":
+                "system-configuration--the-530-nobody-records",
+            'Statistical rigor — "is this 3% real?"':
+                "statistical-rigor--is-this-3-real",
+            "Stability soak (burn-in)": "stability-soak-burn-in",
+        }
+        for title, expected in cases.items():
+            self.assertEqual(self._anchor(title), expected, title)
