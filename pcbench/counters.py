@@ -131,7 +131,12 @@ def _windows_snapshot(children: bool = False) -> dict:
             "block_input": 0,
             "block_output": 0,
             "voluntary_switches": switches.voluntary,
-            "involuntary_switches": switches.involuntary,
+            # psutil always reports 0 involuntary switches on Windows: the
+            # counter is not exposed by the OS. Recording it as a real zero
+            # produced "Involuntary switches: 0 (0/s over 208s)" alongside an
+            # explanation of where they come from, which reads as a
+            # measurement rather than an absence.
+            "involuntary_switches_unavailable": True,
         }
     except Exception as e:
         return {"wall_clock": time.monotonic(),
@@ -460,7 +465,13 @@ def render(result: dict | None) -> str:
                 lines.append(f"  {label:<26}: {pmu[key]}{unit}")
 
     res = result.get("resources") or {}
-    if res.get("note") and "involuntary_switches" not in res:
+    if res.get("involuntary_switches_unavailable"):
+        lines.append("  Involuntary switches      : not exposed by this OS")
+        res = {k: v for k, v in res.items()
+               if k not in ("involuntary_switches",
+                            "involuntary_switches_per_s")}
+    if res.get("note") and "involuntary_switches" not in res \
+            and not res.get("voluntary_switches"):
         lines.append(f"  Resource counters         : {res['note']}")
         res = {}
     if res:

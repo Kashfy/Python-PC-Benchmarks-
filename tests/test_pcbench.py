@@ -4279,3 +4279,143 @@ class TestReadmeTableOfContents(unittest.TestCase):
         }
         for title, expected in cases.items():
             self.assertEqual(self._anchor(title), expected, title)
+
+
+# --------------------------------------------------------------------------- #
+class TestGpuVendorAndSelection(unittest.TestCase):
+    """Discrete GPUs must be preferred over integrated ones.
+
+    Selecting purely by measured throughput picks the discrete card almost
+    always — but a card throttled by a power setting or falling back to a slow
+    driver path would silently lose to the iGPU, and the report would describe
+    the wrong hardware without saying so.
+    """
+
+    def test_vendor_detection_across_all_four(self):
+        cases = {
+            "NVIDIA GeForce RTX 5070 Ti": "nvidia",
+            "AMD Radeon RX 7900 XTX": "amd",
+            "gfx1036": "amd",
+            "Intel(R) Arc(TM) A770 Graphics": "intel",
+            "Intel(R) UHD Graphics 770": "intel",
+            "Apple M4": "apple",
+        }
+        for name, vendor in cases.items():
+            self.assertEqual(gpucompute.vendor_of(name), vendor, name)
+
+    def test_classification_of_real_devices(self):
+        cases = [
+            ("NVIDIA GeForce RTX 5070 Ti", False, "discrete"),
+            ("AMD Radeon RX 7900 XTX", False, "discrete"),
+            ("Intel(R) Arc(TM) A770 Graphics", False, "discrete"),
+            ("AMD Radeon(TM) Graphics", True, "integrated"),
+            ("Intel(R) UHD Graphics 770", True, "integrated"),
+        ]
+        for name, unified, expected in cases:
+            self.assertEqual(gpucompute.classify(name, unified), expected, name)
+
+    def test_apple_unified_memory_is_not_treated_as_integrated(self):
+        # Apple silicon shares memory but is the only and the fast GPU.
+        self.assertEqual(gpucompute.classify("Apple M4", True), "discrete")
+
+    def test_non_gpu_devices_are_not_classified(self):
+        self.assertEqual(
+            gpucompute.classify("Intel(R) Core(TM) i9", None, "CPU"), "unknown")
+
+    def test_discrete_wins_even_when_integrated_measures_faster(self):
+        results = [
+            {"name": "iGPU", "class": "integrated", "fp32_gflops": 900.0},
+            {"name": "dGPU", "class": "discrete", "fp32_gflops": 400.0},
+        ]
+        self.assertEqual(gpucompute.select_best(results)["name"], "dGPU")
+
+    def test_a_reversal_is_explained_rather_than_hidden(self):
+        results = [
+            {"name": "iGPU", "class": "integrated", "fp32_gflops": 900.0},
+            {"name": "dGPU", "class": "discrete", "fp32_gflops": 400.0},
+        ]
+        note = gpucompute.selection_note(results,
+                                         gpucompute.select_best(results))
+        self.assertIn("measured higher", note)
+        self.assertIn("driver or power setting", note)
+
+    def test_fastest_discrete_wins_among_several(self):
+        results = [
+            {"name": "slow dGPU", "class": "discrete", "fp32_gflops": 400.0},
+            {"name": "fast dGPU", "class": "discrete", "fp32_gflops": 40000.0},
+            {"name": "iGPU", "class": "integrated", "fp32_gflops": 350.0},
+        ]
+        self.assertEqual(gpucompute.select_best(results)["name"], "fast dGPU")
+
+    def test_the_real_windows_pair_selects_the_rtx(self):
+        results = [
+            {"name": "NVIDIA GeForce RTX 5070 Ti", "class": "discrete",
+             "fp32_gflops": 42638.0},
+            {"name": "gfx1036", "class": "integrated", "fp32_gflops": 346.9},
+        ]
+        best = gpucompute.select_best(results)
+        self.assertEqual(best["name"], "NVIDIA GeForce RTX 5070 Ti")
+
+    def test_devices_that_failed_are_never_selected(self):
+        results = [{"name": "broken", "class": "discrete", "error": "boom"},
+                   {"name": "iGPU", "class": "integrated", "fp32_gflops": 350.0}]
+        self.assertEqual(gpucompute.select_best(results)["name"], "iGPU")
+
+    def test_no_usable_device_selects_nothing(self):
+        self.assertIsNone(gpucompute.select_best([]))
+        self.assertIsNone(gpucompute.select_best([{"name": "x", "error": "y"}]))
+
+    def test_matmul_rates_use_the_shared_score_keys(self):
+        # The same keys the Metal engine emits, so an RTX and an Apple GPU
+        # land in the same category and are directly comparable.
+        rates = gpucompute.extract_rates({
+            "available": True, "best_gflops": 42638.0,
+            "matmul": {"matmul_fp32_tflops": 41.2,
+                       "matmul_fp16_tflops": 168.5}})
+        self.assertEqual(rates["gpu_matmul_fp32"], 41.2)
+        self.assertEqual(rates["gpu_matmul_fp16"], 168.5)
+        self.assertEqual(rates["gpu_opencl"], 42638.0)
+        for key in ("gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"):
+            self.assertIn(key, scoring.BASELINES)
+
+    def test_matmul_alone_still_scores_without_opencl(self):
+        # A machine with CUDA torch but no pyopencl is still measurable.
+        rates = gpucompute.extract_rates({
+            "available": False, "matmul": {"matmul_fp32_tflops": 41.2}})
+        self.assertEqual(rates, {"gpu_matmul_fp32": 41.2})
+
+    def test_skipped_matmul_contributes_nothing(self):
+        self.assertEqual(
+            gpucompute.extract_rates({"matmul": {"skipped": True}}), {})
+
+    def test_torch_matmul_reports_a_reason_when_unavailable(self):
+        result = gpucompute.torch_matmul(0.1)
+        if result.get("skipped"):
+            self.assertTrue(result.get("reason"))
+        else:
+            self.assertGreater(result.get("matmul_fp32_tflops", 0), 0)
+
+
+# --------------------------------------------------------------------------- #
+class TestWindowsInvoluntarySwitches(unittest.TestCase):
+    """Windows does not expose involuntary context switches at all.
+
+    psutil returns 0 there unconditionally. Recording that as a measurement
+    produced "Involuntary switches: 0 (0/s over 208s)" next to an explanation
+    of where they come from, which reads as a finding rather than an absence.
+    """
+
+    def test_windows_snapshot_marks_the_counter_unavailable(self):
+        snapshot = counters._windows_snapshot()
+        if "voluntary_switches" not in snapshot:
+            self.skipTest("psutil not installed")
+        self.assertTrue(snapshot.get("involuntary_switches_unavailable"))
+        self.assertNotIn("involuntary_switches", snapshot)
+
+    def test_render_says_not_exposed_rather_than_zero(self):
+        text = counters.render({"resources": {
+            "involuntary_switches_unavailable": True,
+            "voluntary_switches": 268, "minor_faults": 6_309_088,
+            "max_rss_bytes": 361 * 1024 ** 2, "elapsed_s": 208.0}})
+        self.assertIn("not exposed by this OS", text)
+        self.assertNotIn("0/s over", text)

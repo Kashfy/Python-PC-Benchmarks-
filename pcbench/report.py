@@ -314,8 +314,12 @@ def print_accelerators(inv: dict | None, accel: dict | None) -> None:
         return
     if not accel:
         if inv and not inv.get("benchmark_supported"):
-            print("\n  Compute benchmarking is Apple-only for now "
-                  "(Metal / Core ML); inventory shown above.")
+            # This used to claim compute benchmarking was "Apple-only", which
+            # was printed directly above an OpenCL section that had just
+            # benchmarked two GPUs. Metal is Apple-only; GPU compute is not.
+            print("\n  Apple's Metal / Core ML engine is not available here; "
+                  "NVIDIA, AMD and Intel GPUs are benchmarked through OpenCL "
+                  "and PyTorch — see the GPU compute section below.")
         return
 
     print()
@@ -379,29 +383,56 @@ def print_crypto(c: dict | None) -> None:
         _row(label, fmt(e["rate"]), suffix)
 
 
-def print_opencl(g: dict | None) -> None:
-    if not g:
+def print_opencl(result: dict | None) -> None:
+    """Cross-vendor GPU compute: OpenCL shader throughput and torch matmul."""
+    if not result:
         return
-    if not g.get("available"):
-        if g.get("nvidia"):
-            hr("GPU telemetry (NVIDIA)")
-            for d in g["nvidia"]:
-                _kv(d.get("name", f"GPU {d.get('index')}"),
-                    ", ".join(f"{k}={v}" for k, v in d.items()
-                              if k not in ("name", "index")))
+    matmul = result.get("matmul") or {}
+    if not result.get("available") and matmul.get("skipped"):
+        if result.get("note"):
+            hr("GPU compute — cross-vendor")
+            print(f"  {result['note']}")
         return
-    hr("GPU compute — OpenCL (cross-platform)")
-    for d in g.get("devices", []):
-        if d.get("error"):
-            _row(d.get("name", "?"), "FAILED", f"  {d['error'][:44]}")
+
+    hr("GPU compute — NVIDIA / AMD / Intel / Apple")
+
+    for device in result.get("devices", []):
+        if device.get("error"):
+            _row(device.get("name", "?"), "failed", f"  {device['error'][:50]}")
             continue
-        _row(d["name"], fmt(d.get("fp32_gflops")),
-             f" GFLOPS  ({d.get('compute_units')} CUs, "
-             f"{d.get('bandwidth_mb_s', 0):,.0f} MB/s)")
-    for d in g.get("nvidia", []):
-        bits = [f"{k}={v}" for k, v in d.items()
-                if k not in ("name", "index")]
-        _kv(d.get("name", f"GPU {d.get('index')}"), ", ".join(bits))
+        label = device.get("name", "?")
+        kind = device.get("class")
+        if kind and kind != "unknown":
+            label += f" [{kind}]"
+        _row(label, fmt(device.get("fp32_gflops")),
+             f" GFLOPS  ({device.get('compute_units', '?')} CUs, "
+             f"{device.get('bandwidth_mb_s', 0):,.0f} MB/s)")
+
+    if result.get("selection_note"):
+        print(f"      {result['selection_note']}")
+
+    if not matmul.get("skipped"):
+        print()
+        _row(f"Matmul FP32 ({matmul.get('name', '?')})",
+             fmt(matmul.get("matmul_fp32_tflops")), " TFLOPS")
+        if matmul.get("matmul_fp16_tflops"):
+            _row("Matmul FP16", fmt(matmul.get("matmul_fp16_tflops")),
+                 f" TFLOPS  ({matmul.get('fp16_speedup', 0):.2f}x fp32)")
+        if matmul.get("note"):
+            print(f"      {matmul['note']}")
+        print(f"      dense N={matmul.get('n')} GEMM via PyTorch on "
+              f"{matmul.get('device')}; this is the AI-compute figure, and "
+              f"OpenCL cannot reach the matrix hardware that produces it")
+    elif matmul.get("reason"):
+        _row("Matmul (AI compute)", "skipped", f"  {matmul['reason'][:60]}")
+
+    nvidia = result.get("nvidia")
+    if nvidia:
+        for entry in (nvidia if isinstance(nvidia, list) else [nvidia]):
+            if isinstance(entry, dict) and entry.get("name"):
+                detail = ", ".join(f"{k}={v}" for k, v in entry.items()
+                                   if k != "name")
+                print(f"  {entry['name']}: {detail}")
 
 
 def print_npu_onnx(npu: dict | None) -> None:
