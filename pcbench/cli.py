@@ -23,6 +23,7 @@ from . import drivelife
 from . import export as export_mod
 from . import gates as gates_mod
 from . import health
+from . import hwinfo
 from . import iobench
 from . import monitor as monitor_mod
 from . import numa as numa_mod
@@ -267,6 +268,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write a commented starter config file and exit")
     g.add_argument("--list-tests", action="store_true",
                    help="List every test and profile, then exit")
+
+    g = p.add_argument_group("hardware stats (no benchmarking)")
+    g.add_argument("--stats", nargs="?", const="all", default=None,
+                   metavar="SECTIONS",
+                   help="Report hardware facts without running any benchmark: "
+                        "battery wear, SSD endurance, temperatures, GPU "
+                        "inventory, OS settings. Comma-separated sections, or "
+                        "omit for all")
+    g.add_argument("--list-stats", action="store_true",
+                   help="List the available --stats sections, then exit")
+    g.add_argument("--menu", action="store_true",
+                   help="Interactively choose what to run")
 
     g = p.add_argument_group("analysis depth")
     g.add_argument("--counters", action="store_true",
@@ -535,6 +548,34 @@ def main(argv=None) -> int:
         except config_mod.ConfigError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
+
+    if args.list_stats:
+        print("Hardware stats sections (--stats a,b,c; omit for all):\n")
+        for name, (label, _) in hwinfo.SECTIONS.items():
+            print(f"  {name:<14} {label}")
+        print("\nNone of these run a benchmark or load the machine.")
+        return 0
+
+    if args.stats is not None:
+        try:
+            sections = hwinfo.parse_sections(args.stats)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        data = hwinfo.collect(sections, _repo_root())
+        if args.json_stdout:
+            print(json.dumps({"tool": "pcbench", "mode": "stats",
+                              "version": __version__, "stats": data},
+                             indent=2, default=str))
+        else:
+            print(hwinfo.render(data, _repo_root()))
+        return 0
+
+    if args.menu:
+        choice = _run_menu()
+        if choice is None:
+            return 0
+        return main(choice)
 
     if args.list_devices:
         inv = storage_mod.inventory(args.disk_mb)
@@ -1132,6 +1173,60 @@ def main(argv=None) -> int:
     if gates_mod.failed(gate_results):
         return 6
     return 0
+
+
+#: What the interactive menu offers, as (label, argv) pairs. Every entry is a
+#: real command line, printed before it runs, so the menu teaches the flags
+#: rather than hiding them.
+_MENU: list[tuple[str, list[str]]] = [
+    ("Quick benchmark (about a minute)", ["--quick"]),
+    ("Full benchmark (default set)", []),
+    ("CPU only", ["--profile", "cpu"]),
+    ("Storage only", ["--profile", "storage"]),
+    ("Application workloads (database, render, encode)", ["--profile", "apps"]),
+    ("AI / data science", ["--datascience"]),
+    ("Reference standards (STREAM, LINPACK, CoreMark)",
+     ["--only", "cpu_int", "--quick"]),
+    ("Hardware stats — everything, no benchmarking", ["--stats"]),
+    ("Battery health", ["--stats", "battery"]),
+    ("SSD lifetime and wear", ["--stats", "drives"]),
+    ("Temperatures and power", ["--stats", "thermal,power"]),
+    ("GPU and NPU inventory", ["--stats", "gpu"]),
+    ("Live monitor (60 seconds)", ["--monitor", "60s"]),
+    ("Stability soak (10 minutes)", ["--soak", "10m"]),
+    ("Compare past runs", ["--compare"]),
+]
+
+
+def _run_menu() -> list[str] | None:
+    """Offer the common tasks by number. Returns argv, or None to quit.
+
+    Exists because the tool has 22 tests, 13 profiles and a hundred flags, and
+    someone who just wants to know their battery health should not have to read
+    any of that first.
+    """
+    print("What would you like to do?\n")
+    for index, (label, argv) in enumerate(_MENU, 1):
+        flags = " ".join(argv) or "(no flags)"
+        print(f"  {index:>2}. {label:<48} {flags}")
+    print(f"  {'q':>2}. quit")
+
+    try:
+        answer = input("\nChoice: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if answer in ("q", "quit", "exit", ""):
+        return None
+    try:
+        chosen = _MENU[int(answer) - 1]
+    except (ValueError, IndexError):
+        print(f"error: {answer!r} is not one of 1-{len(_MENU)}",
+              file=sys.stderr)
+        return None
+
+    print(f"\nRunning: pcbench {' '.join(chosen[1])}\n")
+    return chosen[1]
 
 
 def _render_devices(inv: dict) -> str:

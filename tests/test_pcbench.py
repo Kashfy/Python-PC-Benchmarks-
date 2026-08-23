@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
                      core, coreml_model, cores, counters, cryptobench,
                      datascience, diagnose, drivelife, export, gates, gpucompute,
-                     health,
+                     health, hwinfo,
                      interference, iobench, monitor, numa, numeric, optional,
                      plugins, provenance, reference, soak, standards, stats,
                      storage, sysbench, limits, mlbench, mlframework, network,
@@ -4419,3 +4419,180 @@ class TestWindowsInvoluntarySwitches(unittest.TestCase):
             "max_rss_bytes": 361 * 1024 ** 2, "elapsed_s": 208.0}})
         self.assertIn("not exposed by this OS", text)
         self.assertNotIn("0/s over", text)
+
+
+# --------------------------------------------------------------------------- #
+class TestHardwareStatsMode(unittest.TestCase):
+    """Hardware facts on demand, without running a benchmark.
+
+    Most of what the tool knows is gathered in seconds and needs no load.
+    Asking "how worn is my battery?" should not require a benchmark that takes
+    minutes and heats the machine up.
+    """
+
+    def test_every_section_has_a_label_and_a_callable(self):
+        for name, (label, func) in hwinfo.SECTIONS.items():
+            self.assertTrue(label, name)
+            self.assertTrue(callable(func), name)
+
+    def test_parse_sections_accepts_a_subset(self):
+        self.assertEqual(hwinfo.parse_sections("battery,drives"),
+                         ["battery", "drives"])
+
+    def test_parse_sections_defaults_to_everything(self):
+        self.assertEqual(hwinfo.parse_sections(""), hwinfo.available_sections())
+        self.assertEqual(hwinfo.parse_sections("all"),
+                         hwinfo.available_sections())
+
+    def test_unknown_section_lists_the_valid_ones(self):
+        with self.assertRaises(ValueError) as ctx:
+            hwinfo.parse_sections("nonsense")
+        self.assertIn("battery", str(ctx.exception))
+
+    def test_collect_isolates_a_failing_section(self):
+        # One broken section must not take the whole report down.
+        original = hwinfo.SECTIONS["battery"]
+        def boom():
+            raise RuntimeError("simulated failure")
+        hwinfo.SECTIONS["battery"] = ("Battery", boom)
+        try:
+            data = hwinfo.collect(["battery", "cpu"], ".")
+            self.assertIn("error", data["battery"])
+            self.assertIn("model", data["cpu"])
+        finally:
+            hwinfo.SECTIONS["battery"] = original
+
+    def test_render_survives_an_errored_section(self):
+        text = hwinfo.render({"battery": {"error": "RuntimeError: x"}})
+        self.assertIn("unavailable", text)
+
+    def test_battery_reports_absence_rather_than_empty(self):
+        section = hwinfo.battery_section()
+        self.assertIn("present", section)
+        if not section["present"]:
+            self.assertTrue(section.get("note"))
+
+    def test_battery_wear_thresholds_are_explained(self):
+        # A cycle count means nothing without knowing what is normal.
+        from pcbench import thermal as thermal_mod
+        original = thermal_mod.battery_health
+        thermal_mod.battery_health = lambda: {"health_percent": 72.0,
+                                              "cycle_count": 950}
+        try:
+            section = hwinfo.battery_section()
+            notes = " ".join(section.get("notes", []))
+            self.assertIn("80%", notes)
+            self.assertIn("cycles", notes)
+        finally:
+            thermal_mod.battery_health = original
+
+    def test_gpu_name_survives_unknown_vram(self):
+        # `row` skips empty values, which once dropped the GPU line entirely
+        # on Windows where VRAM is reported as unknown.
+        text = hwinfo.render({"gpu": {"gpus": [{"name": "RTX 5070 Ti"}],
+                                      "npus": []}})
+        self.assertIn("RTX 5070 Ti", text)
+
+    def test_cpu_section_reports_cache_and_features(self):
+        section = hwinfo.cpu_section()
+        self.assertIn("model", section)
+        self.assertIn("cores_logical", section)
+        self.assertIn("last_level_cache_source", section)
+
+    def test_collect_all_sections_without_raising(self):
+        data = hwinfo.collect(None, ".")
+        self.assertEqual(set(data), set(hwinfo.SECTIONS))
+        rendered = hwinfo.render(data)
+        self.assertIsInstance(rendered, str)
+
+    def test_stats_mode_exits_zero(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli.main(["--stats", "cpu"]), 0)
+        self.assertIn("Processor", buf.getvalue())
+
+    def test_stats_mode_supports_json(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["--stats", "cpu", "--json-stdout"])
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["mode"], "stats")
+        self.assertIn("cpu", payload["stats"])
+
+    def test_bad_stats_section_exits_two(self):
+        import io
+        import contextlib
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["--stats", "nonsense"]), 2)
+
+    def test_list_stats_exits_zero(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli.main(["--list-stats"]), 0)
+        for name in hwinfo.SECTIONS:
+            self.assertIn(name, buf.getvalue())
+
+    def test_stats_mode_runs_no_benchmark(self):
+        # The point of the mode: it must not import or invoke a workload.
+        import io
+        import contextlib
+        import time as _time
+        buf = io.StringIO()
+        start = _time.perf_counter()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["--stats", "cpu,memory,battery"])
+        self.assertLess(_time.perf_counter() - start, 20.0,
+                        "stats mode should be near-instant, not a benchmark")
+
+
+# --------------------------------------------------------------------------- #
+class TestInteractiveMenu(unittest.TestCase):
+    """The menu exists so someone can find a task without reading the flags."""
+
+    def test_every_entry_is_a_real_command_line(self):
+        parser = cli.build_parser()
+        for label, argv in cli._MENU:
+            self.assertTrue(label)
+            # Must parse; an entry that errors would be a dead menu item.
+            parser.parse_args(argv)
+
+    def test_menu_covers_both_benchmarks_and_stats(self):
+        flags = [" ".join(argv) for _, argv in cli._MENU]
+        self.assertTrue(any("--stats" in f for f in flags))
+        self.assertTrue(any("--profile" in f for f in flags))
+        self.assertTrue(any("--monitor" in f for f in flags))
+
+    def test_quit_returns_none(self):
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch("builtins.input", return_value="q"):
+                self.assertIsNone(cli._run_menu())
+
+    def test_selection_returns_that_entrys_argv(self):
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch("builtins.input", return_value="1"):
+                self.assertEqual(cli._run_menu(), cli._MENU[0][1])
+
+    def test_out_of_range_choice_is_rejected(self):
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with unittest.mock.patch("builtins.input", return_value="999"):
+                    self.assertIsNone(cli._run_menu())
+
+    def test_eof_is_treated_as_quit(self):
+        import io
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            with unittest.mock.patch("builtins.input", side_effect=EOFError):
+                self.assertIsNone(cli._run_menu())

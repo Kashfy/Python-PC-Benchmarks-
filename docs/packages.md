@@ -343,6 +343,29 @@ Config files are found by walking up from the working directory
 Python 3.11+; JSON works everywhere. Precedence is command line > `PCBENCH_*`
 environment > config file > defaults.
 
+### Hardware stats (no benchmarking)
+
+| Flag | Description |
+|------|-------------|
+| `--stats [SECTIONS]` | Report hardware facts without load. Comma-separated, or omit for all |
+| `--list-stats` | List the available sections |
+| `--menu` | Interactively choose a benchmark or a stats section |
+
+Sections: `cpu`, `memory`, `storage`, `drives`, `battery`, `gpu`, `thermal`,
+`power`, `os`, `environment`, `numa`, `packages`.
+
+The whole set gathers in roughly two seconds and never loads the machine, so it
+is safe to run on a busy server or a laptop on battery. `--json-stdout` applies,
+which makes any section usable as a monitoring check:
+
+```bash
+pcbench --stats battery --json-stdout | jq '.stats.battery.health_percent'
+pcbench --stats drives  --json-stdout | jq '.stats.drives.drives[0].health_pct'
+```
+
+A failing section is isolated and reported in place; it never takes the rest of
+the report down.
+
 ### Analysis depth
 
 | Flag | Description |
@@ -435,7 +458,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-542 cases, standard library only — no pytest, no test dependencies.
+564 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

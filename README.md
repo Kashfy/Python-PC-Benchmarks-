@@ -22,6 +22,8 @@ JSON/CSV/HTML so you can compare machines over time.
 
 **Start here**
 [Is it safe for my hardware?](#is-it-safe-for-my-hardware) ·
+[Choosing what to run](#choosing-what-to-run) ·
+[Hardware stats — no benchmark required](#hardware-stats--no-benchmark-required) ·
 [Two ways to run it](#two-ways-to-run-it) ·
 [Quick start](#quick-start) ·
 [Example output](#example) ·
@@ -654,6 +656,78 @@ A Ryzen 7 7800X3D (8C/16T, 63 GB) with no optional packages installed produced
 a composite of 192 with 17 subscores — storage, native engine, STREAM,
 CoreMark-style, LINPACK and the compile benchmark all skipped for the reasons
 above. Installing a compiler and the `compute` tier brings those back.
+
+## Hardware stats — no benchmark required
+
+Most of what this tool knows takes under two seconds to gather and needs no
+load at all. Asking "how worn is my battery?" should not require a benchmark
+that runs for minutes and heats the machine up.
+
+```bash
+pcbench --stats                    # everything, ~2 seconds
+pcbench --stats battery            # just one section
+pcbench --stats drives,thermal     # or a few
+pcbench --list-stats               # what is available
+```
+
+```
+==========================================================================
+Battery
+==========================================================================
+  Charge                    : 100%  (charging / on AC)
+  Health                    : 97.3% of design capacity
+  Capacity                  : 5605 of 5760 mAh
+  Charge cycles             : 78
+  Temperature               : 30.2 °C
+```
+
+| Section | Reports |
+|---|---|
+| `cpu` | Model, cores, base clock, last-level cache, instruction-set extensions |
+| `memory` | Total, available, swap usage |
+| `storage` | Every mount: type, free space, whether it can be benchmarked |
+| `drives` | **SSD endurance** — TB written, health %, power-on hours, projected life |
+| `battery` | **Charge, health vs design capacity, cycles, temperature** |
+| `gpu` | GPU and NPU inventory, OpenCL devices, PyTorch device |
+| `thermal` | Every readable temperature sensor and fan |
+| `power` | Idle draw, AC or battery |
+| `os` | Kernel, Python build, governor, mitigations, hugepages, SMT, microcode |
+| `environment` | Container, cgroup limits, cloud provider, CI system |
+| `numa` | Node topology |
+| `packages` | Which optional tiers are installed |
+
+Battery and drive figures come with their thresholds explained, since a number
+alone is not actionable:
+
+```
+      i capacity is 72% of design — most vendors treat 80% as the service
+        threshold, so this battery is at or past the point where replacement
+        is normally offered
+```
+
+`--json-stdout` works here too, so any section can feed a script or a
+monitoring check without parsing terminal output.
+
+## Choosing what to run
+
+Twenty-two tests and thirteen profiles is a lot to read before a first run:
+
+```bash
+pcbench --menu
+```
+
+```
+   1. Quick benchmark (about a minute)                 --quick
+   3. CPU only                                         --profile cpu
+   9. Battery health                                   --stats battery
+  10. SSD lifetime and wear                            --stats drives
+  13. Live monitor (60 seconds)                        --monitor 60s
+  ...
+```
+
+Each entry prints the flags it maps to before running, so the menu teaches the
+command line rather than replacing it. For everything else:
+`--list-tests`, `--list-stats`, `--list-devices`.
 
 ## Drive lifetime & wear
 
@@ -1403,7 +1477,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-542 tests, standard library only (they run with or without the optional tiers).
+564 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

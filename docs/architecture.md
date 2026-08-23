@@ -45,6 +45,7 @@ Python-PC-Benchmarks-/
 │   ├── health.py       # RAM integrity, drive SMART (read-only)
 │   ├── drivelife.py    # SSD wear: TBW, power-on hours, endurance left
 │   ├── diagnose.py     # bottleneck analysis, spec sheet
+│   ├── hwinfo.py       # hardware stats on demand, no benchmarking
 │   ├── plugins.py      # discover and run user benchmarks
 │   ├── sustained.py    # thermal / sustained-load mode
 │   ├── soak.py         # long-duration burn-in with error accounting
@@ -68,7 +69,7 @@ Python-PC-Benchmarks-/
 │   ├── export.py       # Prometheus, JUnit XML, SQLite, Markdown
 │   └── regression.py   # run-over-run regression detection
 ├── plugins/            # drop-in user benchmarks (auto-discovered)
-├── tests/              # 542 stdlib unittest cases
+├── tests/              # 564 stdlib unittest cases
 └── docs/
 ```
 
