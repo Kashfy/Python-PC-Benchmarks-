@@ -710,24 +710,65 @@ monitoring check without parsing terminal output.
 
 ## Choosing what to run
 
-Twenty-two tests and thirteen profiles is a lot to read before a first run:
+Twenty-two tests, thirteen profiles and twelve stats sections is a lot to read
+before a first run, so there is a guided setup that asks instead:
 
 ```bash
 pcbench --menu
 ```
 
+It works the way an OS installer does — one question per screen, `b` to step
+back, `q` to leave, and nothing starts until you accept the summary:
+
 ```
-   1. Quick benchmark (about a minute)                 --quick
-   3. CPU only                                         --profile cpu
-   9. Battery health                                   --stats battery
-  10. SSD lifetime and wear                            --stats drives
-  13. Live monitor (60 seconds)                        --monitor 60s
-  ...
+==========================================================================
+  pcbench 11.15 > Main menu
+==========================================================================
+
+  What would you like to do?
+
+     1. Run a benchmark
+        Measure how fast this machine is
+     2. Read hardware stats
+        Battery, SSD endurance, temperatures, GPUs - nothing is loaded
+     3. Watch or stress the machine
+        Live monitor, thermal throttling test, burn-in soak
+     4. Check hardware health
+        RAM integrity, SMART status, drive wear
+     5. Look at past runs
+        Rank the history, or compare two saved runs
+     6. Shortcuts
+        The flat list, if you already know what you want
 ```
 
-Each entry prints the flags it maps to before running, so the menu teaches the
-command line rather than replacing it. For everything else:
-`--list-tests`, `--list-stats`, `--list-devices`.
+Picking *Run a benchmark* then asks what kind (quick pass, the full suite, a
+profile, individual tests, AI/data science, storage I/O, reference standards),
+how long each test should run, what else to measure, and what to write out.
+Multi-choice screens take numbers, ranges or names — `1,4`, `1-6`, `all`,
+`none`, or `cpu_int,disk`. Screens that cannot apply to your answers are
+skipped in both directions, so stepping back never lands on a dead question.
+
+The last screen is the whole point:
+
+```
+  This is what will run:
+
+      pcbench --profile cpu --html
+
+  Which means:
+    - the cpu profile (7 tests)
+    - 3 seconds per test, 3 repeats (the default)
+    - self-contained html report
+    - results saved to results/ as JSON and CSV
+
+     1. Run it now
+     2. Go back and change something
+     3. Quit without running anything
+```
+
+It prints the command line it assembled before running it, so the menu teaches
+the flags rather than replacing them — the second time you want that run, you
+type it. For everything else: `--list-tests`, `--list-stats`, `--list-devices`.
 
 ## Drive lifetime & wear
 

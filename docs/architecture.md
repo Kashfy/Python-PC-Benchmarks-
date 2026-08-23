@@ -21,6 +21,7 @@ Python-PC-Benchmarks-/
 │   ├── config.py       # config files (TOML/JSON) and PCBENCH_* variables
 │   ├── stats.py        # confidence intervals, Mann-Whitney U, A/B verdicts
 │   ├── cli.py          # argument parsing and run orchestration
+│   ├── wizard.py       # guided --menu: screens, back/quit, builds argv
 │   │   ── inventory and state ──
 │   ├── system.py       # hardware inventory, CPU features, machine state
 │   ├── thermal.py      # temperatures in Celsius, fans, battery health

@@ -349,7 +349,7 @@ environment > config file > defaults.
 |------|-------------|
 | `--stats [SECTIONS]` | Report hardware facts without load. Comma-separated, or omit for all |
 | `--list-stats` | List the available sections |
-| `--menu` | Interactively choose a benchmark or a stats section |
+| `--menu` | Guided setup: pick a benchmark, stats section, monitor or comparison one screen at a time, then confirm the command it builds |
 
 Sections: `cpu`, `memory`, `storage`, `drives`, `battery`, `gpu`, `thermal`,
 `power`, `os`, `environment`, `numa`, `packages`.

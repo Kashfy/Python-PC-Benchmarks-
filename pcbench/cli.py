@@ -48,6 +48,7 @@ from . import power
 from . import regression
 from . import sysbench
 from . import report as report_mod
+from . import wizard
 from . import workloads as wl
 from .compare import load_history, render_table
 from .core import ValidationError
@@ -279,7 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--list-stats", action="store_true",
                    help="List the available --stats sections, then exit")
     g.add_argument("--menu", action="store_true",
-                   help="Interactively choose what to run")
+                   help="Guided setup: choose a benchmark, a stats section, "
+                        "a monitor or a comparison by answering a few "
+                        "questions, then confirm the command it builds")
 
     g = p.add_argument_group("analysis depth")
     g.add_argument("--counters", action="store_true",
@@ -572,7 +575,14 @@ def main(argv=None) -> int:
         return 0
 
     if args.menu:
-        choice = _run_menu()
+        # The menu assembles a fresh command line, so anything typed beside
+        # --menu is discarded. Say so rather than appearing to ignore it.
+        typed = [a for a in (argv if argv is not None else sys.argv[1:])
+                 if a != "--menu"]
+        if typed:
+            print(f"  note: --menu builds its own command line, so "
+                  f"{' '.join(typed)} will not be used.")
+        choice = wizard.run()
         if choice is None:
             return 0
         return main(choice)
@@ -1173,60 +1183,6 @@ def main(argv=None) -> int:
     if gates_mod.failed(gate_results):
         return 6
     return 0
-
-
-#: What the interactive menu offers, as (label, argv) pairs. Every entry is a
-#: real command line, printed before it runs, so the menu teaches the flags
-#: rather than hiding them.
-_MENU: list[tuple[str, list[str]]] = [
-    ("Quick benchmark (about a minute)", ["--quick"]),
-    ("Full benchmark (default set)", []),
-    ("CPU only", ["--profile", "cpu"]),
-    ("Storage only", ["--profile", "storage"]),
-    ("Application workloads (database, render, encode)", ["--profile", "apps"]),
-    ("AI / data science", ["--datascience"]),
-    ("Reference standards (STREAM, LINPACK, CoreMark)",
-     ["--only", "cpu_int", "--quick"]),
-    ("Hardware stats — everything, no benchmarking", ["--stats"]),
-    ("Battery health", ["--stats", "battery"]),
-    ("SSD lifetime and wear", ["--stats", "drives"]),
-    ("Temperatures and power", ["--stats", "thermal,power"]),
-    ("GPU and NPU inventory", ["--stats", "gpu"]),
-    ("Live monitor (60 seconds)", ["--monitor", "60s"]),
-    ("Stability soak (10 minutes)", ["--soak", "10m"]),
-    ("Compare past runs", ["--compare"]),
-]
-
-
-def _run_menu() -> list[str] | None:
-    """Offer the common tasks by number. Returns argv, or None to quit.
-
-    Exists because the tool has 22 tests, 13 profiles and a hundred flags, and
-    someone who just wants to know their battery health should not have to read
-    any of that first.
-    """
-    print("What would you like to do?\n")
-    for index, (label, argv) in enumerate(_MENU, 1):
-        flags = " ".join(argv) or "(no flags)"
-        print(f"  {index:>2}. {label:<48} {flags}")
-    print(f"  {'q':>2}. quit")
-
-    try:
-        answer = input("\nChoice: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-    if answer in ("q", "quit", "exit", ""):
-        return None
-    try:
-        chosen = _MENU[int(answer) - 1]
-    except (ValueError, IndexError):
-        print(f"error: {answer!r} is not one of 1-{len(_MENU)}",
-              file=sys.stderr)
-        return None
-
-    print(f"\nRunning: pcbench {' '.join(chosen[1])}\n")
-    return chosen[1]
 
 
 def _render_devices(inv: dict) -> str:

@@ -32,7 +32,7 @@ from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
                      plugins, provenance, reference, soak, standards, stats,
                      storage, sysbench, limits, mlbench, mlframework, network,
                      native, npu, onnx_model, power, regression, report, scoring,
-                     sustained, system, thermal, workloads)
+                     sustained, system, thermal, wizard, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -4552,47 +4552,175 @@ class TestHardwareStatsMode(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-class TestInteractiveMenu(unittest.TestCase):
-    """The menu exists so someone can find a task without reading the flags."""
+class TestWizardParsing(unittest.TestCase):
+    """The selection grammar, which is the only place a typo can hide."""
+
+    def test_numbers_ranges_and_names(self):
+        names = ["cpu_int", "memory", "disk", "json"]
+        parse = wizard._parse_selection
+        self.assertEqual(parse("1,3", 4), [0, 2])
+        self.assertEqual(parse("2-4", 4), [1, 2, 3])
+        self.assertEqual(parse("all", 4), [0, 1, 2, 3])
+        self.assertEqual(parse("none", 4), [])
+        self.assertEqual(parse("disk,memory", 4, names), [2, 1])
+        self.assertEqual(parse("1 2", 4), [0, 1])
+
+    def test_duplicates_collapse_but_order_is_kept(self):
+        self.assertEqual(wizard._parse_selection("3,1,3", 4), [2, 0])
+
+    def test_out_of_range_and_unknown_names_are_rejected(self):
+        for bad in ("0", "5", "2-9", "nope"):
+            with self.assertRaises(ValueError):
+                wizard._parse_selection(bad, 4, ["a", "b", "c", "d"])
+
+
+# --------------------------------------------------------------------------- #
+class TestWizardFlow(unittest.TestCase):
+    """The guided menu exists so someone can find a task without the flags.
+
+    Every case drives it the way a person would — one answer per screen — and
+    checks the command line it hands back, because that argv is the only thing
+    the wizard actually produces.
+    """
+
+    def _drive(self, answers):
+        import io
+        import contextlib
+        import unittest.mock
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with unittest.mock.patch("builtins.input", side_effect=answers):
+                argv = wizard.run()
+        return argv, buffer.getvalue()
+
+    def test_quick_benchmark(self):
+        # main menu -> benchmark -> quick pass -> no extras -> no output -> run
+        argv, _ = self._drive(["1", "1", "none", "none", "1"])
+        self.assertEqual(argv, ["--quick"])
+
+    def test_profile_with_html_report(self):
+        argv, _ = self._drive(["1", "3", "3", "2", "none", "1", "1"])
+        self.assertEqual(argv, ["--profile", "cpu", "--html"])
+
+    def test_individual_tests_can_be_named(self):
+        argv, _ = self._drive(["1", "4", "cpu_int,disk", "1",
+                               "none", "none", "1"])
+        self.assertEqual(argv, ["--only", "cpu_int,disk", "--quick"])
+
+    def test_custom_depth_becomes_seconds_and_repeats(self):
+        argv, _ = self._drive(["1", "2", "4", "4.5", "7",
+                               "none", "none", "1"])
+        self.assertEqual(argv, ["--seconds", "4.5", "--repeats", "7"])
+
+    def test_focused_run_still_asks_for_one_test(self):
+        # A benchmark run with no tests measures nothing, so the narrow
+        # scope pairs the datascience work with a one-second CPU check.
+        argv, _ = self._drive(["1", "5", "1", "none", "none", "1"])
+        self.assertEqual(argv, ["--only", "cpu_int", "--quick",
+                                "--datascience"])
+
+    def test_writing_nothing_overrides_the_other_output_choices(self):
+        argv, _ = self._drive(["1", "1", "none", "1,4", "1"])
+        self.assertEqual(argv, ["--quick", "--no-save"])
+
+    def test_stats_sections(self):
+        argv, _ = self._drive(["2", "battery,drives", "1", "1"])
+        self.assertEqual(argv, ["--stats", "battery,drives"])
+
+    def test_stats_all_sections_needs_no_argument(self):
+        argv, _ = self._drive(["2", "all", "1", "1"])
+        self.assertEqual(argv, ["--stats"])
+
+    def test_monitor_duration_and_options(self):
+        argv, _ = self._drive(["3", "1", "90s", "1", "1"])
+        self.assertEqual(argv, ["--monitor", "90s", "--monitor-power"])
+
+    def test_soak_defaults_to_a_minimal_companion_run(self):
+        argv, _ = self._drive(["3", "3", "2h", "none", "1"])
+        self.assertEqual(argv, ["--soak", "2h", "--only", "cpu_int",
+                                "--quick"])
+
+    def test_health_ram_test_carries_the_size(self):
+        argv, _ = self._drive(["4", "5", "512", "1"])
+        self.assertEqual(argv, ["--health", "--health-mb", "512",
+                                "--only", "cpu_int", "--quick"])
+
+    def test_history_table(self):
+        argv, _ = self._drive(["5", "1", "1"])
+        self.assertEqual(argv, ["--compare"])
+
+    def test_shortcut_returns_that_entrys_argv(self):
+        argv, _ = self._drive(["6", "1"])
+        self.assertEqual(argv, wizard.SHORTCUTS[0][1])
+
+    def test_back_leaves_a_skipped_screen_skipped(self):
+        # The quick pass fixes the depth, so its screen is not shown. Going
+        # back from Extras must reach the kind screen rather than stalling.
+        argv, output = self._drive(["1", "1", "b", "2", "2",
+                                    "none", "none", "1"])
+        self.assertEqual(argv, [])
+        self.assertNotIn("Benchmark > Scope", output)
+
+    def test_back_at_the_first_screen_returns_to_the_main_menu(self):
+        argv, output = self._drive(["1", "b", "2", "all", "1", "1"])
+        self.assertEqual(argv, ["--stats"])
+        self.assertEqual(output.count("Main menu"), 2)
+
+    def test_declining_the_confirmation_goes_back(self):
+        argv, _ = self._drive(["1", "1", "none", "none", "2",
+                               "1", "1", "1"])
+        self.assertEqual(argv, ["--quick", "--html"])
+
+    def test_nothing_runs_until_the_confirmation_is_accepted(self):
+        argv, output = self._drive(["1", "1", "none", "none", "3"])
+        self.assertIsNone(argv)
+        self.assertIn("Nothing has started yet", output)
+
+    def test_bad_input_re_asks_rather_than_giving_up(self):
+        argv, output = self._drive(["99", "banana", "1", "1",
+                                    "none", "none", "1"])
+        self.assertEqual(argv, ["--quick"])
+        self.assertIn("is not one of 1-", output)
+
+    def test_quit_returns_none(self):
+        self.assertIsNone(self._drive(["q"])[0])
+
+    def test_eof_is_treated_as_quit(self):
+        self.assertIsNone(self._drive([EOFError()])[0])
+
+    def test_interrupt_is_treated_as_quit(self):
+        self.assertIsNone(self._drive([KeyboardInterrupt()])[0])
+
+    def test_the_command_line_it_built_is_printed(self):
+        _, output = self._drive(["1", "1", "none", "none", "1"])
+        self.assertIn("pcbench --quick", output)
+
+
+# --------------------------------------------------------------------------- #
+class TestWizardShortcuts(unittest.TestCase):
+    """Shortcut entries are real command lines, so they must parse."""
 
     def test_every_entry_is_a_real_command_line(self):
         parser = cli.build_parser()
-        for label, argv in cli._MENU:
+        for label, argv in wizard.SHORTCUTS:
             self.assertTrue(label)
-            # Must parse; an entry that errors would be a dead menu item.
+            # An entry the parser rejects would be a dead menu item.
             parser.parse_args(argv)
 
-    def test_menu_covers_both_benchmarks_and_stats(self):
-        flags = [" ".join(argv) for _, argv in cli._MENU]
+    def test_other_flags_beside_menu_are_called_out(self):
+        # The menu replaces the command line; silently dropping --html
+        # would look like a bug in --html.
+        import io
+        import contextlib
+        import unittest.mock
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with unittest.mock.patch("builtins.input", side_effect=["q"]):
+                self.assertEqual(cli.main(["--menu", "--html"]), 0)
+        self.assertIn("--html will not be used", buffer.getvalue())
+
+    def test_shortcuts_cover_both_benchmarks_and_stats(self):
+        flags = [" ".join(argv) for _, argv in wizard.SHORTCUTS]
         self.assertTrue(any("--stats" in f for f in flags))
         self.assertTrue(any("--profile" in f for f in flags))
         self.assertTrue(any("--monitor" in f for f in flags))
-
-    def test_quit_returns_none(self):
-        import io
-        import contextlib
-        with contextlib.redirect_stdout(io.StringIO()):
-            with unittest.mock.patch("builtins.input", return_value="q"):
-                self.assertIsNone(cli._run_menu())
-
-    def test_selection_returns_that_entrys_argv(self):
-        import io
-        import contextlib
-        with contextlib.redirect_stdout(io.StringIO()):
-            with unittest.mock.patch("builtins.input", return_value="1"):
-                self.assertEqual(cli._run_menu(), cli._MENU[0][1])
-
-    def test_out_of_range_choice_is_rejected(self):
-        import io
-        import contextlib
-        with contextlib.redirect_stdout(io.StringIO()):
-            with contextlib.redirect_stderr(io.StringIO()):
-                with unittest.mock.patch("builtins.input", return_value="999"):
-                    self.assertIsNone(cli._run_menu())
-
-    def test_eof_is_treated_as_quit(self):
-        import io
-        import contextlib
-        with contextlib.redirect_stdout(io.StringIO()):
-            with unittest.mock.patch("builtins.input", side_effect=EOFError):
-                self.assertIsNone(cli._run_menu())
