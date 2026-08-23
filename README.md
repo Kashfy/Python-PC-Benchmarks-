@@ -524,6 +524,82 @@ Full reference — every baseline constant with its unit, category membership, a
 the rules above in detail — is in
 [docs/technical.md](docs/technical.md#scoring).
 
+## Windows and x86 users — start here
+
+Everything runs on Windows, but several sections need a one-time setup that
+macOS and Linux get for free. This is the whole list.
+
+### Running it
+
+```powershell
+python3 benchmark.py                      # zero install, works immediately
+```
+
+With the optional packages, note that a virtual environment puts its
+interpreter in `Scripts\`, **not** `bin/`:
+
+```powershell
+python3 install.py
+.venv\Scripts\python.exe benchmark.py     # Windows
+```
+
+`.venv/bin/python` is the macOS and Linux path and will fail with *"The term
+'.venv/bin/python' is not recognized"*.
+
+### The three things worth installing
+
+| Install | Restores | Command |
+|---|---|---|
+| **A C compiler** | Native engine, **STREAM**, **CoreMark-style**, and the `compile` benchmark — four sections | `winget install BrechtSanders.WinLibs.POSIX.UCRT` |
+| **psutil** | Resource counters (context switches, page faults, peak working set) | `pip install psutil` |
+| **py-cpuinfo** | Full CPU feature list — AES-NI, SHA-NI, AVX2, AVX-512 | `pip install py-cpuinfo` |
+
+A bare `clang` is **not** enough. LLVM's clang on Windows relies on a Visual
+Studio installation for its headers and linker, and fails with *"unable to find
+a Visual Studio installation"* on its own. The tool tries every compiler it can
+find and keeps the first that actually produces a binary, preferring
+self-contained MinGW `gcc`, then MSVC `cl` from a Developer Command Prompt,
+then clang.
+
+Without py-cpuinfo, Windows falls back to `IsProcessorFeaturePresent`, which
+has codes for the vector extensions and **none for AES-NI or SHA-NI** — so
+those show as undetected rather than absent, and the report says so.
+
+### What Windows genuinely cannot do
+
+These are platform limits, not missing work, and the tool reports each with its
+reason rather than failing quietly:
+
+| Section | Status on Windows | Why |
+|---|---|---|
+| **PMU counters** (`--counters`) | Unavailable | Hardware counters need a kernel driver; `perf` has no Windows equivalent |
+| **GPU/NPU compute** | Inventory only | Compute benchmarking is Metal/Core ML for now; OpenCL via `pyopencl` works cross-platform |
+| **Power measurement** | TDP estimate | No on-die power metering is exposed; macOS uses `powermetrics`, Linux uses RAPL |
+| **NUMA bandwidth matrix** | Topology only | Needs `numactl`, which is Linux-only |
+| **Drive lifetime detail** | Often status only | `Get-StorageReliabilityCounter` returns nulls for many consumer drives; try an **elevated** PowerShell |
+
+### Things that look wrong on x86 and are not
+
+- **"cannot separate SMT from a hybrid layout"** in core scaling. On a CPU with
+  Hyper-Threading or SMT, the knee in the scaling curve has two possible causes
+  that the curve alone cannot distinguish — hyperthreads sharing execution
+  units, or physically smaller cores. The tool declines to guess rather than
+  assert the wrong one. See [Core scaling](#core-scaling-and-hybrid-cpus).
+- **`ml` as the weakest category** when it sits close to `cpu_int`. Those
+  workloads are pure Python, so they measure the interpreter on your CPU rather
+  than a separate subsystem. The verdict says so.
+- **GPU VRAM reported as unknown.** `Win32_VideoController.AdapterRAM` is a
+  32-bit field that pins every card at 4 GB or above to just under 4 GiB. The
+  tool reads the 64-bit driver registry value instead and reports *unknown*
+  rather than printing "4.0 GB" about a 16 GB card.
+
+### Known-good Windows baseline
+
+A Ryzen 7 7800X3D (8C/16T, 63 GB) with no optional packages installed produced
+a composite of 192 with 17 subscores — storage, native engine, STREAM,
+CoreMark-style, LINPACK and the compile benchmark all skipped for the reasons
+above. Installing a compiler and the `compute` tier brings those back.
+
 ## Drive lifetime & wear
 
 A benchmark says how fast storage is *today*. It says nothing about how long it
@@ -1213,7 +1289,7 @@ No compiler? That section is skipped; everything else still runs.
 python3 -m unittest discover -s tests -v
 ```
 
-516 tests, standard library only (they run with or without the optional tiers).
+521 tests, standard library only (they run with or without the optional tiers).
 
 ## Documentation
 

@@ -907,6 +907,28 @@ driver is read from the display-class registry key instead. Where that cannot
 be read, VRAM is reported as unknown with the reason — saying nothing beats
 saying 4 GB about a 16 GB card.
 
+## Windows: CPU features shows only "x86-64"
+
+Fixed in v11.11, and improved further by installing py-cpuinfo.
+
+Windows has no `/proc/cpuinfo` and no `sysctl`, and its own
+`IsProcessorFeaturePresent` API has codes for the vector extensions
+(SSE/AVX/AVX-512) and **none for AES-NI or SHA-NI** — which matter here,
+because the hashing and crypto benchmarks depend on them.
+
+```powershell
+pip install py-cpuinfo
+```
+
+That performs a real CPUID and gives the full list. A Ryzen 7 7800X3D then
+reports `AES-NI, SHA-NI, AVX-512, AVX2, AVX, FMA, SSE4.2, SSE4.1, VAES, BMI2`
+instead of a single `x86-64`. Without it the report falls back to the Win32 API
+and marks AES/SHA as undetected rather than absent, so the two cases are never
+confused.
+
+Versions before v11.11 reported the literal string "x86-64" for every Intel and
+AMD chip, which conveyed nothing.
+
 ## Reporting an issue
 
 Capture a full machine-readable dump:

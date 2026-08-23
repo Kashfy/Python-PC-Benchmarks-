@@ -96,7 +96,8 @@ TIERS: dict[str, dict] = {
                     "Per-core utilisation, sensors and counters on Windows "
                     "and Linux", 1, critical=True),
             Package("cpuinfo", "py-cpuinfo",
-                    "Accurate CPU identification on every platform", 1),
+                    "Full instruction-set detection via CPUID — the only way "
+                    "to see AES-NI and SHA-NI on Windows", 1),
             Package("rich", "rich",
                     "Formatted tables and colour in the terminal report", 2),
             Package("matplotlib", "matplotlib",

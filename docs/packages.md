@@ -1,5 +1,44 @@
 # Packages, Dependencies & Toolchain
 
+## Platform support matrix
+
+What each section needs, and what it does where the requirement is missing.
+Everything degrades with a stated reason; nothing fails silently.
+
+| Section | macOS | Linux | Windows | Requirement on Windows |
+|---|---|---|---|---|
+| CPU, memory, cache, app workloads | yes | yes | yes | — |
+| Storage (seq, IOPS, queue depth) | yes | yes | yes | — (uses seek+read where `os.pread` is absent) |
+| `compile` benchmark | yes | yes | needs a compiler | MinGW `gcc`, or `cl` from a Developer Command Prompt |
+| Native engine, **STREAM**, **CoreMark-style** | yes | yes | needs a compiler | same |
+| **LINPACK** | needs NumPy | needs NumPy | needs NumPy | `pip install numpy` |
+| Resource counters | yes | yes | needs psutil | `pip install psutil` |
+| **PMU counters** (`--counters`) | no | needs `perf` | **no** | Requires a kernel driver; no equivalent exists |
+| CPU feature list | full | full | needs py-cpuinfo | `pip install py-cpuinfo` (Win32 API has no AES/SHA codes) |
+| GPU/NPU compute | yes (Metal/Core ML) | OpenCL only | OpenCL only | `pip install pyopencl` |
+| GPU inventory | yes | yes | yes | VRAM from the driver registry, not WMI |
+| Power measurement | `powermetrics` (sudo) | RAPL | **estimate only** | No on-die metering exposed |
+| Thermals / fans | yes | hwmon | partial | WMI thermal zones where the vendor publishes them |
+| Drive lifetime | IOKit NVMe | `nvme-cli`/`smartctl` | partial | Elevated PowerShell; many consumer drives report nulls |
+| NUMA topology | n/a (unified) | yes | socket count | — |
+| NUMA bandwidth matrix | n/a | needs `numactl` | **no** | `numactl` is Linux-only |
+| Soak, monitor, gates, exports, A/B | yes | yes | yes | — |
+
+### Windows compiler selection
+
+Compilers are tried in order and the first that **actually produces a binary**
+wins, because being on PATH and being able to compile are different things:
+
+1. `gcc` — MinGW-w64, self-contained, no other dependency
+2. `cl` — MSVC; needs a Developer Command Prompt for its environment, and takes
+   a different flag dialect (`/O2`, `/Fe:`) which the tool supplies
+3. `clang-cl`, then `clang` — LLVM clang relies on a Visual Studio installation
+   for headers and linker, and fails without one
+4. `cc`
+
+When all fail, every failure is listed rather than a misleading "no compiler
+found".
+
 ## Runtime requirements
 
 | Component | Requirement | Notes |
@@ -396,7 +435,7 @@ Written to `--output-dir` (default `results/`, git-ignored):
 python3 -m unittest discover -s tests -v
 ```
 
-516 cases, standard library only — no pytest, no test dependencies.
+521 cases, standard library only — no pytest, no test dependencies.
 
 ## Version notes
 

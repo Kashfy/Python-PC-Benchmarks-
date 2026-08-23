@@ -385,9 +385,93 @@ _FEATURE_LABELS = {
 }
 
 
+#: Win32 IsProcessorFeaturePresent codes. This API covers the vector
+#: extensions and nothing else — there is no code for AES-NI or SHA-NI — so it
+#: is a fallback rather than a complete answer, and says so.
+_PF_FEATURES = [
+    (6, "SSE"), (10, "SSE2"), (13, "SSE3"), (36, "SSSE3"),
+    (37, "SSE4.1"), (38, "SSE4.2"), (39, "AVX"), (40, "AVX2"),
+    (41, "AVX-512"),
+]
+
+#: CPUID flag names (as py-cpuinfo reports them) mapped to the labels used
+#: throughout the report, so every platform prints the same vocabulary.
+_CPUID_LABELS = [
+    ("aes", "AES-NI"), ("sha_ni", "SHA-NI"), ("sha", "SHA-NI"),
+    ("avx512f", "AVX-512"), ("avx2", "AVX2"), ("avx", "AVX"),
+    ("fma", "FMA"), ("fma3", "FMA"),
+    ("sse4_2", "SSE4.2"), ("sse4_1", "SSE4.1"),
+    ("vaes", "VAES"), ("bmi2", "BMI2"),
+]
+
+
+def _features_from_cpuid_flags(flags) -> list[str]:
+    """Map a set of CPUID flag names onto this tool's labels, order preserved.
+
+    Kept as a pure function so the mapping is testable without the hardware or
+    the optional package that supplies it.
+    """
+    have = {str(f).lower().replace("-", "_") for f in (flags or [])}
+    out: list[str] = []
+    for key, label in _CPUID_LABELS:
+        if key in have and label not in out:
+            out.append(label)
+    return out
+
+
+def _cpu_features_via_cpuinfo() -> list[str]:
+    """Full feature list via py-cpuinfo, which performs a real CPUID."""
+    try:
+        import cpuinfo
+        info = cpuinfo.get_cpu_info()
+    except Exception:
+        return []
+    return _features_from_cpuid_flags(info.get("flags"))
+
+
+def _cpu_features_windows() -> list[str]:
+    """Instruction-set extensions on Windows.
+
+    Windows exposes no /proc/cpuinfo and no sysctl, and its own
+    ``IsProcessorFeaturePresent`` API has codes only for the vector extensions
+    — nothing for AES-NI or SHA-NI, which matter here because the hashing and
+    crypto benchmarks depend on them. py-cpuinfo runs a real CPUID and is
+    therefore preferred; the Win32 API is the fallback.
+
+    An earlier version reported the single string "x86-64" for every Intel and
+    AMD chip, which told the reader nothing about a Ryzen 7800X3D that has
+    AES-NI, SHA-NI, AVX2 and more.
+    """
+    found = _cpu_features_via_cpuinfo()
+    if found:
+        return found
+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for code, label in _PF_FEATURES:
+            if kernel32.IsProcessorFeaturePresent(code):
+                found.append(label)
+    except Exception:
+        return []
+
+    if found:
+        # Be explicit that the absence of AES-NI/SHA-NI here is a limit of the
+        # API, not a statement about the chip.
+        found.append("(AES/SHA detection needs py-cpuinfo)")
+    return found
+
+
 def cpu_features() -> list[str]:
     """Human-readable list of performance-relevant CPU instruction sets."""
     system = platform.system()
+
+    # py-cpuinfo performs a real CPUID and is more complete than any of the
+    # per-platform sources below, so it wins wherever it is installed.
+    detected = _cpu_features_via_cpuinfo()
+    if detected:
+        return detected
+
     found: list[str] = []
     try:
         if system == "Darwin":
@@ -432,14 +516,7 @@ def cpu_features() -> list[str]:
                         found.append(label)
 
         elif system == "Windows":
-            # PowerShell exposes IsProcessorFeaturePresent indirectly; the
-            # identifier string is a reliable coarse fallback.
-            ident = os.environ.get("PROCESSOR_IDENTIFIER", "").lower()
-            out = _run(["powershell", "-NoProfile", "-Command",
-                        "(Get-CimInstance Win32_Processor).Name"]).lower()
-            blob = ident + " " + out
-            if "intel" in blob or "amd" in blob:
-                found.append("x86-64")
+            found = _cpu_features_windows()
     except Exception:
         pass
     return found

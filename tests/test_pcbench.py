@@ -4168,3 +4168,47 @@ class TestWindowsGpuVram(unittest.TestCase):
     def test_registry_reader_degrades_to_empty(self):
         # No PowerShell on this platform; it must return {} not raise.
         self.assertIsInstance(accel._gpu_vram_from_registry(), dict)
+
+
+# --------------------------------------------------------------------------- #
+class TestCpuFeatureDetection(unittest.TestCase):
+    """Windows reported the literal string "x86-64" for every Intel and AMD chip.
+
+    That conveyed nothing about a Ryzen 7800X3D with AES-NI, SHA-NI, AVX2 and
+    AVX-512 — features the hashing and crypto benchmarks depend on.
+    """
+
+    #: The Zen 4 flag set, as CPUID reports it.
+    RYZEN_7800X3D = ["sse", "sse2", "ssse3", "sse4_1", "sse4_2", "aes",
+                     "pclmulqdq", "avx", "avx2", "fma", "bmi1", "bmi2",
+                     "avx512f", "avx512dq", "avx512bw", "avx512vl", "sha_ni",
+                     "vaes", "rdseed", "adx", "clwb"]
+
+    def test_ryzen_flags_map_to_meaningful_labels(self):
+        found = system._features_from_cpuid_flags(self.RYZEN_7800X3D)
+        for expected in ("AES-NI", "SHA-NI", "AVX-512", "AVX2", "FMA"):
+            self.assertIn(expected, found)
+        self.assertNotEqual(found, ["x86-64"])
+
+    def test_mapping_is_order_stable_and_deduplicated(self):
+        # Both "sha" and "sha_ni" appear across vendors and kernels.
+        found = system._features_from_cpuid_flags(["sha", "sha_ni", "aes"])
+        self.assertEqual(found.count("SHA-NI"), 1)
+
+    def test_empty_and_missing_flags_are_safe(self):
+        self.assertEqual(system._features_from_cpuid_flags([]), [])
+        self.assertEqual(system._features_from_cpuid_flags(None), [])
+
+    def test_win32_fallback_covers_only_vector_extensions(self):
+        # The API genuinely has no AES or SHA code, so the table must not
+        # claim one and the report must say the detection is incomplete.
+        labels = [label for _, label in system._PF_FEATURES]
+        self.assertIn("AVX2", labels)
+        self.assertNotIn("AES-NI", labels)
+        self.assertNotIn("SHA-NI", labels)
+
+    def test_cpu_features_still_works_on_this_platform(self):
+        features = system.cpu_features()
+        self.assertIsInstance(features, list)
+        if platform.system() == "Darwin" and platform.machine().startswith("arm"):
+            self.assertIn("AES", features)
