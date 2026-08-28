@@ -349,7 +349,7 @@ environment > config file > defaults.
 |------|-------------|
 | `--stats [SECTIONS]` | Report hardware facts without load. Comma-separated, or omit for all |
 | `--list-stats` | List the available sections |
-| `--menu` | Guided setup: pick a benchmark, stats section, monitor or comparison one screen at a time, then confirm the command it builds |
+| `--menu` | Guided setup, driven by the arrow keys: pick a benchmark, stats section, monitor or comparison one screen at a time, then confirm the command it builds. `PCBENCH_NO_TUI=1` forces typed answers |
 
 Sections: `cpu`, `memory`, `storage`, `drives`, `battery`, `gpu`, `thermal`,
 `power`, `os`, `environment`, `numa`, `packages`.

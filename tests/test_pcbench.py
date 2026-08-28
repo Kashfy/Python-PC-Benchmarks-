@@ -32,7 +32,7 @@ from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
                      plugins, provenance, reference, soak, standards, stats,
                      storage, sysbench, limits, mlbench, mlframework, network,
                      native, npu, onnx_model, power, regression, report, scoring,
-                     sustained, system, thermal, wizard, workloads)
+                     sustained, system, thermal, tui, wizard, workloads)
 
 
 # --------------------------------------------------------------------------- #
@@ -4552,12 +4552,245 @@ class TestHardwareStatsMode(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestTuiKeys(unittest.TestCase):
+    """Escape-sequence decoding: the subtlest part, and invisible when wrong."""
+
+    def _feed(self, data):
+        """Hand _read_posix these characters as if the terminal sent them."""
+        pending = list(data)
+
+        def fake_read(fd, count):
+            return pending.pop(0).encode() if pending else b""
+
+        def fake_select(rlist, _w, _x, _timeout):
+            return ([rlist[0]] if pending else [], [], [])
+
+        return fake_read, fake_select
+
+    def _key(self, data):
+        import unittest.mock
+        read, sel = self._feed(data)
+        with unittest.mock.patch("pcbench.tui.os.read", read):
+            with unittest.mock.patch("pcbench.tui._select.select", sel):
+                return tui._read_posix()
+
+    @unittest.skipUnless(tui._HAVE_TERMIOS, "POSIX terminal only")
+    def test_arrow_sequences(self):
+        self.assertEqual(self._key("\x1b[A"), "UP")
+        self.assertEqual(self._key("\x1b[B"), "DOWN")
+        self.assertEqual(self._key("\x1b[C"), "RIGHT")
+        self.assertEqual(self._key("\x1b[D"), "LEFT")
+        self.assertEqual(self._key("\x1bOA"), "UP")     # application mode
+        self.assertEqual(self._key("\x1b[5~"), "PGUP")
+
+    @unittest.skipUnless(tui._HAVE_TERMIOS, "POSIX terminal only")
+    def test_bare_escape_is_the_escape_key(self):
+        # Nothing follows a bare Esc, which is the only thing separating it
+        # from the start of an arrow sequence.
+        self.assertEqual(self._key("\x1b"), "ESC")
+
+    @unittest.skipUnless(tui._HAVE_TERMIOS, "POSIX terminal only")
+    def test_plain_characters_pass_through(self):
+        self.assertEqual(self._key("q"), "q")
+        self.assertEqual(self._key(" "), " ")
+
+    def test_navigation_wraps_and_jumps(self):
+        self.assertEqual(tui._move("DOWN", 0, 5), 1)
+        self.assertEqual(tui._move("UP", 0, 5), 4)       # wraps to the end
+        self.assertEqual(tui._move("DOWN", 4, 5), 0)
+        self.assertEqual(tui._move("END", 0, 5), 4)
+        self.assertEqual(tui._move("HOME", 3, 5), 0)
+        self.assertEqual(tui._move("3", 0, 5), 2)        # number jumps
+        self.assertIsNone(tui._move("ENTER", 0, 5))
+        self.assertIsNone(tui._move("9", 0, 5))          # out of range
+
+    def test_long_lists_scroll_around_the_cursor(self):
+        self.assertEqual(tui._window(5, 0, 10), (0, 5))  # no scrolling needed
+        self.assertEqual(tui._window(22, 0, 8), (0, 8))
+        self.assertEqual(tui._window(22, 21, 8), (14, 22))
+        start, end = tui._window(22, 11, 8)
+        self.assertTrue(start <= 11 < end, "cursor must stay on screen")
+
+    def test_the_key_hints_shrink_rather_than_truncate(self):
+        wide = tui._widest_that_fits(tui._FOOTER_MULTI, 100)
+        narrow = tui._widest_that_fits(tui._FOOTER_MULTI, 56)
+        self.assertIn("[a] all/none", wide)
+        self.assertLessEqual(len(narrow), 52)
+        # However narrow it gets, the way out has to stay on screen.
+        self.assertIn("esc", narrow)
+
+
+# --------------------------------------------------------------------------- #
+class TestTuiWidgets(unittest.TestCase):
+    """The key-driven widgets, fed a scripted sequence of keypresses."""
+
+    OPTIONS = [("alpha", "the first"), ("beta", "the second"),
+               ("gamma", "the third")]
+
+    def _out(self):
+        import io
+        return io.StringIO()
+
+    def _reader(self, keys):
+        return iter(keys).__next__
+
+    def test_select_moves_and_returns_the_index(self):
+        out = self._out()
+        index = tui.select("t", "q?", self.OPTIONS, out=out,
+                           read=self._reader(["DOWN", "DOWN", "ENTER"]))
+        self.assertEqual(index, 2)
+
+    def test_select_escape_goes_back(self):
+        with self.assertRaises(tui.Back):
+            tui.select("t", "q?", self.OPTIONS, out=self._out(),
+                       read=self._reader(["ESC"]))
+
+    def test_select_q_quits(self):
+        with self.assertRaises(tui.Quit):
+            tui.select("t", "q?", self.OPTIONS, out=self._out(),
+                       read=self._reader(["q"]))
+
+    def test_multiselect_toggles_with_space(self):
+        chosen = tui.multiselect("t", "q?", self.OPTIONS, out=self._out(),
+                                 read=self._reader([" ", "DOWN", "DOWN", " ",
+                                                    "ENTER"]))
+        self.assertEqual(chosen, [0, 2])
+
+    def test_multiselect_space_untoggles(self):
+        chosen = tui.multiselect("t", "q?", self.OPTIONS, out=self._out(),
+                                 read=self._reader([" ", " ", "ENTER"]))
+        self.assertEqual(chosen, [])
+
+    def test_multiselect_a_toggles_everything(self):
+        chosen = tui.multiselect("t", "q?", self.OPTIONS, out=self._out(),
+                                 read=self._reader(["a", "ENTER"]))
+        self.assertEqual(chosen, [0, 1, 2])
+
+    def test_multiselect_starts_from_the_default(self):
+        chosen = tui.multiselect("t", "q?", self.OPTIONS, default="all",
+                                 out=self._out(),
+                                 read=self._reader([" ", "ENTER"]))
+        self.assertEqual(chosen, [1, 2], "space should clear the first one")
+
+    def test_multiselect_refuses_an_empty_answer_when_told_to(self):
+        out = self._out()
+        chosen = tui.multiselect("t", "q?", self.OPTIONS, allow_empty=False,
+                                 out=out,
+                                 read=self._reader(["ENTER", " ", "ENTER"]))
+        self.assertEqual(chosen, [0])
+        self.assertIn("choose at least one", out.getvalue())
+
+    def test_text_accepts_typing_and_backspace(self):
+        value = tui.text("t", "q?", "Seconds", "3", out=self._out(),
+                         read=self._reader(["4", "2", "x", "BACKSPACE",
+                                            "ENTER"]))
+        self.assertEqual(value, "42")
+
+    def test_text_empty_answer_takes_the_default(self):
+        value = tui.text("t", "q?", "Seconds", "3", out=self._out(),
+                         read=self._reader(["ENTER"]))
+        self.assertEqual(value, "3")
+
+    def test_text_re_asks_until_the_value_validates(self):
+        def only_numbers(value):
+            if not value.isdigit():
+                raise ValueError("digits only")
+
+        out = self._out()
+        value = tui.text("t", "q?", "N", "", validate=only_numbers, out=out,
+                         read=self._reader(["z", "ENTER", "7", "ENTER"]))
+        self.assertEqual(value, "7")
+        self.assertIn("digits only", out.getvalue())
+
+    def test_text_does_not_treat_q_as_quit(self):
+        # q is a character to type here, not a command.
+        value = tui.text("t", "q?", "Host", "", out=self._out(),
+                         read=self._reader(["q", "ENTER"]))
+        self.assertEqual(value, "q")
+
+    def test_rows_line_up_whether_or_not_they_are_highlighted(self):
+        # The cursor row carries a "> " marker; the others have to be
+        # indented past it, or the list jumps sideways as the cursor moves.
+        out = self._out()
+        with self.assertRaises(tui.Back):
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["ESC"]))
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out.getvalue())
+        rows = [line for line in plain.split("\r\n") if "alpha" in line
+                or "beta" in line]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].index("alpha"), rows[1].index("beta"))
+
+    def test_screen_is_a_no_op_when_the_terminal_cannot_take_it(self):
+        # Under a pipe there is nothing to put into raw mode, and trying
+        # would be worse than doing nothing.
+        with tui.screen() as active:
+            self.assertFalse(active)
+
+
+# --------------------------------------------------------------------------- #
+class TestWizardByKeys(unittest.TestCase):
+    """The whole flow driven by keypresses, the way a terminal drives it."""
+
+    def _drive(self, keys):
+        import io
+        import contextlib
+        import unittest.mock
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            with unittest.mock.patch("pcbench.tui.supported",
+                                     return_value=True):
+                with unittest.mock.patch("pcbench.tui.screen",
+                                         contextlib.nullcontext):
+                    with unittest.mock.patch("pcbench.tui.read_key",
+                                             side_effect=keys):
+                        argv = wizard.run()
+        return argv, buffer.getvalue()
+
+    def test_quick_benchmark_by_arrow_keys(self):
+        # benchmark > quick pass > no extras > no output > run
+        argv, _ = self._drive(["ENTER", "ENTER", "ENTER", "ENTER", "ENTER"])
+        self.assertEqual(argv, ["--quick"])
+
+    def test_ticking_an_output_with_space(self):
+        argv, _ = self._drive(["ENTER", "ENTER", "ENTER",
+                               " ", "ENTER",          # tick HTML report
+                               "ENTER"])
+        self.assertEqual(argv, ["--quick", "--html"])
+
+    def test_escape_climbs_back_out_of_a_branch(self):
+        argv, output = self._drive(["ENTER", "ESC",    # into benchmark, out
+                                    "DOWN", "ENTER",   # stats
+                                    "ENTER",           # every section, ticked
+                                    "ENTER",           # readable report
+                                    "ENTER"])          # run
+        self.assertEqual(argv, ["--stats"])
+        self.assertIn("Main menu", output)
+
+    def test_sections_start_ticked_where_all_is_the_sensible_answer(self):
+        # The stats screen defaults to every section, so untick one rather
+        # than tick eleven.
+        argv, _ = self._drive(["DOWN", "ENTER", " ", "ENTER", "ENTER",
+                               "ENTER"])
+        self.assertEqual(argv[0], "--stats")
+        self.assertNotIn("cpu", argv[1].split(","))
+
+    def test_q_quits_without_running(self):
+        argv, _ = self._drive(["q"])
+        self.assertIsNone(argv)
+
+    def test_ctrl_c_quits_without_running(self):
+        argv, _ = self._drive(["\x03"])
+        self.assertIsNone(argv)
+
+
+# --------------------------------------------------------------------------- #
 class TestWizardParsing(unittest.TestCase):
-    """The selection grammar, which is the only place a typo can hide."""
+    """The typed selection grammar, the fallback for a pipe or a dumb term."""
 
     def test_numbers_ranges_and_names(self):
         names = ["cpu_int", "memory", "disk", "json"]
-        parse = wizard._parse_selection
+        parse = tui.parse_selection
         self.assertEqual(parse("1,3", 4), [0, 2])
         self.assertEqual(parse("2-4", 4), [1, 2, 3])
         self.assertEqual(parse("all", 4), [0, 1, 2, 3])
@@ -4566,12 +4799,12 @@ class TestWizardParsing(unittest.TestCase):
         self.assertEqual(parse("1 2", 4), [0, 1])
 
     def test_duplicates_collapse_but_order_is_kept(self):
-        self.assertEqual(wizard._parse_selection("3,1,3", 4), [2, 0])
+        self.assertEqual(tui.parse_selection("3,1,3", 4), [2, 0])
 
     def test_out_of_range_and_unknown_names_are_rejected(self):
         for bad in ("0", "5", "2-9", "nope"):
             with self.assertRaises(ValueError):
-                wizard._parse_selection(bad, 4, ["a", "b", "c", "d"])
+                tui.parse_selection(bad, 4, ["a", "b", "c", "d"])
 
 
 # --------------------------------------------------------------------------- #

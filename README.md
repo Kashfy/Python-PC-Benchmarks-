@@ -717,36 +717,48 @@ before a first run, so there is a guided setup that asks instead:
 pcbench --menu
 ```
 
-It works the way an OS installer does — one question per screen, `b` to step
-back, `q` to leave, and nothing starts until you accept the summary:
+It is driven the way an OS installer is. Arrow keys move the highlighted row,
+Enter selects, Esc steps back, `q` leaves. Nothing is typed and nothing starts
+until you accept the summary at the end.
 
 ```
-==========================================================================
-  pcbench 11.15 > Main menu
-==========================================================================
+====================================================================================
+  pcbench 11.16 > Main menu
+====================================================================================
 
   What would you like to do?
 
-     1. Run a benchmark
-        Measure how fast this machine is
-     2. Read hardware stats
-        Battery, SSD endurance, temperatures, GPUs - nothing is loaded
-     3. Watch or stress the machine
-        Live monitor, thermal throttling test, burn-in soak
-     4. Check hardware health
-        RAM integrity, SMART status, drive wear
-     5. Look at past runs
-        Rank the history, or compare two saved runs
-     6. Shortcuts
-        The flat list, if you already know what you want
+  > Run a benchmark              Measure how fast this machine is
+    Read hardware stats          Battery, SSD endurance, temperatures, GPUs
+    Watch or stress the machine  Live monitor, thermal throttling test, burn-in
+    Check hardware health        RAM integrity, SMART status, drive wear
+    Look at past runs            Rank the history, or compare two saved runs
+    Shortcuts                    The flat list, if you already know what you want
+
+  [up/down] move   [enter] select   [esc] back   [q] quit
 ```
 
 Picking *Run a benchmark* then asks what kind (quick pass, the full suite, a
 profile, individual tests, AI/data science, storage I/O, reference standards),
 how long each test should run, what else to measure, and what to write out.
-Multi-choice screens take numbers, ranges or names — `1,4`, `1-6`, `all`,
-`none`, or `cpu_int,disk`. Screens that cannot apply to your answers are
-skipped in both directions, so stepping back never lands on a dead question.
+Screens that pick several things at once are checkboxes — space ticks a row,
+`a` ticks or clears everything, Enter accepts:
+
+```
+  Which tests?
+
+  > [x] cpu_int      Integer math, single core (primes/s)
+    [ ] cpu_float    Floating-point math, single core (iters/s)
+    [x] cpu_multi    Integer math across every core (primes/s)
+    [ ] cores        Per-core-count scaling curve and efficiency-core detection
+    v 18 more
+
+  [up/down] move   [space] toggle   [a] all/none   [enter] accept   [esc] back
+```
+
+Long lists scroll around the cursor, and screens that cannot apply to your
+answers are skipped in both directions — so stepping back never lands on a
+dead question.
 
 The last screen is the whole point:
 
@@ -761,14 +773,20 @@ The last screen is the whole point:
     - self-contained html report
     - results saved to results/ as JSON and CSV
 
-     1. Run it now
-     2. Go back and change something
-     3. Quit without running anything
+  > Run it now
+    Go back and change something
+    Quit without running anything
 ```
 
-It prints the command line it assembled before running it, so the menu teaches
-the flags rather than replacing them — the second time you want that run, you
-type it. For everything else: `--list-tests`, `--list-stats`, `--list-devices`.
+The screens are drawn on the terminal's alternate buffer, so once it exits the
+only thing left in your scrollback is the command it built. That is deliberate:
+the menu teaches the flags rather than replacing them, and the second time you
+want that run, you type it.
+
+Over a pipe, on a terminal that cannot be put into raw mode, or with
+`PCBENCH_NO_TUI=1` set, the same screens fall back to numbered answers you type
+— so `printf '2\nbattery\n1\n1\n' | pcbench --menu` still works. For
+everything else: `--list-tests`, `--list-stats`, `--list-devices`.
 
 ## Drive lifetime & wear
 

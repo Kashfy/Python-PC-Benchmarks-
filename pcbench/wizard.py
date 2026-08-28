@@ -7,10 +7,16 @@ This module asks a short series of them instead — what kind of work, then
 which one, then the options that apply to it, then a confirmation screen —
 the way an OS installer does.
 
-Two rules hold on every screen. ``b`` steps back and ``q`` leaves, so no
-answer is a trap. And nothing starts until the confirmation screen is
-accepted, which then prints the exact command line it assembled, so the
-questions are a way to learn the flags rather than a substitute for them.
+It is driven the way one is, too: arrow keys move a highlighted cursor,
+space ticks a checkbox, Enter accepts, Esc steps back, and q leaves. The
+widgets that do that live in :mod:`pcbench.tui`; this module is only the
+flow. Over a pipe, or on a terminal that cannot be put into raw mode, the
+same screens fall back to typed answers.
+
+Two rules hold everywhere. No answer is a trap, because every screen goes
+back. And nothing starts until the confirmation screen is accepted, which
+then prints the exact command line it assembled, so the questions are a way
+to learn the flags rather than a substitute for them.
 """
 
 from __future__ import annotations
@@ -21,15 +27,9 @@ from datetime import datetime
 
 from . import __version__
 from . import hwinfo
-from .report import WIDTH
-
-
-class _Back(Exception):
-    """The user asked for the previous screen."""
-
-
-class _Quit(Exception):
-    """The user asked to leave without running anything."""
+from . import tui
+from .tui import Back as _Back
+from .tui import Quit as _Quit
 
 
 #: Returned by a step that does not apply to the answers given so far. The
@@ -39,12 +39,6 @@ class _Quit(Exception):
 #: and bounce the user forward again.
 _SKIP = object()
 
-_BACK_WORDS = {"b", "back"}
-_QUIT_WORDS = {"q", "quit", "exit"}
-_FOOTER = "  [number] choose    [b] back    [q] quit"
-_FOOTER_MULTI = "  [numbers] choose    [b] back    [q] quit"
-_FOOTER_TEXT = "  [value] answer    [b] back    [q] quit"
-
 
 def _cli():
     """The CLI module, imported late because it imports this one."""
@@ -52,143 +46,26 @@ def _cli():
     return cli
 
 
-# --------------------------------------------------------------------------- #
-# Screen drawing and prompts
-# --------------------------------------------------------------------------- #
-def _fit(text: str, width: int) -> str:
-    return text if len(text) <= width else text[:max(0, width - 3)] + "..."
-
-
-def _header(trail: list[str]) -> None:
-    """The installer-style banner: where you are, and how you got here."""
-    print()
-    print("=" * WIDTH)
-    print("  " + _fit(" > ".join([f"pcbench {__version__}"] + list(trail)),
-                      WIDTH - 4))
-    print("=" * WIDTH)
-
-
-def _draw(trail, question: str, lines, error: str,
-          footer: str = _FOOTER) -> None:
-    _header(trail)
-    print(f"\n  {question}\n")
-    for line in lines:
-        print(line)
-    if error:
-        print(f"\n  !  {error}")
-    print(f"\n{footer}")
-
-
-def _input(label: str, default: str = "") -> str:
-    """One line of input, with back/quit handled before the caller sees it."""
-    suffix = f" [{default}]" if default else ""
-    try:
-        answer = input(f"\n  {label}{suffix}: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        raise _Quit
-    lowered = answer.lower()
-    if lowered in _QUIT_WORDS:
-        raise _Quit
-    if lowered in _BACK_WORDS:
-        raise _Back
-    return answer or default
-
-
-def _options_block(options) -> list[str]:
-    lines = []
-    for number, option in enumerate(options, 1):
-        label = option[0]
-        detail = option[1] if len(option) > 1 else ""
-        lines.append(f"    {number:>2}. {label}")
-        if detail:
-            lines.append("        " + _fit(detail, WIDTH - 10))
-    return lines
+def _title(trail) -> str:
+    """The breadcrumb each screen carries: where you are and how you got
+    here."""
+    return " > ".join([f"pcbench {__version__}"] + list(trail))
 
 
 def _choose(trail, question, options, body=(), note="") -> int:
-    """Ask for one of ``options``. Returns its index."""
-    error = ""
-    while True:
-        lines = list(body) + ([""] if body else []) + _options_block(options)
-        if note:
-            lines += ["", f"  {note}"]
-        _draw(trail, question, lines, error)
-        answer = _input("Choice")
-        if answer.isdigit() and 1 <= int(answer) <= len(options):
-            return int(answer) - 1
-        error = f"{answer!r} is not one of 1-{len(options)}"
-
-
-def _parse_selection(answer: str, count: int, names=None) -> list[int]:
-    """Turn ``'1,4-6'``, ``'all'``, or ``'cpu_int,disk'`` into indexes."""
-    lowered = answer.strip().lower()
-    if lowered in ("all", "*"):
-        return list(range(count))
-    if lowered in ("none", "-"):
-        return []
-    chosen: list[int] = []
-    for token in lowered.replace(" ", ",").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        parts = token.split("-", 1)
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            low, high = int(parts[0]), int(parts[1])
-            if not 1 <= low <= high <= count:
-                raise ValueError(f"{token!r} is outside 1-{count}")
-            chosen += list(range(low - 1, high))
-        elif token.isdigit():
-            number = int(token)
-            if not 1 <= number <= count:
-                raise ValueError(f"{token!r} is outside 1-{count}")
-            chosen.append(number - 1)
-        elif names and token in names:
-            chosen.append(names.index(token))
-        else:
-            raise ValueError(f"{token!r} is not one of the choices")
-    seen, ordered = set(), []
-    for index in chosen:
-        if index not in seen:
-            seen.add(index)
-            ordered.append(index)
-    return ordered
+    return tui.select(_title(trail), question, options, body=body, note=note)
 
 
 def _multi(trail, question, options, names=None, default="none",
            allow_empty=True, note="") -> list[int]:
-    """Ask for any number of ``options``. Returns their indexes."""
-    hint = ("Numbers (1,4), ranges (1-6), 'all', or 'none'"
-            + (", or names" if names else ""))
-    error = ""
-    while True:
-        lines = _options_block(options) + ["", f"  {note or hint}"]
-        _draw(trail, question, lines, error, _FOOTER_MULTI)
-        answer = _input("Choice(s)", default)
-        try:
-            chosen = _parse_selection(answer, len(options), names)
-        except ValueError as e:
-            error = str(e)
-            continue
-        if not chosen and not allow_empty:
-            error = "choose at least one"
-            continue
-        return chosen
+    return tui.multiselect(_title(trail), question, options, names=names,
+                           default=default, allow_empty=allow_empty,
+                           note=note)
 
 
 def _text(trail, question, label, default, validate=None, body=()) -> str:
-    """Ask for a free-text value, re-asking until ``validate`` accepts it."""
-    error = ""
-    while True:
-        _draw(trail, question, list(body), error, _FOOTER_TEXT)
-        answer = _input(label, default)
-        if validate is None:
-            return answer
-        try:
-            validate(answer)
-            return answer
-        except ValueError as e:
-            error = str(e)
+    return tui.text(_title(trail), question, label, default, body=body,
+                    validate=validate)
 
 
 def _confirm(trail, argv: list[str], plan: list[str]) -> None:
@@ -345,9 +222,7 @@ def _bench_tests(trail) -> dict:
     names = list(cli.TESTS)
     options = [(name, cli.DESCRIPTIONS.get(name, "")) for name in names]
     chosen = _multi(trail + ["Tests"], "Which tests?", options, names=names,
-                    default="", allow_empty=False,
-                    note="Numbers (1,4,7), ranges (1-6), names "
-                         "(cpu_int,disk), or 'all'")
+                    default="", allow_empty=False)
     picked = [names[i] for i in chosen]
     return dict(mode="suite", select=["--only", ",".join(picked)], depth=None,
                 label=f"{len(picked)} test(s): {', '.join(picked)}")
@@ -411,7 +286,7 @@ def _bench_extras(state) -> None:
                     "Anything else to measure while it runs?",
                     [(label, detail) for _, label, detail in _EXTRAS],
                     default="none",
-                    note="All optional. Press Enter for none of them.")
+                    note="All optional; accepting none of them is normal.")
     state["extras"] = chosen
     return None
 
@@ -585,7 +460,7 @@ def _watch_options(state) -> None:
     state["options"] = _multi(
         ["Watch", state["label"], "Options"], "Any options?",
         [(label, detail) for _, label, detail in options], default="none",
-        note="All optional. Press Enter for none of them.")
+        note="All optional; accepting none of them is normal.")
     return None
 
 
@@ -806,7 +681,7 @@ def _shortcuts() -> list[str]:
     options = [(label, " ".join(argv) or "(no flags)")
                for label, argv in SHORTCUTS]
     index = _choose(["Shortcuts"], "Pick a task.", options,
-                    note="The flags each one maps to are shown underneath.")
+                    note="Each one is a real command line, shown beside it.")
     return list(SHORTCUTS[index][1])
 
 
@@ -829,8 +704,8 @@ def _main_menu() -> list[str]:
     handlers = [_benchmark, _stats, _watch, _health, _history, _shortcuts]
     while True:
         index = _choose(["Main menu"], "What would you like to do?", _MAIN,
-                        note="Every screen takes 'b' to go back and 'q' to "
-                             "quit.")
+                        note="Every screen goes back, so nothing here "
+                             "commits you to anything.")
         try:
             return handlers[index]()
         except _Back:
@@ -838,10 +713,18 @@ def _main_menu() -> list[str]:
 
 
 def run() -> list[str] | None:
-    """Ask the questions. Returns the argv to run, or None to do nothing."""
-    try:
-        argv = _main_menu()
-    except _Quit:
+    """Ask the questions. Returns the argv to run, or None to do nothing.
+
+    The screens are drawn on the terminal's alternate buffer, so the summary
+    below is the first thing left in the scrollback: what ran, and how to
+    ask for it again without the questions.
+    """
+    with tui.screen():
+        try:
+            argv = _main_menu()
+        except _Quit:
+            argv = None
+    if argv is None:
         print("\n  Nothing was run.\n")
         return None
     command = ("pcbench " + " ".join(argv)).strip()

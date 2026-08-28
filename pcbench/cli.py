@@ -280,9 +280,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--list-stats", action="store_true",
                    help="List the available --stats sections, then exit")
     g.add_argument("--menu", action="store_true",
-                   help="Guided setup: choose a benchmark, a stats section, "
-                        "a monitor or a comparison by answering a few "
-                        "questions, then confirm the command it builds")
+                   help="Guided setup, driven by the arrow keys: choose a "
+                        "benchmark, a stats section, a monitor or a "
+                        "comparison one screen at a time, then confirm the "
+                        "command it builds")
 
     g = p.add_argument_group("analysis depth")
     g.add_argument("--counters", action="store_true",
