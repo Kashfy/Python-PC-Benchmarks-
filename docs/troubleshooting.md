@@ -20,6 +20,65 @@ The thresholds: battery power, load per core above 0.30, or an active thermal
 throttle. Note that running the benchmark itself raises the load average, so
 back-to-back runs may trip the guard; wait a minute between them.
 
+## `--menu` does not respond to the arrow keys
+
+The menu needs a real terminal: stdin and stdout both a TTY, and `TERM` set to
+something other than `dumb`. When any of that is missing it falls back to
+numbered answers you type, which is the correct behaviour for a pipe, a CI
+log, or an editor's output pane — not a bug.
+
+Check what it sees:
+
+```bash
+python3 -c "from pcbench import tui; print(tui.supported())"
+```
+
+`False` and you did not expect it, in rough order of likelihood:
+
+1. **Output is redirected or piped** — `pcbench --menu | less` cannot be
+   interactive. Run it on its own.
+2. **`PCBENCH_NO_TUI` is set** — that forces the typed path. `unset
+   PCBENCH_NO_TUI`.
+3. **`TERM` is unset or `dumb`** — common under `cron`, some CI runners, and
+   a few IDE terminals. `export TERM=xterm-256color`.
+4. **Windows before 10, or a console without VT support** — the ANSI drawing
+   cannot be enabled, so the typed path is used. Windows Terminal works.
+
+The typed path takes the same answers by number, including ranges and names:
+
+```bash
+printf '2\nbattery\n1\n1\n' | pcbench --menu     # stats > battery > run
+```
+
+## The menu screen is garbled, or the shell is broken after it
+
+Raw mode and the alternate screen buffer are restored in a `finally`, so a
+normal exit — including `q` and Ctrl-C — always puts the terminal back. If a
+hard kill (`SIGKILL`, a closed pane) skipped that, reset the terminal:
+
+```bash
+reset
+```
+
+Over `ssh`, `tmux` or `screen`, a `TERM` the outer terminal does not
+understand causes the escape sequences to be printed instead of acted on. Set
+`TERM` to something both ends know (`xterm-256color`), or use
+`PCBENCH_NO_TUI=1` for a session with no cursor addressing at all.
+
+## The menu ran something other than what I picked
+
+It cannot, but it can be given nothing to work with: flags typed alongside
+`--menu` are discarded, because the menu assembles a fresh command line. It
+says so before drawing:
+
+```
+  note: --menu builds its own command line, so --html will not be used.
+```
+
+Tick the HTML report on the menu's own output screen instead. The confirmation
+screen shows the exact command before anything starts, and that same command
+is printed afterwards — run it directly to skip the questions next time.
+
 ## "VALIDATION FAILED" (exit code 4)
 
 A workload computed the **wrong answer**. This is the most serious result the

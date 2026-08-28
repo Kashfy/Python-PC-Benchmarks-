@@ -225,6 +225,9 @@ measures two things Python cannot express meaningfully:
 parse_args()
    ├─ --list-tests / --init-config / --list-devices / --compare → print, exit 0
    ├─ config.apply()   config file + PCBENCH_* (command line still wins)
+   ├─ --list-stats / --stats? → hwinfo.collect(), render, exit 0 (no load)
+   ├─ --menu?     → wizard.run() over tui widgets, then main(chosen argv);
+   │                 the menu itself starts nothing
    ├─ --monitor?  → telemetry session, summary, exit 0 (no benchmarking)
    ├─ --quick presets, validate --only/--skip/--assert, parse durations
    │      malformed assertions fail here, not after ten minutes of work

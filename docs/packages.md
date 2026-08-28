@@ -76,10 +76,9 @@ onto an unfamiliar machine and run immediately, with no install step and no
 |--------|----------|
 | `argparse` | CLI parsing |
 | `csv` | History file read/write |
-| `ctypes` | Windows RAM and power queries (lazy import) |
+| `ctypes` | Windows RAM and power queries, and enabling ANSI output on Windows 10+ consoles (lazy import) |
 | `datetime` | UTC timestamps |
 | `fcntl` | macOS `F_NOCACHE` page-cache bypass (lazy import) |
-| `glob` | Linux power-supply and thermal sysfs nodes |
 | `hashlib` | SHA-256 workload |
 | `html` | Escaping in the HTML report |
 | `json` | JSON output, parsing native engine output |
@@ -89,7 +88,7 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `platform` | OS / arch / Python identification |
 | `random` | Deterministic corpus and random-read offsets |
 | `re` | Parsing `/proc` files, sanitizing filenames |
-| `shutil` | `which`, `disk_usage` |
+| `shutil` | `which`, `disk_usage`, terminal size for `--menu` |
 | `statistics` | `median`, `fmean`, `stdev` |
 | `subprocess` | `sysctl`, `pmset`, PowerShell, the native engine |
 | `sys` | Bitness, byte order, exit codes |
@@ -99,10 +98,11 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `unittest` | Test suite |
 | `winreg` | Windows CPU model (lazy import) |
 | `zlib` | Compression workload |
-| `struct` | Packing float weights into the Core ML protobuf |
 | `socket` / `threading` | Loopback network benchmark |
 | `struct` | Packing weights into the Core ML and ONNX protobufs |
-| `glob` | Sensor, power-supply, and hwmon enumeration |
+| `glob` | Sensor, power-supply, thermal and hwmon sysfs enumeration |
+| `termios` / `tty` | Raw keyboard mode for `--menu` on Unix (lazy import) |
+| `msvcrt` | Raw keyboard mode for `--menu` on Windows (lazy import) |
 
 ## Optional package tiers
 

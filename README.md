@@ -137,6 +137,10 @@ pip install -e .
 pcbench --quick
 ```
 
+Not sure what to ask for? `pcbench --menu` walks you through it with the arrow
+keys and prints the command it built — see
+[choosing what to run](#choosing-what-to-run).
+
 ## What makes it reliable
 
 | Feature | Why it matters |
@@ -718,12 +722,13 @@ pcbench --menu
 ```
 
 It is driven the way an OS installer is. Arrow keys move the highlighted row,
-Enter selects, Esc steps back, `q` leaves. Nothing is typed and nothing starts
-until you accept the summary at the end.
+Enter selects, Esc steps back, `q` leaves. The only thing you ever type is a
+real value — a duration, a custom repeat count — and nothing starts until you
+accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.16 > Main menu
+  pcbench 11.17 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -785,8 +790,11 @@ want that run, you type it.
 
 Over a pipe, on a terminal that cannot be put into raw mode, or with
 `PCBENCH_NO_TUI=1` set, the same screens fall back to numbered answers you type
-— so `printf '2\nbattery\n1\n1\n' | pcbench --menu` still works. For
-everything else: `--list-tests`, `--list-stats`, `--list-devices`.
+— so `printf '2\nbattery\n1\n1\n' | pcbench --menu` still works. If the arrow
+keys do nothing when you expected them to, see
+[troubleshooting](docs/troubleshooting.md#--menu-does-not-respond-to-the-arrow-keys).
+
+For everything else: `--list-tests`, `--list-stats`, `--list-devices`.
 
 ## Drive lifetime & wear
 
@@ -1162,6 +1170,18 @@ exactly the false precision worth avoiding.
 | `--force` | off | Run despite distorting machine state |
 | `--no-autoscale` | off | Do not shrink test sizes on small or CPU-limited machines |
 | `--list-tests` | — | List every test and profile, then exit |
+
+**Hardware stats & guided setup**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--stats [a,b]` | — | Report hardware facts and exit; no benchmark runs. Omit the list for every section |
+| `--list-stats` | — | List the available `--stats` sections, then exit |
+| `--menu` | off | [Guided setup](#choosing-what-to-run) driven by the arrow keys; builds a command line, shows it, then runs it |
+
+Sections for `--stats`: `cpu`, `memory`, `storage`, `drives`, `battery`,
+`gpu`, `thermal`, `power`, `os`, `environment`, `numa`, `packages`.
+`PCBENCH_NO_TUI=1` makes `--menu` use typed answers instead of the arrow keys.
 
 **Analysis depth**
 

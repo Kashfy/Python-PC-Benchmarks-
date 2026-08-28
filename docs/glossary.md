@@ -176,6 +176,9 @@ See [ml-algorithms.md](ml-algorithms.md) for how each algorithm actually works.
 | **API** | **A**pplication **P**rogramming **I**nterface | The published way for programs to ask a system to do something. |
 | **SDK** | **S**oftware **D**evelopment **K**it | The tools and libraries for building on a platform. |
 | **CLI** | **C**ommand **L**ine **I**nterface | Text commands and flags — how you drive this tool. |
+| **TUI** | **T**ext **U**ser **I**nterface | A full-screen interface drawn in the terminal and driven by keys rather than typed commands — what `--menu` gives you. |
+| **raw mode** | — | A terminal setting where each keypress reaches the program immediately, instead of a whole line at Enter. It is what makes arrow keys work; the tool always restores the previous setting on exit. |
+| **alternate screen buffer** | — | A second, scrollback-free screen a program can draw on and then drop, leaving what was there before untouched. `--menu` uses it, so only the command it built stays in your history. |
 | **GIL** | **G**lobal **I**nterpreter **L**ock | A CPython lock allowing only one thread to run Python at a time. Python 3.13+ can be built without it. |
 | **spawn / fork** | — | Two ways to start a worker process. This tool uses `spawn` everywhere for identical behaviour across platforms. |
 | **JSON** | **J**ava**S**cript **O**bject **N**otation | A structured text format; used for the full result payload. |

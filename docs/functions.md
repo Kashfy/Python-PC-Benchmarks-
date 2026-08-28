@@ -615,6 +615,101 @@ names.
 Maps every test name to its callable. A test in `TESTS` without an entry here
 is caught by the suite.
 
+#### `--menu` dispatch
+`main()` calls `wizard.run()`, then re-enters `main()` with the argv the
+wizard returned — so a menu choice takes exactly the path a typed command
+would. Flags given alongside `--menu` are named and discarded, since the
+wizard builds a fresh command line.
+
+---
+
+## `pcbench.wizard` — the guided menu
+
+Screens and what they build. The widgets themselves are `pcbench.tui`; this
+module holds only the flow.
+
+#### `run() -> list[str] | None`
+Draws the menu inside `tui.screen()` and returns the argv to run, or `None`
+if the user left. Prints the assembled command line afterwards, outside the
+alternate buffer, so it survives in the scrollback.
+
+#### `SHORTCUTS: list[tuple[str, list[str]]]`
+The flat list of common tasks, reachable from the main menu. Every entry is a
+real command line; a test asserts the parser accepts each one, so a dead menu
+item cannot ship.
+
+#### `_run_steps(steps, state) -> list[str]`
+The step machine behind every branch. Each step mutates `state` and may raise
+`tui.Back`; a step that returns `_SKIP` does not apply to the answers so far,
+and the machine keeps moving in the direction it was already going. That is
+what stops a skipped screen from bouncing the user forward again when they
+step back through it. Walking off the front re-raises `Back`, which the main
+menu catches.
+
+#### `_benchmark()` · `_stats()` · `_watch()` · `_health()` · `_history()`
+One step list each: e.g. the benchmark branch is kind → scope → depth →
+extras → output → confirm. Scope only appears for a focused run (data
+science, I/O, standards); depth is skipped when the chosen kind already
+fixes it.
+
+#### `_confirm(trail, argv, plan) -> None`
+The last screen of every branch: the command line, a plain-English plan, and
+run / go back / quit. Nothing has started when it is drawn.
+
+#### `_validate(argv) -> str`
+Parses the assembled argv with the real parser and returns an error string if
+it would be rejected — so a wizard bug surfaces as a screen, not a traceback
+after the user commits.
+
+---
+
+## `pcbench.tui` — raw-terminal widgets
+
+No dependency: `termios`/`tty` on Unix, `msvcrt` on Windows, ANSI for drawing.
+Every widget falls back to a typed prompt when the terminal cannot be driven
+key by key, which is what keeps `--menu` scriptable.
+
+#### `supported() -> bool`
+True when stdin and stdout are both a TTY, `TERM` is usable, and
+`PCBENCH_NO_TUI` is unset. On Windows it also enables
+`ENABLE_VIRTUAL_TERMINAL_PROCESSING` via ctypes, and reports whether that
+worked.
+
+#### `screen()` (context manager)
+Alternate buffer, hidden cursor, raw mode — all restored in a `finally`,
+including on Ctrl-C, because a terminal left in raw mode breaks the user's
+shell. Yields `False` and does nothing when `supported()` is false.
+
+#### `read_key() -> str`
+One keypress as a name (`UP`, `ENTER`, `BACKSPACE`, `ESC`) or the character
+itself. `_read_posix` distinguishes a bare Esc from the start of an arrow
+sequence by a 50 ms timeout, since nothing follows a bare Esc.
+
+#### `select(title, question, options, ...) -> int`
+One choice. Arrows or `j`/`k` move, a digit jumps, Enter selects, Esc raises
+`Back`, `q` raises `Quit`.
+
+#### `multiselect(title, question, options, default="none", ...) -> list[int]`
+Checkboxes. Space toggles, `a` ticks or clears everything, Enter accepts.
+`default` pre-ticks entries (`"all"`, `"none"`, or the same comma syntax the
+typed path takes); `allow_empty=False` refuses an empty answer.
+
+#### `text(title, question, label, default, validate=None, ...) -> str`
+A one-line field. Printable keys type, Backspace deletes, Ctrl-U clears,
+Enter accepts the default when nothing was typed. `q` is a character here,
+not a command. `validate` re-asks with the error shown in place.
+
+#### `parse_selection(answer, count, names=None) -> list[int]`
+The typed path's grammar: `1,4`, ranges `1-6`, `all`, `none`, or names.
+Duplicates collapse and order is kept.
+
+#### `_window(count, cursor, room) -> (start, end)`
+The slice of a long list to draw, keeping the cursor on screen.
+
+#### `_widest_that_fits(candidates, width) -> str`
+Picks the widest key-hint line that fits, so a narrow terminal loses the
+optional hints rather than truncating the one that says how to leave.
+
 ---
 
 ## `native_engine.c`
