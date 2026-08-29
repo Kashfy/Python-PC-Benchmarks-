@@ -132,6 +132,8 @@ _BENCH_KINDS = [
      "Database, sequential, log-write and mixed-VM patterns"),
     ("Reference standards",
      "STREAM, LINPACK and a CoreMark-style suite"),
+    ("Drive read/write speed",
+     "Sequential MB/s and random IOPS, per drive, and nothing else"),
 ]
 
 _DEPTHS = [
@@ -196,13 +198,43 @@ def _bench_kind(state) -> None:
             elif index == 5:
                 state.update(mode="io", select=[], depth=None,
                              label="the storage I/O job suite")
-            else:
+            elif index == 6:
                 state.update(mode="standards", select=[], depth=None,
                              label="the reference standards: STREAM, LINPACK "
                                    "and CoreMark")
+            else:
+                state.update(_bench_drives(trail))
         except _Back:
             continue
         return None
+
+
+def _bench_drives(trail) -> dict:
+    """Which drives to measure. Own mode, so no other test runs alongside."""
+    inv = _storage().inventory(256)
+    devices = [d for d in inv.get("devices", []) if d.get("benchmarkable")]
+    options = [("Every drive that can be measured",
+                f"{len(devices)} filesystem(s) found")]
+    options += [(d["mount"], f"{d.get('kind') or '?'}"
+                             f"{_free(d)}") for d in devices]
+    index = _choose(trail + ["Drives"], "Which drive?", options,
+                    note="Writes a temporary file, reads it back with the "
+                         "page cache bypassed, then deletes it.")
+    mounts = "all" if index == 0 else devices[index - 1]["mount"]
+    return dict(mode="drive_speed", select=["--drive-speed", mounts],
+                depth=None,
+                label=("read/write speed on every measurable drive"
+                       if index == 0 else f"read/write speed on {mounts}"))
+
+
+def _free(device: dict) -> str:
+    free = device.get("free_bytes")
+    return f", {free / (1024 ** 3):.0f} GB free" if free else ""
+
+
+def _storage():
+    from . import storage
+    return storage
 
 
 def _bench_profile(trail) -> dict:
@@ -248,7 +280,7 @@ def _bench_scope(state) -> object:
 
 
 def _bench_depth(state) -> object:
-    if state.get("depth") == "quick":
+    if state.get("depth") == "quick" or state["mode"] == "drive_speed":
         return _SKIP
     index = _choose(["Benchmark", "Depth"], "How long should each test run?",
                     _DEPTHS,
@@ -281,7 +313,9 @@ def _positive_int(text: str) -> None:
         raise ValueError("must be a whole number of 1 or more")
 
 
-def _bench_extras(state) -> None:
+def _bench_extras(state) -> object:
+    if state["mode"] == "drive_speed":
+        return _SKIP
     chosen = _multi(["Benchmark", "Extras"],
                     "Anything else to measure while it runs?",
                     [(label, detail) for _, label, detail in _EXTRAS],
@@ -291,7 +325,10 @@ def _bench_extras(state) -> None:
     return None
 
 
-def _bench_reports(state) -> None:
+def _bench_reports(state) -> object:
+    if state["mode"] == "drive_speed":
+        state["reports"] = []
+        return _SKIP
     chosen = _multi(["Benchmark", "Output"], "What should it write out?",
                     [(label, detail) for _, label, detail in _REPORTS],
                     default="none",
@@ -320,6 +357,18 @@ def _bench_confirm(state) -> None:
         argv.append("--io")
 
     plan = [state["label"]]
+    if state["mode"] == "drive_speed":
+        # Its own mode: no test suite, no depth, nothing written out.
+        plan += ["writes a temporary file per drive and reads it back with "
+                 "the page cache bypassed",
+                 "reports sequential MB/s and 4 KiB random IOPS, then exits"]
+        problem = _validate(argv)
+        if problem:
+            _choose(["Benchmark", "Confirm"], problem, [("Go back", "")])
+            raise _Back
+        _confirm(["Benchmark"], argv, plan)
+        state["argv"] = argv
+        return None
     if depth == "quick":
         plan.append("1 second per test, 2 repeats")
     elif depth == "thorough":
@@ -674,6 +723,8 @@ SHORTCUTS: list[tuple[str, list[str]]] = [
     ("Live monitor (60 seconds)", ["--monitor", "60s"]),
     ("Stability soak (10 minutes)", ["--soak", "10m"]),
     ("Compare past runs", ["--compare"]),
+    ("Drive read/write speed", ["--drive-speed"]),
+    ("Internet speed test", ["--internet"]),
 ]
 
 
@@ -688,6 +739,88 @@ def _shortcuts() -> list[str]:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+#: (label, detail, argv, plan). Everything here except the loopback test
+#: sends traffic somewhere, so each says where before it is chosen.
+_NETWORK_KINDS = [
+    ("Internet speed", "Download, upload, latency and jitter",
+     ["--internet"],
+     ["sends traffic to a public endpoint and spends bandwidth",
+      "capped by time and by bytes; upload gets a quarter of the budget",
+      "no benchmark runs"]),
+    ("Latency to a host", "Round-trip time and DNS, no bulk transfer",
+     None,      # needs the hostname first
+     []),
+    ("This machine's network stack", "TCP loopback only; nothing leaves the "
+     "machine",
+     ["--only", "cpu_int", "--quick"],
+     ["measures the OS network stack over 127.0.0.1",
+      "runs a one-second CPU check, because a run needs one test"]),
+    ("Two-node test — wait for a peer", "Opens a listening port on this "
+     "machine",
+     ["--net-server"],
+     ["listens for a peer running the client half",
+      "blocks until you stop it"]),
+    ("Two-node test — measure against a peer",
+     "Throughput, latency and jitter to a machine running the server half",
+     None,      # needs the peer address first
+     []),
+]
+
+
+def _network_kind(state) -> None:
+    index = _choose(["Network"], "What should be measured?",
+                    [(label, detail)
+                     for label, detail, _, _ in _NETWORK_KINDS])
+    state["kind"] = index
+    return None
+
+
+def _network_host(state) -> object:
+    """Only the two host-directed choices need somewhere to point."""
+    if state["kind"] not in (1, 4):
+        return _SKIP
+    what = ("host to measure latency to" if state["kind"] == 1
+            else "peer running --net-server")
+    state["host"] = _text(
+        ["Network", _NETWORK_KINDS[state["kind"]][0]],
+        f"Which {what}?", "Host", "",
+        _nonempty,
+        body=["  A hostname or an IP address. This contacts it directly."])
+    return None
+
+
+def _nonempty(text: str) -> None:
+    if not text.strip():
+        raise ValueError("a hostname or address is needed")
+
+
+def _network_confirm(state) -> None:
+    label, _, argv, plan = _NETWORK_KINDS[state["kind"]]
+    if argv is None:
+        host = state["host"]
+        if state["kind"] == 1:
+            argv = ["--network-host", host, "--only", "cpu_int", "--quick"]
+            plan = [f"measures TCP round-trip time and DNS against {host}",
+                    "contacts that host directly; no bulk transfer",
+                    "runs a one-second CPU check, because a run needs one "
+                    "test"]
+        else:
+            argv = ["--net-client", host]
+            plan = [f"measures throughput, latency and jitter to {host}",
+                    f"{host} must already be running pcbench --net-server"]
+    problem = _validate(argv)
+    if problem:
+        _choose(["Network", "Confirm"], problem, [("Go back", "")])
+        raise _Back
+    _confirm(["Network", label], list(argv), list(plan))
+    state["argv"] = list(argv)
+    return None
+
+
+def _network() -> list[str]:
+    return _run_steps([_network_kind, _network_host, _network_confirm], {})
+
+
 _MAIN = [
     ("Run a benchmark", "Measure how fast this machine is"),
     ("Read hardware stats",
@@ -695,13 +828,16 @@ _MAIN = [
     ("Watch or stress the machine",
      "Live monitor, thermal throttling test, burn-in soak"),
     ("Check hardware health", "RAM integrity, SMART status, drive wear"),
+    ("Test the network", "Internet speed, latency to a host, or a two-node "
+                        "test"),
     ("Look at past runs", "Rank the history, or compare two saved runs"),
     ("Shortcuts", "The flat list, if you already know what you want"),
 ]
 
 
 def _main_menu() -> list[str]:
-    handlers = [_benchmark, _stats, _watch, _health, _history, _shortcuts]
+    handlers = [_benchmark, _stats, _watch, _health, _network, _history,
+                _shortcuts]
     while True:
         index = _choose(["Main menu"], "What would you like to do?", _MAIN,
                         note="Every screen goes back, so nothing here "

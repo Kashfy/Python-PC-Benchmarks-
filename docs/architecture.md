@@ -228,6 +228,9 @@ parse_args()
    ├─ --list-stats / --stats? → hwinfo.collect(), render, exit 0 (no load)
    ├─ --menu?     → wizard.run() over tui widgets, then main(chosen argv);
    │                 the menu itself starts nothing
+   ├─ --drive-speed? → per-drive read/write/IOPS table, exit 0
+   ├─ --internet?    → download/upload/latency to a public endpoint, exit 0
+   │                   (the only mode that sends traffic off-box by default)
    ├─ --monitor?  → telemetry session, summary, exit 0 (no benchmarking)
    ├─ --quick presets, validate --only/--skip/--assert, parse durations
    │      malformed assertions fail here, not after ten minutes of work

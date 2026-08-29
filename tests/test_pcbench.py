@@ -4552,6 +4552,130 @@ class TestHardwareStatsMode(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestInternetSpeed(unittest.TestCase):
+    """The opt-in internet test. Nothing here contacts the network."""
+
+    def test_a_bad_server_url_fails_before_any_traffic(self):
+        for bad in ("", "not a url", "///"):
+            result = network.internet_speed(bad)
+            self.assertIn("error", result)
+            self.assertNotIn("download", result,
+                             "must give up before measuring anything")
+
+    def test_server_host_is_extracted_for_the_latency_probe(self):
+        self.assertEqual(
+            network._server_host("https://speed.cloudflare.com"),
+            "speed.cloudflare.com")
+        self.assertEqual(network._server_host("http://10.0.0.5:8080/x"),
+                         "10.0.0.5")
+
+    def test_upload_body_is_incompressible(self):
+        # A run of zeros would be squeezed by any transparent proxy, and the
+        # result would flatter the link.
+        chunk = network._UPLOAD_CHUNK
+        self.assertIsNotNone(chunk)
+        import zlib
+        self.assertGreater(len(zlib.compress(chunk)), len(chunk) * 0.9)
+
+    def test_render_reports_a_failure_rather_than_pretending(self):
+        text = network.render_internet(
+            {"server": "s", "note": "n",
+             "download": {"error": "connection refused"},
+             "upload": {"error": "connection refused"},
+             "latency": {"error": "unreachable"}})
+        self.assertIn("unavailable", text)
+        self.assertIn("connection refused", text)
+
+    def test_render_shows_both_directions_and_the_caveat(self):
+        text = network.render_internet({
+            "server": "https://example.invalid", "host": "example.invalid",
+            "note": "single stream",
+            "download": {"mbit_per_s": 512.0, "mb_per_s": 61.0,
+                         "transferred_mb": 100.0, "seconds": 1.6},
+            "upload": {"mbit_per_s": 40.0, "mb_per_s": 4.8,
+                       "transferred_mb": 10.0, "seconds": 2.1},
+            "latency": {"p50_ms": 12.0, "p99_ms": 30.0, "min_ms": 10.0,
+                        "loss_percent": 0.0},
+            "dns": {"median_ms": 8.0, "resolved": 3}})
+        self.assertIn("512.0 Mbit/s", text)
+        self.assertIn("40.0 Mbit/s", text)
+        self.assertIn("jitter 20.0", text)          # p99 - min
+        self.assertIn("single stream", text)
+
+    def test_render_survives_a_missing_result(self):
+        self.assertIn("did not run", network.render_internet(None))
+
+    def test_render_survives_sections_that_never_ran(self):
+        # A result with no latency or dns key at all must not crash the
+        # report; "absent" and "failed" are different states.
+        text = network.render_internet(
+            {"server": "s", "note": "n",
+             "download": {"mbit_per_s": 1.0, "mb_per_s": 0.1,
+                          "transferred_mb": 1.0, "seconds": 1.0},
+             "upload": {"error": "refused"}})
+        self.assertIn("unavailable", text)
+        self.assertNotIn("DNS", text)
+
+    def test_the_flags_exist_and_default_to_off(self):
+        args = cli.build_parser().parse_args([])
+        self.assertFalse(args.internet,
+                         "an internet test must never run by default")
+        self.assertEqual(args.internet_server, network.DEFAULT_SPEED_SERVER)
+        self.assertIsNone(args.drive_speed)
+
+
+# --------------------------------------------------------------------------- #
+class TestDriveSpeedReport(unittest.TestCase):
+    """The standalone read/write table."""
+
+    def _entry(self, mount, **disk):
+        base = {"write_rate": 500.0, "read_rate": 900.0,
+                "random_read_iops": 40000.0, "cache_bypassed": True}
+        base.update(disk)
+        return {"mount": mount, "kind": "apfs", "disk": base}
+
+    def test_rates_are_shown_per_drive(self):
+        text = storage.render_speeds(
+            {"devices": [self._entry("/"), self._entry("/data")]})
+        self.assertIn("500 MB/s", text)
+        self.assertIn("900 MB/s", text)
+        self.assertIn("40000 IOPS", text)
+        self.assertIn("/data", text)
+
+    def test_an_uncached_read_is_flagged(self):
+        # A read served from RAM is not a drive measurement, and saying so is
+        # the whole point of tracking the flag.
+        clean = storage.render_speeds({"devices": [self._entry("/")]})
+        self.assertNotIn("page cache could not be bypassed", clean)
+        dirty = storage.render_speeds(
+            {"devices": [self._entry("/", cache_bypassed=False)]})
+        self.assertIn("page cache could not be bypassed", dirty)
+
+    def test_a_skipped_drive_says_why(self):
+        text = storage.render_speeds({"devices": [
+            {"mount": "/ro", "kind": "apfs", "skipped": True,
+             "reason": "read-only"}]})
+        self.assertIn("skipped: read-only", text)
+
+    def test_no_devices_is_not_an_empty_table(self):
+        self.assertIn("no drive", storage.render_speeds({"devices": []}))
+        self.assertIn("no drive", storage.render_speeds(None))
+
+    def test_drive_speed_with_no_match_exits_two(self):
+        import io
+        import contextlib
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stderr(err):
+                code = cli.main(["--drive-speed",
+                                 "/definitely/not/a/mount/point/xyzzy",
+                                 "--quick", "--no-save"])
+        # A named path is taken at face value, so this either measures it or
+        # reports it cleanly — never a traceback.
+        self.assertIn(code, (0, 2))
+
+
+# --------------------------------------------------------------------------- #
 class TestTuiKeys(unittest.TestCase):
     """Escape-sequence decoding: the subtlest part, and invisible when wrong."""
 
@@ -4925,12 +5049,35 @@ class TestWizardFlow(unittest.TestCase):
                                 "--only", "cpu_int", "--quick"])
 
     def test_history_table(self):
-        argv, _ = self._drive(["5", "1", "1"])
+        argv, _ = self._drive(["6", "1", "1"])
         self.assertEqual(argv, ["--compare"])
 
     def test_shortcut_returns_that_entrys_argv(self):
-        argv, _ = self._drive(["6", "1"])
+        argv, _ = self._drive(["7", "1"])
         self.assertEqual(argv, wizard.SHORTCUTS[0][1])
+
+    def test_drive_speed_is_its_own_mode(self):
+        # No depth, extras or output screens: it measures a drive and exits.
+        argv, _ = self._drive(["1", "8", "1", "1"])
+        self.assertEqual(argv, ["--drive-speed", "all"])
+
+    def test_internet_speed_from_the_network_branch(self):
+        argv, output = self._drive(["5", "1", "1"])
+        self.assertEqual(argv, ["--internet"])
+        self.assertIn("spends bandwidth", output)
+
+    def test_latency_branch_asks_for_the_host_first(self):
+        argv, _ = self._drive(["5", "2", "example.com", "1"])
+        self.assertEqual(argv, ["--network-host", "example.com",
+                                "--only", "cpu_int", "--quick"])
+
+    def test_two_node_client_asks_for_the_peer(self):
+        argv, _ = self._drive(["5", "5", "10.0.0.9", "1"])
+        self.assertEqual(argv, ["--net-client", "10.0.0.9"])
+
+    def test_network_choices_that_need_no_host_skip_that_screen(self):
+        argv, _ = self._drive(["5", "4", "1"])
+        self.assertEqual(argv, ["--net-server"])
 
     def test_back_leaves_a_skipped_screen_skipped(self):
         # The quick pass fixes the depth, so its screen is not shown. Going

@@ -29,3 +29,6 @@ dist/
 # Compiled SMART reader
 smart_engine
 smart_engine.exe
+
+# macOS
+.DS_Store

@@ -199,6 +199,24 @@ Columns with no data anywhere are omitted.
 
 ---
 
+## `pcbench.storage` — device enumeration and per-drive benchmarking
+
+#### `inventory(need_mb=256) -> dict` · `targets(inv, requested, all_devices)`
+What is mounted, what can be benchmarked, and which of it to measure. An
+explicit path always wins over the skip heuristics: someone naming a mount
+knows something the heuristics do not.
+
+#### `run(targets_list, seconds, repeats, file_mb) -> dict`
+Runs the standard disk workload plus an fsync test in a `.pcbench`
+subdirectory of each target, removing it afterwards.
+
+#### `render_speeds(result) -> str`
+The `--drive-speed` table: sequential write, sequential read and 4 KiB random
+IOPS per drive. Carries the cache-bypass warning, because a read served from
+RAM is not a measurement of the drive.
+
+---
+
 ## `pcbench.native`
 
 #### `find_compiler() -> str | None` · `build(src, exe) -> (bool, str)`
@@ -357,6 +375,35 @@ Samples power while a background thread burns all cores — active draw, not idl
 #### `run(duration=1.0) -> dict`
 TCP loopback throughput (MB/s) plus ping/pong latency (`p50_us`, `p99_us`).
 Sends nothing off-box. Never raises.
+
+---
+
+### Internet speed test (opt-in)
+
+#### `internet_speed(server, seconds=5.0, max_mb=200) -> dict`
+Download, upload, TCP latency and DNS against `server` (default
+`DEFAULT_SPEED_SERVER`, Cloudflare's public endpoint). Never raises; failures
+come back as `{"error": ...}` per section. Both directions are capped by time
+and by bytes, and upload additionally by a quarter of the byte budget —
+links are usually asymmetric, and a metered uplink should not be handed
+hundreds of megabytes.
+
+#### `_measure_download(server, seconds, max_bytes) -> dict`
+Timed from the **first byte**, so DNS, the TCP handshake and TLS do not count
+against the throughput they precede. Stops on whichever budget binds first.
+
+#### `_measure_upload(server, seconds, max_bytes) -> dict`
+Two-phase: a 1 MB probe measures the rate, then one body sized to the time
+budget is sent. An upload cannot be cut short the way a download can — the
+body is committed before timing starts — so the size is chosen from a
+measurement rather than guessed. The body is `os.urandom` bytes, incompressible
+so a transparent proxy cannot flatter the result, and containing nothing from
+the machine.
+
+#### `render_internet(result) -> str`
+Both directions, latency with jitter (p99 − min), and DNS. A section that
+failed and a section that never ran are reported differently, and neither
+crashes the report.
 
 ---
 

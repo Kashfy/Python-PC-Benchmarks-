@@ -222,6 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--list-devices", action="store_true",
                    help="List mounted storage and whether each can be "
                         "benchmarked, then exit")
+    g.add_argument("--drive-speed", nargs="?", const="all", default=None,
+                   metavar="MOUNT[,MOUNT]",
+                   help="Measure sequential read/write and random-read IOPS "
+                        "per drive, then exit. Omit the list for every "
+                        "benchmarkable filesystem")
 
     g = p.add_argument_group("stability / monitoring")
     g.add_argument("--soak", metavar="DURATION", default=None,
@@ -337,6 +342,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Port for the two-node network test")
     g.add_argument("--net-streams", type=int, default=4,
                    help="Parallel streams for the two-node throughput test")
+
+    g = p.add_argument_group("internet speed test")
+    g.add_argument("--internet", action="store_true",
+                   help="Measure download, upload, latency and jitter against "
+                        "a public endpoint, then exit. Sends traffic off this "
+                        "machine and spends bandwidth, so it is never part of "
+                        "a normal run")
+    g.add_argument("--internet-seconds", type=float, default=5.0,
+                   metavar="N",
+                   help="Time budget per direction for --internet")
+    g.add_argument("--internet-max-mb", type=int, default=200, metavar="MB",
+                   help="Byte budget for --internet; upload uses a quarter of "
+                        "it, so a metered link cannot be drained")
+    g.add_argument("--internet-server", default=network.DEFAULT_SPEED_SERVER,
+                   metavar="URL",
+                   help="Endpoint for --internet; must serve /__down and "
+                        "/__up")
 
     g = p.add_argument_group("A/B comparison")
     g.add_argument("--compare-runs", nargs=2, default=None,
@@ -620,6 +642,52 @@ def main(argv=None) -> int:
             print(f"  candidate: {args.compare_runs[1]}\n")
             print(stats_mod.render_payload_comparison(verdict))
         return 6 if verdict["regressions"] else 0
+
+    # A drive-speed check is the whole job: it answers "how fast is this
+    # disk?" without the twenty other tests that surround the same numbers
+    # in a full run.
+    if args.drive_speed is not None:
+        requested = [m.strip() for m in args.drive_speed.split(",")
+                     if m.strip() and m.strip().lower() != "all"]
+        inv = storage_mod.inventory(args.disk_mb)
+        chosen = storage_mod.targets(inv, requested or None,
+                                     all_devices=not requested)
+        if not chosen:
+            print("error: no benchmarkable filesystem found. "
+                  "Use --list-devices to see what was detected, or name a "
+                  "mount with --drive-speed PATH", file=sys.stderr)
+            return 2
+        seconds, repeats = (1.0, 2) if args.quick else (args.seconds,
+                                                        max(1, args.repeats))
+        if not args.json_stdout:
+            report_mod.hr(f"Drive read/write speed — {len(chosen)} device(s)")
+        result = storage_mod.run(chosen, seconds, repeats, args.disk_mb)
+        if args.json_stdout:
+            print(json.dumps({"tool": "pcbench", "mode": "drive_speed",
+                              "version": __version__, "storage": result},
+                             indent=2, default=str))
+        else:
+            print(storage_mod.render_speeds(result))
+        return 0
+
+    # An internet measurement is opt-in and stands alone: it spends the
+    # user's bandwidth on a third party, which no benchmark run should do as
+    # a side effect.
+    if args.internet:
+        if not args.json_stdout:
+            report_mod.hr("Internet speed")
+            print(f"  measuring against {args.internet_server} ...\n")
+        result = network.internet_speed(args.internet_server,
+                                        args.internet_seconds,
+                                        args.internet_max_mb)
+        if args.json_stdout:
+            print(json.dumps({"tool": "pcbench", "mode": "internet",
+                              "version": __version__, "internet": result},
+                             indent=2, default=str))
+        else:
+            print(network.render_internet(result))
+        down = (result.get("download") or {}).get("error")
+        return 2 if (result.get("error") or down) else 0
 
     # The receiving half of the two-node network test. Blocks until stopped,
     # so it cannot be combined with a benchmark run.

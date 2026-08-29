@@ -324,3 +324,48 @@ def run(targets_list: list[dict], seconds: float, repeats: int,
 def _fsync_for(workdir: str, seconds: float) -> dict:
     from . import apps
     return apps.bench_fsync(min(seconds, 2.0), workdir)
+
+
+def render_speeds(result: dict | None) -> str:
+    """Read/write table for the standalone drive-speed mode.
+
+    The full run reports these numbers inside a much larger report. Someone
+    who asked only "how fast is this drive?" should get a table they can read
+    at a glance, with the caveat that matters most — whether the page cache
+    was actually bypassed — attached to the number it qualifies.
+    """
+    devices = (result or {}).get("devices") or []
+    if not devices:
+        return "  no drive could be measured"
+    lines = [f"  {'MOUNT':<22} {'KIND':<10} {'WRITE':>12} {'READ':>12} "
+             f"{'RANDOM':>12}",
+             "  " + "-" * 72]
+    uncached = True
+    for entry in devices:
+        mount = entry["mount"][:22]
+        kind = (entry.get("kind") or "?")[:10]
+        if entry.get("skipped"):
+            lines.append(f"  {mount:<22} {kind:<10} "
+                         f"skipped: {entry.get('reason', 'unavailable')}")
+            continue
+        disk = entry.get("disk") or {}
+        if disk.get("skipped") or disk.get("error"):
+            lines.append(f"  {mount:<22} {kind:<10} "
+                         f"skipped: {disk.get('error', 'unavailable')}")
+            continue
+        uncached = uncached and bool(disk.get("cache_bypassed"))
+        iops = disk.get("random_read_iops")
+        lines.append(
+            f"  {mount:<22} {kind:<10} "
+            f"{disk.get('write_rate', 0):>7.0f} MB/s "
+            f"{disk.get('read_rate', 0):>7.0f} MB/s "
+            f"{(iops or 0):>7.0f} IOPS")
+    lines.append("")
+    lines.append("  WRITE/READ are sequential in 4 MiB blocks; writes are "
+                 "timed through fsync.")
+    lines.append("  RANDOM is 4 KiB random reads, which is what governs how "
+                 "responsive a disk feels.")
+    if not uncached:
+        lines.append("  !  the page cache could not be bypassed on at least "
+                     "one drive — reads there measure RAM, not the drive")
+    return "\n".join(lines)

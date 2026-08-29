@@ -126,10 +126,19 @@ them and loses nothing else.
 - `sudo -n powermetrics` is attempted on macOS *only* to read a power meter.
   The `-n` flag means it never prompts and never blocks; without existing sudo
   rights it silently falls back to an estimate.
-- **External network tests are opt-in and have no default target.** Nothing
-  leaves the machine unless you pass `--network-host` or `--network-url`.
+- **External network tests are opt-in.** Nothing leaves the machine unless you
+  pass `--network-host`, `--network-url`, `--net-client`, or `--internet`.
   Downloads are capped in both time and bytes so a mistyped URL cannot pull an
   unbounded amount over a metered connection.
+- **`--internet` is the one test with a default target**, because "how fast is
+  my connection?" cannot be answered without one. It contacts
+  `speed.cloudflare.com` — a public speed-test endpoint needing no account —
+  downloading up to `--internet-max-mb` (200 MB) and uploading a quarter of
+  that, each also capped by `--internet-seconds`. Point it elsewhere with
+  `--internet-server`. The upload body is random bytes generated for the
+  purpose: **no file, result, or machine identifier is ever sent**. It never
+  runs as part of a benchmark; it is its own mode and must be asked for by
+  name every time.
 - **Plugins are ordinary Python and run with full privileges**, exactly like
   any script you execute. Only add files you trust. Discovery never looks
   outside `plugins/`, and a plugin that raises is skipped rather than aborting
@@ -172,5 +181,6 @@ is the point; the tool is not what caused it.
 | Thread/process cleanup | Verified no leaks |
 | Network | Loopback only, no external traffic |
 | Package installs | Opt-in, confirmed, into a venv, from PyPI only |
-| External network | Opt-in only, no default target, capped downloads |
+| External network | Opt-in only, capped by time and bytes; only `--internet` has a default target |
+| Internet speed test | Random bytes to a public endpoint, never your data; upload capped at a quarter of the budget |
 | RAM / SMART checks | RAM test is read-write on its own buffer; SMART is read-only |

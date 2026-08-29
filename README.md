@@ -41,11 +41,11 @@ JSON/CSV/HTML so you can compare machines over time.
 |---|---|
 | CPU | [What each test measures](#what-each-test-measures) · [Core scaling and hybrid CPUs](#core-scaling-and-hybrid-cpus) · [System configuration](#system-configuration--the-530-nobody-records) |
 | Real software | [Application workloads](#application-workloads--will-this-machine-be-good-at-my-job) · [Reference workloads (STREAM, LINPACK, CoreMark)](#reference-workloads--numbers-that-mean-something-elsewhere) |
-| Storage | [Depth-aware storage testing](#depth-aware-storage-testing) · [Every device](#storage-every-device-not-just-the-one-you-are-standing-on) · [Configurable I/O jobs](#configurable-storage-io) · [Drive lifetime & wear](#drive-lifetime--wear) |
+| Storage | [Read/write speed](#drive-readwrite-speed) · [Depth-aware storage testing](#depth-aware-storage-testing) · [Every device](#storage-every-device-not-just-the-one-you-are-standing-on) · [Configurable I/O jobs](#configurable-storage-io) · [Drive lifetime & wear](#drive-lifetime--wear) |
 | Memory | [NUMA](#numa) |
 | Accelerators | [GPU compute — NVIDIA, AMD, Intel, Apple](#gpu-compute--nvidia-amd-intel-apple) · [GPU and Neural Engine](#gpu-and-neural-engine) · [NPU across vendors](#npu-support-across-vendors) · [AI training & inference](#ai-training--inference-optional-framework-tier) |
 | AI / data | [Data science & ML](#data-science--ml) · [ML without a framework](#machine-learning-workloads-with-no-framework-required) |
-| Network | [Network stack](#network-stack) · [Two-node network](#two-node-network) |
+| Network | [Internet speed](#internet-speed) · [Network stack](#network-stack) · [Two-node network](#two-node-network) |
 | Power | [Power & perf-per-watt](#power--perf-per-watt) · [Energy to solution](#energy-to-solution) |
 
 **Interpreting results**
@@ -736,7 +736,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.18 > Main menu
+  pcbench 11.19 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -745,6 +745,7 @@ accept the summary at the end.
     Read hardware stats          Battery, SSD endurance, temperatures, GPUs
     Watch or stress the machine  Live monitor, thermal throttling test, burn-in
     Check hardware health        RAM integrity, SMART status, drive wear
+    Test the network             Internet speed, latency, or a two-node test
     Look at past runs            Rank the history, or compare two saved runs
     Shortcuts                    The flat list, if you already know what you want
 
@@ -844,6 +845,35 @@ printf '2\nbattery\n1\n1\n' | python3 benchmark.py --menu   # stats > battery > 
 terminal renders the full-screen version badly.
 
 For everything else: `--list-tests`, `--list-stats`, `--list-devices`.
+
+## Drive read/write speed
+
+Sequential throughput and random IOPS are measured as part of any run, but if
+that is the only question, ask it directly:
+
+```bash
+pcbench --drive-speed                 # every filesystem that can be measured
+pcbench --drive-speed /Volumes/SSD    # or a specific one
+pcbench --drive-speed --quick         # 1s x 2 instead of 3s x 3
+```
+
+```
+  MOUNT                  KIND              WRITE         READ       RANDOM
+  ------------------------------------------------------------------------
+  /System/Volumes/Data   apfs          5835 MB/s    3811 MB/s   35952 IOPS
+```
+
+It writes a temporary file, reads it back with the page cache bypassed
+(`F_NOCACHE` on macOS, `posix_fadvise` on Linux), deletes it, and exits — no
+other test runs. If the cache could not be bypassed on some platform, the
+table says so, because a read served from RAM is not a measurement of the
+drive.
+
+Sequential MB/s is what a large copy achieves. **Random IOPS is what makes a
+machine feel fast**, since real workloads are dominated by small scattered
+reads — a drive with excellent sequential numbers and poor IOPS still feels
+slow. `--drive-speed` respects the same wear caps as every other disk test;
+see [is it safe for my hardware?](#is-it-safe-for-my-hardware).
 
 ## Drive lifetime & wear
 
@@ -1163,6 +1193,43 @@ latency rather than by the link's capacity. Where `iperf3` is installed it
 remains the better tool and this says so; this exists for the very common case
 where nothing can be installed on either end.
 
+## Internet speed
+
+Everything above stays on the machine or needs a target you name. "How fast is
+my internet?" needs neither, which is exactly why it has to be asked for:
+
+```bash
+pcbench --internet
+```
+
+```
+  Download    :    513.5 Mbit/s (61.2 MB/s, 25 MB in 0.4s)
+  Upload      :     29.9 Mbit/s (3.6 MB/s, 5 MB in 1.4s)
+  Latency     :     30.6 ms median (best 27.9, jitter 26.6, 0% failed)
+  DNS         :     20.5 ms median to resolve 3 name(s)
+```
+
+Latency and jitter are usually the more useful half. A 500 Mbit/s link with
+30 ms of jitter makes calls stutter and shells feel laggy; a 50 Mbit/s link
+with 2 ms does neither.
+
+**This one sends traffic off the machine**, so it is never part of a benchmark
+run — it is its own mode and has to be named every time. It downloads up to
+`--internet-max-mb` (200 MB) and uploads a quarter of that, each also bounded
+by `--internet-seconds` (5 s), so a slow or metered connection stops on bytes
+and a fast one stops on time. The upload body is random bytes generated for
+the purpose: no file, result, or machine identifier is ever sent.
+
+The default endpoint is Cloudflare's public speed-test service, which needs no
+account. Point it at your own with `--internet-server URL` — it needs to serve
+`/__down?bytes=N` and accept a POST to `/__up`.
+
+It is a single stream, not a speedtest.net client: no server selection, no
+multi-connection saturation. On a fast link it therefore reads lower than
+those tools, and says so. What it reports honestly is what one stream from
+this machine actually achieves, which is the number that governs a download,
+a `git clone`, or a container pull.
+
 ## Energy to solution
 
 Watts is a rate and answers "how hot will this get?". It does not answer what
@@ -1283,6 +1350,16 @@ Sections for `--stats`: `cpu`, `memory`, `storage`, `drives`, `battery`,
 | `--list-devices` | — | List mounted storage and whether each can be benchmarked |
 | `--disk-all` | off | Benchmark every writable local filesystem |
 | `--disk-path P[,P]` | — | Benchmark specific mount points |
+| `--drive-speed [P[,P]]` | — | Measure read/write and random IOPS per drive, then exit. Omit the list for every drive |
+
+**Internet speed test** — sends traffic off this machine; never part of a run
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--internet` | off | Measure download, upload, latency and jitter, then exit |
+| `--internet-seconds N` | `5.0` | Time budget per direction |
+| `--internet-max-mb MB` | `200` | Byte budget; upload uses a quarter of it |
+| `--internet-server URL` | Cloudflare | Endpoint; must serve `/__down` and `/__up` |
 
 **Stability & monitoring**
 

@@ -661,6 +661,69 @@ reports: Python has no portable asynchronous submission, so depth is reached
 with blocking calls on threads, which costs more CPU per request. The note is
 printed with every I/O run.
 
+## Internet speed is far below what I pay for
+
+`--internet` opens **one** connection to **one** endpoint. Speedtest-style
+tools open many in parallel, which is how they saturate a link that shapes or
+paces a single flow. On a fast connection the single-stream figure is
+genuinely lower, and it is not wrong — it is the number that governs a real
+download, a `git clone`, or a container pull, all of which are usually one
+stream too.
+
+Before blaming the link, rule out the obvious:
+
+1. **Wi-Fi, not the WAN.** Test on Ethernet, or next to the access point. A
+   2.4 GHz link or a weak signal caps well below most broadband.
+2. **Something else is using the connection.** The test measures what is left,
+   not what exists.
+3. **The endpoint is far away.** It is anycast, but a poor path still costs
+   throughput. Check the latency line; over ~80 ms a single TCP stream is
+   window-limited rather than bandwidth-limited, and that alone explains a low
+   number. Point it somewhere closer with `--internet-server`.
+4. **The byte budget bound before the time budget.** `25 MB in 0.4s` means it
+   ran out of data, not time — raise `--internet-max-mb` for a longer sample.
+
+Upload being much lower than download is normal: most consumer connections are
+asymmetric by design.
+
+## Upload is reported but download failed (exit code 2)
+
+The two directions use different endpoints (`/__down` and `/__up`) and a proxy
+or filter may allow one and not the other. Exit code 2 means the download
+specifically could not be measured. Test the endpoint directly:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' \
+  'https://speed.cloudflare.com/__down?bytes=1000000'
+```
+
+Behind a corporate proxy, `urllib` honours `HTTPS_PROXY`; if that is not set,
+nothing will reach out. A self-hosted endpoint via `--internet-server` avoids
+the whole question.
+
+## Drive speed looks impossibly high
+
+Same cause as the disk test in a full run: the page cache served the read. The
+`--drive-speed` table prints an explicit warning when the bypass failed on any
+drive — if you see it, the read column is measuring RAM. See
+[disk read numbers look impossibly high](#disk-read-numbers-look-impossibly-high).
+
+Sequential numbers that look right while random IOPS looks low is not a fault:
+that is what a hard disk, a slow SD card, or a network share looks like, and
+the IOPS column is the one that predicts how the machine feels.
+
+## `--drive-speed` finds no drive
+
+It only measures filesystems that pass the safety heuristics — writable, local,
+enough free space, not a read-only or system mount. `--list-devices` shows what
+was found and why anything was skipped. Naming a mount explicitly overrides the
+heuristics:
+
+```bash
+python3 benchmark.py --list-devices
+python3 benchmark.py --drive-speed /Volumes/External
+```
+
 ## Two-node network test cannot connect
 
 The peer must be running `pcbench --net-server` and the port (default 51900)

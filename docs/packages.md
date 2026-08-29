@@ -299,6 +299,7 @@ For real measured power on macOS, run the whole tool with `sudo`.
 | `--list-devices` | List mounts and whether each can be benchmarked, then exit |
 | `--disk-all` | Benchmark every writable local filesystem |
 | `--disk-path P[,P]` | Benchmark named mount points (overrides the safety heuristics) |
+| `--drive-speed [MOUNT[,MOUNT]]` | Measure sequential read/write and 4 KiB random IOPS per drive, then exit. Omit the list for every benchmarkable filesystem |
 
 ### Stability and monitoring
 
@@ -407,6 +408,22 @@ Patterns: `read`, `write`, `randread`, `randwrite`, `randrw`.
 | `--net-server` | Receiving half; opens a listening port until stopped |
 | `--net-client HOST` | Measuring half: RTT, jitter, single and parallel throughput |
 | `--net-port N` / `--net-streams N` | Port and stream count |
+
+### Internet speed test
+
+Sends traffic off the machine, so it is a mode of its own and never part of a
+benchmark run.
+
+| Flag | Description |
+|------|-------------|
+| `--internet` | Download, upload, latency and jitter against a public endpoint, then exit |
+| `--internet-seconds N` | Time budget per direction (default `5.0`) |
+| `--internet-max-mb MB` | Byte budget (default `200`); upload uses a quarter of it |
+| `--internet-server URL` | Endpoint, default `https://speed.cloudflare.com`; must serve `/__down?bytes=N` and accept a POST to `/__up` |
+
+The upload body is random bytes generated for the purpose — no file, result or
+machine identifier is sent. Exit code is 2 if the download could not be
+measured. See [safety](safety.md#privilege-and-network).
 
 ### A/B comparison
 
