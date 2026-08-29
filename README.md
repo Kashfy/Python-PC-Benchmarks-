@@ -137,8 +137,8 @@ pip install -e .
 pcbench --quick
 ```
 
-Not sure what to ask for? `pcbench --menu` walks you through it with the arrow
-keys and prints the command it built — see
+Not sure what to ask for? Add `--menu` to either command — it walks you
+through it with the arrow keys and prints the command it built. See
 [choosing what to run](#choosing-what-to-run).
 
 ## What makes it reliable
@@ -715,11 +715,19 @@ monitoring check without parsing terminal output.
 ## Choosing what to run
 
 Twenty-two tests, thirteen profiles and twelve stats sections is a lot to read
-before a first run, so there is a guided setup that asks instead:
+before a first run, so there is a guided setup that asks instead. Any of these
+starts it — use the first if you have not installed anything:
 
 ```bash
-pcbench --menu
+python3 benchmark.py --menu     # straight from a checkout, no install needed
+python3 -m pcbench --menu       # the same thing, as a module
+pcbench --menu                  # after `pip install -e .`
 ```
+
+Run it in the terminal directly. Piping or redirecting it (`| less`,
+`> out.txt`) drops the arrow-key interface and falls back to typed answers,
+because there is no TTY to put into raw mode — see
+[when the arrow keys do nothing](#when-the-arrow-keys-do-nothing) below.
 
 It is driven the way an OS installer is. Arrow keys move the highlighted row,
 Enter selects, Esc steps back, `q` leaves. The only thing you ever type is a
@@ -728,7 +736,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.17 > Main menu
+  pcbench 11.18 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -742,6 +750,26 @@ accept the summary at the end.
 
   [up/down] move   [enter] select   [esc] back   [q] quit
 ```
+
+Every screen takes the same keys. Lists — one choice or several — take all of
+these:
+
+| Key | What it does |
+|-----|--------------|
+| `↑` `↓`, or `k` `j` | Move the highlighted row; it wraps at both ends |
+| `Home` `End` `PgUp` `PgDn` | Jump around a long list |
+| `1`–`9` | Jump straight to that row |
+| `Enter` | Select the row, or accept a screen of checkboxes |
+| `Space` | Tick or untick a checkbox (on a one-choice screen it selects) |
+| `a` | Tick everything, or clear everything |
+| `Esc`, or `←` | Go back one screen |
+| `q` | Leave without running anything |
+| `Ctrl-C` | The same |
+
+The few screens that ask for a value — a duration, a custom repeat count —
+are a text field instead: type it, `Backspace` deletes, `Ctrl-U` clears, and
+`Enter` accepts (empty keeps the default shown in grey). `Esc` still goes
+back and `Ctrl-C` still leaves, but `q` is just the letter q there.
 
 Picking *Run a benchmark* then asks what kind (quick pass, the full suite, a
 profile, individual tests, AI/data science, storage I/O, reference standards),
@@ -788,11 +816,32 @@ only thing left in your scrollback is the command it built. That is deliberate:
 the menu teaches the flags rather than replacing them, and the second time you
 want that run, you type it.
 
-Over a pipe, on a terminal that cannot be put into raw mode, or with
-`PCBENCH_NO_TUI=1` set, the same screens fall back to numbered answers you type
-— so `printf '2\nbattery\n1\n1\n' | pcbench --menu` still works. If the arrow
-keys do nothing when you expected them to, see
-[troubleshooting](docs/troubleshooting.md#--menu-does-not-respond-to-the-arrow-keys).
+### When the arrow keys do nothing
+
+The menu needs a real terminal: stdin and stdout both a TTY, and a `TERM` that
+is not `dumb`. Without that — a pipe, a redirect, a CI log, some IDE output
+panes — the same screens fall back to numbered answers you type, which is the
+right behaviour there rather than a failure. Check what it sees:
+
+```bash
+python3 -c "from pcbench import tui; print(tui.supported())"
+```
+
+The usual causes of an unexpected `False` are a redirect, `PCBENCH_NO_TUI`
+being set, `TERM` unset or `dumb` (common under `cron` and some CI runners),
+or a Windows console without VT support — Windows Terminal is fine.
+[Troubleshooting](docs/troubleshooting.md#--menu-does-not-respond-to-the-arrow-keys)
+has the fix for each.
+
+The typed path takes the same answers by number, and is what makes the menu
+scriptable:
+
+```bash
+printf '2\nbattery\n1\n1\n' | python3 benchmark.py --menu   # stats > battery > run
+```
+
+`PCBENCH_NO_TUI=1` forces it deliberately, if you prefer typing or your
+terminal renders the full-screen version badly.
 
 For everything else: `--list-tests`, `--list-stats`, `--list-devices`.
 

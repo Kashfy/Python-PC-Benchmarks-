@@ -354,6 +354,12 @@ environment > config file > defaults.
 Sections: `cpu`, `memory`, `storage`, `drives`, `battery`, `gpu`, `thermal`,
 `power`, `os`, `environment`, `numa`, `packages`.
 
+`--menu` needs stdin and stdout to both be a TTY; over a pipe it falls back to
+typed answers, which is what keeps it scriptable. The key bindings are listed
+in the [README](../README.md#choosing-what-to-run), and
+[troubleshooting](troubleshooting.md#--menu-does-not-respond-to-the-arrow-keys)
+covers a terminal that will not take it.
+
 The whole set gathers in roughly two seconds and never loads the machine, so it
 is safe to run on a busy server or a laptop on battery. `--json-stdout` applies,
 which makes any section usable as a monitoring check:

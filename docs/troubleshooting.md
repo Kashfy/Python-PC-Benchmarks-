@@ -22,6 +22,10 @@ back-to-back runs may trip the guard; wait a minute between them.
 
 ## `--menu` does not respond to the arrow keys
 
+Start it with `python3 benchmark.py --menu` from a checkout, `pcbench --menu`
+once installed, or `python3 -m pcbench --menu` either way — all three are the
+same code path.
+
 The menu needs a real terminal: stdin and stdout both a TTY, and `TERM` set to
 something other than `dumb`. When any of that is missing it falls back to
 numbered answers you type, which is the correct behaviour for a pipe, a CI
@@ -35,7 +39,7 @@ python3 -c "from pcbench import tui; print(tui.supported())"
 
 `False` and you did not expect it, in rough order of likelihood:
 
-1. **Output is redirected or piped** — `pcbench --menu | less` cannot be
+1. **Output is redirected or piped** — `python3 benchmark.py --menu | less` cannot be
    interactive. Run it on its own.
 2. **`PCBENCH_NO_TUI` is set** — that forces the typed path. `unset
    PCBENCH_NO_TUI`.
@@ -47,7 +51,7 @@ python3 -c "from pcbench import tui; print(tui.supported())"
 The typed path takes the same answers by number, including ranges and names:
 
 ```bash
-printf '2\nbattery\n1\n1\n' | pcbench --menu     # stats > battery > run
+printf '2\nbattery\n1\n1\n' | python3 benchmark.py --menu   # stats > battery > run
 ```
 
 ## The menu screen is garbled, or the shell is broken after it

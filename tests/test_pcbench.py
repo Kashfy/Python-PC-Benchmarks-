@@ -4721,6 +4721,52 @@ class TestTuiWidgets(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0].index("alpha"), rows[1].index("beta"))
 
+    def test_every_key_the_readme_documents_works(self):
+        # The README prints a key table. These assertions are what stop it
+        # from drifting away from the code.
+        out = self._out()
+        # Left arrow goes back, same as Esc.
+        with self.assertRaises(tui.Back):
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["LEFT"]))
+        # Space selects on a one-choice screen, where there is nothing to tick.
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["DOWN", " "])), 1)
+        # Home / End / PgUp / PgDn jump around a long list.
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["END", "ENTER"])), 2)
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["END", "HOME", "ENTER"])), 0)
+        # A digit jumps straight to that row.
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["3", "ENTER"])), 2)
+        # Ctrl-C leaves from a list and from a text field alike.
+        for widget, keys in ((tui.select, ["\x03"]),
+                             (tui.multiselect, ["\x03"])):
+            with self.assertRaises(tui.Quit):
+                widget("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(keys))
+        with self.assertRaises(tui.Quit):
+            tui.text("t", "q?", "N", "", out=out, read=self._reader(["\x03"]))
+        # Ctrl-U clears a half-typed value.
+        self.assertEqual(
+            tui.text("t", "q?", "N", "9", out=out,
+                     read=self._reader(["1", "2", "\x15", "ENTER"])), "9")
+
+    def test_the_cursor_wraps_at_both_ends(self):
+        out = self._out()
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["UP", "ENTER"])), 2)
+        self.assertEqual(
+            tui.select("t", "q?", self.OPTIONS, out=out,
+                       read=self._reader(["DOWN", "DOWN", "DOWN", "ENTER"])),
+            0)
+
     def test_screen_is_a_no_op_when_the_terminal_cannot_take_it(self):
         # Under a pipe there is nothing to put into raw mode, and trying
         # would be worse than doing nothing.
