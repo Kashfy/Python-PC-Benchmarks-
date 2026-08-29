@@ -686,6 +686,35 @@ Before blaming the link, rule out the obvious:
 Upload being much lower than download is normal: most consumer connections are
 asymmetric by design.
 
+## Ping says "TCP handshake" instead of ICMP
+
+ICMP was blocked or dropped, which is extremely common — many networks,
+clouds and anycast endpoints never answer an echo request while serving TCP
+perfectly. The tool falls back to timing a TCP handshake, which is also
+exactly one round trip to the same host, so the number is comparable.
+
+It is often the *better* number: where ICMP is answered but deprioritised, an
+echo reply can read higher than anything real traffic experiences. Check it
+yourself with:
+
+```bash
+ping -c 3 speed.cloudflare.com
+```
+
+If that reports 100% loss, nothing is wrong with the connection or the tool.
+
+## Ping is much higher than my router or speedtest.net reports
+
+Those measure to your gateway or to a deliberately nearby server. This
+measures to the endpoint actually serving the throughput test, over the whole
+path — which is the latency your downloads and page loads experience, and is
+correctly higher.
+
+Jitter is the number to watch. This tool reports the mean difference between
+*consecutive* round trips (RFC 3550), not the max-minus-min spread that some
+tools call jitter. One spike gives a large spread and small jitter; a
+permanently unsteady link gives both. Only the second breaks calls.
+
 ## Upload is reported but download failed (exit code 2)
 
 The two directions use different endpoints (`/__down` and `/__up`) and a proxy

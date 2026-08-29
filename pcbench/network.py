@@ -18,7 +18,10 @@ behind its own flag and never part of a default run.
 from __future__ import annotations
 
 import os
+import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 
@@ -61,6 +64,21 @@ def _throughput(duration: float) -> float:
         t.join(timeout=1.0)
     elapsed = time.perf_counter() - start
     return sent / elapsed / (1024 * 1024)
+
+
+def _jitter(samples: list[float]) -> float:
+    """Mean absolute difference between consecutive round trips.
+
+    The RFC 3550 definition, used for RTP. It is the variation that decides
+    whether interactive traffic works: a link with 40 ms RTT and 1 ms jitter
+    carries a call perfectly, one with 20 ms RTT and 30 ms jitter does not,
+    and a spread like ``p99 - min`` cannot tell a single outlier apart from
+    a connection that is unsteady throughout.
+    """
+    if len(samples) < 2:
+        return 0.0
+    return (sum(abs(samples[i] - samples[i - 1])
+                for i in range(1, len(samples))) / (len(samples) - 1))
 
 
 def _latency(rounds: int = 2000) -> dict:
@@ -143,14 +161,20 @@ def tcp_latency(host: str, port: int = 443, attempts: int = 12) -> dict:
             sock.close()
     if not times:
         return {"host": host, "error": f"could not reach {host}:{port}"}
-    times.sort()
-    n = len(times)
+    # Jitter is computed before sorting: it is defined on the order the
+    # samples arrived in, and sorting destroys exactly that.
+    jitter = _jitter(times)
+    ordered = sorted(times)
+    n = len(ordered)
     return {
         "host": host,
         "port": port,
-        "p50_ms": round(times[n // 2], 2),
-        "p99_ms": round(times[min(n - 1, int(n * 0.99))], 2),
-        "min_ms": round(times[0], 2),
+        "p50_ms": round(ordered[n // 2], 2),
+        "mean_ms": round(sum(ordered) / n, 2),
+        "p99_ms": round(ordered[min(n - 1, int(n * 0.99))], 2),
+        "min_ms": round(ordered[0], 2),
+        "max_ms": round(ordered[-1], 2),
+        "jitter_ms": round(jitter, 2),
         "attempts": attempts,
         "failed": errors,
         "loss_percent": round(errors / attempts * 100, 1),
@@ -452,11 +476,7 @@ def measure_latency(host: str, port: int = DEFAULT_PORT,
         return {"error": "no probe completed", "lost": lost}
 
     ordered = sorted(samples)
-    # Mean absolute consecutive difference, the same definition RFC 3550 uses
-    # for RTP jitter.
-    jitter = (sum(abs(samples[i] - samples[i - 1])
-                  for i in range(1, len(samples))) / (len(samples) - 1)
-              if len(samples) > 1 else 0.0)
+    jitter = _jitter(samples)
     return {
         "host": host, "port": port,
         "probes": len(samples), "lost": lost,
@@ -564,6 +584,69 @@ DEFAULT_SPEED_SERVER = "https://speed.cloudflare.com"
 _UPLOAD_CHUNK = os.urandom(256 * 1024) if hasattr(os, "urandom") else None
 
 
+#: Round-trip times in ping's output, across platforms and locales:
+#: ``time=12.3 ms``, ``time=12ms``, ``time<1ms``. Parsing the per-packet
+#: lines rather than the summary avoids every localisation problem, and
+#: yields the individual samples that jitter needs.
+_PING_TIME = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
+
+
+def _ping_command(host: str, count: int, timeout: float) -> list[str]:
+    """The platform's ping invocation. ``-W`` means different units per OS."""
+    if os.name == "nt":
+        return ["ping", "-n", str(count), "-w", str(int(timeout * 1000)), host]
+    if sys.platform == "darwin":
+        # macOS takes the per-packet timeout in milliseconds.
+        return ["ping", "-c", str(count), "-W", str(int(timeout * 1000)), host]
+    return ["ping", "-c", str(count), "-W", str(max(1, int(timeout))), host]
+
+
+def icmp_ping(host: str, count: int = 3, timeout: float = 1.0) -> dict:
+    """Round-trip time with the system ``ping``. Never raises.
+
+    This is the number people mean by "ping" and can check against any other
+    tool, which is why it is worth shelling out for: raw ICMP needs a
+    privilege this tool does not ask for, while ``ping`` itself is setuid
+    everywhere and needs none.
+
+    ICMP is also frequently rate-limited or dropped outright while TCP is
+    fine, so a missing or inflated result here is not the same finding as a
+    slow connection — which is why :func:`tcp_latency` is still reported
+    beside it rather than replaced by it.
+    """
+    # The host comes from a URL the user supplied. An argument list already
+    # rules out shell injection; this rules out a leading dash arriving as a
+    # flag for ping itself.
+    if not host or host.startswith("-") or any(c.isspace() for c in host):
+        return {"host": host, "error": "not a usable hostname"}
+    try:
+        proc = subprocess.run(_ping_command(host, count, timeout),
+                              capture_output=True, text=True,
+                              timeout=count * timeout + 10)
+    except FileNotFoundError:
+        return {"host": host, "error": "no ping command on this system"}
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"host": host, "error": f"{type(e).__name__}: {e}"}
+
+    samples = [float(m) for m in _PING_TIME.findall(proc.stdout)]
+    if not samples:
+        # Exit status alone cannot tell "host down" from "ICMP filtered",
+        # and saying which would be a guess.
+        return {"host": host,
+                "error": "no reply — ICMP is blocked, or the host is down"}
+    ordered = sorted(samples)
+    return {
+        "host": host,
+        "sent": count,
+        "received": len(samples),
+        "loss_percent": round((count - len(samples)) / count * 100, 1),
+        "min_ms": round(ordered[0], 2),
+        "avg_ms": round(sum(samples) / len(samples), 2),
+        "max_ms": round(ordered[-1], 2),
+        "jitter_ms": round(_jitter(samples), 2),
+    }
+
+
 def _server_host(server: str) -> str:
     from urllib.parse import urlparse
 
@@ -657,6 +740,38 @@ def _measure_upload(server: str, seconds: float, max_bytes: int) -> dict:
     }
 
 
+def ping_summary(icmp: dict, tcp: dict) -> dict:
+    """One round-trip figure: ICMP where it answers, TCP where it does not.
+
+    ICMP is blocked or rate-limited on a great many networks, and on those an
+    unreachable ping says nothing about the connection. A TCP handshake is
+    also exactly one round trip, so it measures the same thing and always
+    gets through to a host already serving the throughput test. Which one
+    produced the number is reported, because they are not interchangeable:
+    ICMP is often deprioritised, so a TCP figure can be the *better* estimate
+    of what traffic actually experiences.
+    """
+    if icmp and icmp.get("avg_ms") is not None:
+        return dict(icmp, method="icmp",
+                    note="ICMP echo — what the ping command measures")
+    if tcp and tcp.get("mean_ms") is not None:
+        return {
+            "method": "tcp",
+            "host": tcp.get("host"),
+            "sent": tcp.get("attempts"),
+            "received": (tcp.get("attempts", 0) - tcp.get("failed", 0)),
+            "loss_percent": tcp.get("loss_percent", 0.0),
+            "min_ms": tcp.get("min_ms"),
+            "avg_ms": tcp.get("mean_ms"),
+            "max_ms": tcp.get("max_ms"),
+            "jitter_ms": tcp.get("jitter_ms"),
+            "note": "TCP handshake, also one round trip — ICMP got no "
+                    "reply, which many networks block",
+        }
+    return {"error": (icmp or {}).get("error") or (tcp or {}).get("error")
+            or "no round-trip measurement succeeded"}
+
+
 def internet_speed(server: str = DEFAULT_SPEED_SERVER, seconds: float = 5.0,
                    max_mb: int = 200) -> dict:
     """Download, upload, latency and jitter against ``server``. Never raises.
@@ -673,7 +788,9 @@ def internet_speed(server: str = DEFAULT_SPEED_SERVER, seconds: float = 5.0,
     out: dict = {"server": server, "host": host,
                  "note": "single stream to a public endpoint; reads lower "
                          "than multi-connection tools on a fast link"}
+    out["icmp"] = icmp_ping(host)
     out["latency"] = tcp_latency(host, 443)
+    out["ping"] = ping_summary(out["icmp"], out["latency"])
     out["dns"] = dns_latency()
     out["download"] = _measure_download(server, seconds, max_bytes)
     out["upload"] = _measure_upload(server, seconds, max_bytes)
@@ -697,16 +814,16 @@ def render_internet(result: dict | None) -> str:
     lines = [_speed_line("Download", result.get("download")),
              _speed_line("Upload", result.get("upload"))]
 
-    latency = result.get("latency") or {}
-    if latency.get("p50_ms") is None:
-        lines.append(f"  {'Latency':<12}: unavailable — "
-                     f"{latency.get('error', 'not measured')}")
+    ping = result.get("ping") or {}
+    if ping.get("avg_ms") is None:
+        lines.append(f"  {'Ping':<12}: unavailable — "
+                     f"{ping.get('error', 'not measured')}")
     else:
-        jitter = latency.get("p99_ms", 0) - latency.get("min_ms", 0)
-        lines.append(f"  {'Latency':<12}: {latency['p50_ms']:>8.1f} ms median "
-                     f"(best {latency['min_ms']:.1f}, "
-                     f"jitter {jitter:.1f}, "
-                     f"{latency['loss_percent']:.0f}% failed)")
+        lines.append(f"  {'Ping':<12}: {ping['avg_ms']:>8.1f} ms average "
+                     f"(min {ping['min_ms']:.1f}, max {ping['max_ms']:.1f}, "
+                     f"jitter {ping['jitter_ms']:.1f}, "
+                     f"{ping['loss_percent']:.0f}% loss)")
+        lines.append(f"  {'':<12}  {ping.get('note', '')}")
     # Absent and failed are different states, and neither has a number to
     # print — checking only for "error" walked straight into the missing key.
     dns = result.get("dns") or {}

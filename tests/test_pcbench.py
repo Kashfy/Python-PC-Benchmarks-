@@ -4577,14 +4577,116 @@ class TestInternetSpeed(unittest.TestCase):
         import zlib
         self.assertGreater(len(zlib.compress(chunk)), len(chunk) * 0.9)
 
+    def test_ping_output_is_parsed_across_platform_formats(self):
+        # Linux/macOS "time=12.3 ms", Windows "time=12ms", and the sub-1 ms
+        # "time<1ms" that Windows prints on a fast LAN.
+        for text, expected in (
+                ("64 bytes from h: icmp_seq=0 ttl=57 time=12.3 ms", [12.3]),
+                ("Reply from 1.2.3.4: bytes=32 time=12ms TTL=57", [12.0]),
+                ("Reply from 1.2.3.4: bytes=32 time<1ms TTL=128", [1.0]),
+        ):
+            self.assertEqual(
+                [float(m) for m in network._PING_TIME.findall(text)], expected)
+
+    def test_ping_command_matches_the_platform(self):
+        # -W means milliseconds on macOS and seconds on Linux; getting that
+        # backwards makes every ping either instant or minutes long.
+        import unittest.mock
+        with unittest.mock.patch("pcbench.network.os.name", "posix"):
+            with unittest.mock.patch("pcbench.network.sys.platform", "darwin"):
+                self.assertEqual(network._ping_command("h", 3, 1.0),
+                                 ["ping", "-c", "3", "-W", "1000", "h"])
+            with unittest.mock.patch("pcbench.network.sys.platform", "linux"):
+                self.assertEqual(network._ping_command("h", 3, 1.0),
+                                 ["ping", "-c", "3", "-W", "1", "h"])
+        with unittest.mock.patch("pcbench.network.os.name", "nt"):
+            self.assertEqual(network._ping_command("h", 3, 1.0),
+                             ["ping", "-n", "3", "-w", "1000", "h"])
+
+    def test_ping_refuses_a_hostname_that_looks_like_a_flag(self):
+        # The host comes from a user-supplied URL; a leading dash would
+        # otherwise be handed to ping as an option.
+        for bad in ("-c", "-oOptions", "two words", ""):
+            self.assertIn("error", network.icmp_ping(bad))
+
+    def test_ping_prefers_icmp_when_it_answers(self):
+        icmp = {"host": "h", "sent": 3, "received": 3, "loss_percent": 0.0,
+                "min_ms": 11.8, "avg_ms": 12.4, "max_ms": 14.1,
+                "jitter_ms": 0.6}
+        summary = network.ping_summary(icmp, {"mean_ms": 30.0})
+        self.assertEqual(summary["method"], "icmp")
+        self.assertEqual(summary["avg_ms"], 12.4)
+
+    def test_ping_falls_back_to_tcp_when_icmp_is_blocked(self):
+        # Blocked ICMP says nothing about the connection, and a TCP handshake
+        # is the same single round trip.
+        tcp = {"host": "h", "attempts": 12, "failed": 0, "loss_percent": 0.0,
+               "min_ms": 26.6, "mean_ms": 29.4, "max_ms": 33.0,
+               "jitter_ms": 1.5, "p50_ms": 29.0}
+        summary = network.ping_summary({"error": "no reply"}, tcp)
+        self.assertEqual(summary["method"], "tcp")
+        self.assertEqual(summary["avg_ms"], 29.4)
+        self.assertEqual(summary["received"], 12)
+        self.assertIn("ICMP", summary["note"])
+
+    def test_ping_reports_failure_when_neither_worked(self):
+        summary = network.ping_summary({"error": "blocked"}, {"error": "down"})
+        self.assertIn("error", summary)
+        self.assertIsNone(summary.get("avg_ms"))
+
+    def test_ping_is_rendered_with_its_method(self):
+        icmp = {"host": "h", "sent": 3, "received": 3, "loss_percent": 0.0,
+                "min_ms": 11.8, "avg_ms": 12.4, "max_ms": 14.1,
+                "jitter_ms": 0.6}
+        text = network.render_internet(
+            {"server": "s", "note": "n",
+             "ping": network.ping_summary(icmp, {}),
+             "download": {"mbit_per_s": 1.0, "mb_per_s": 0.1,
+                          "transferred_mb": 1.0, "seconds": 1.0},
+             "upload": {"error": "x"}})
+        self.assertIn("Ping", text)
+        self.assertIn("12.4 ms average", text)
+        self.assertIn("jitter 0.6", text)
+        self.assertIn("ICMP echo", text)
+
+    def test_jitter_is_the_consecutive_difference_everywhere(self):
+        # Not p99 - min: a single spike and a permanently unsteady link give
+        # very different consecutive differences and identical spreads.
+        self.assertAlmostEqual(network._jitter([10.0, 12.0, 11.0]), 1.5)
+        self.assertEqual(network._jitter([5.0]), 0.0)
+        self.assertEqual(network._jitter([]), 0.0)
+        steady = [10.0] * 9 + [90.0]
+        unsteady = [10.0, 90.0] * 5
+        self.assertLess(network._jitter(steady), network._jitter(unsteady))
+
+    def test_tcp_latency_keeps_arrival_order_for_jitter(self):
+        # Jitter is defined on the order samples arrived in; sorting first
+        # would silently report the wrong number.
+        import unittest.mock
+        times = iter([0.0, 0.010, 0.0, 0.090])
+
+        class FakeSocket:
+            def settimeout(self, _): pass
+            def connect(self, _): pass
+            def close(self): pass
+
+        with unittest.mock.patch("pcbench.network.socket.socket",
+                                 lambda *a: FakeSocket()):
+            with unittest.mock.patch("pcbench.network.time.perf_counter",
+                                     side_effect=lambda: next(times)):
+                result = network.tcp_latency("h", 443, attempts=2)
+        self.assertAlmostEqual(result["jitter_ms"], 80.0, places=1)
+        self.assertAlmostEqual(result["mean_ms"], 50.0, places=1)
+
     def test_render_reports_a_failure_rather_than_pretending(self):
         text = network.render_internet(
             {"server": "s", "note": "n",
              "download": {"error": "connection refused"},
              "upload": {"error": "connection refused"},
-             "latency": {"error": "unreachable"}})
+             "ping": {"error": "unreachable"}})
         self.assertIn("unavailable", text)
         self.assertIn("connection refused", text)
+        self.assertIn("unreachable", text)
 
     def test_render_shows_both_directions_and_the_caveat(self):
         text = network.render_internet({
@@ -4594,12 +4696,14 @@ class TestInternetSpeed(unittest.TestCase):
                          "transferred_mb": 100.0, "seconds": 1.6},
             "upload": {"mbit_per_s": 40.0, "mb_per_s": 4.8,
                        "transferred_mb": 10.0, "seconds": 2.1},
-            "latency": {"p50_ms": 12.0, "p99_ms": 30.0, "min_ms": 10.0,
-                        "loss_percent": 0.0},
+            "ping": {"method": "tcp", "avg_ms": 12.0, "min_ms": 10.0,
+                     "max_ms": 30.0, "jitter_ms": 2.0, "loss_percent": 0.0,
+                     "note": "TCP handshake"},
             "dns": {"median_ms": 8.0, "resolved": 3}})
         self.assertIn("512.0 Mbit/s", text)
         self.assertIn("40.0 Mbit/s", text)
-        self.assertIn("jitter 20.0", text)          # p99 - min
+        self.assertIn("12.0 ms average", text)
+        self.assertIn("jitter 2.0", text)
         self.assertIn("single stream", text)
 
     def test_render_survives_a_missing_result(self):

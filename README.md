@@ -736,7 +736,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.19 > Main menu
+  pcbench 11.20 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -1203,15 +1203,26 @@ pcbench --internet
 ```
 
 ```
-  Download    :    513.5 Mbit/s (61.2 MB/s, 25 MB in 0.4s)
-  Upload      :     29.9 Mbit/s (3.6 MB/s, 5 MB in 1.4s)
-  Latency     :     30.6 ms median (best 27.9, jitter 26.6, 0% failed)
-  DNS         :     20.5 ms median to resolve 3 name(s)
+  Download    :    593.3 Mbit/s (70.7 MB/s, 20 MB in 0.3s)
+  Upload      :     27.3 Mbit/s (3.2 MB/s, 5 MB in 1.5s)
+  Ping        :     31.1 ms average (min 27.1, max 36.0, jitter 3.3, 0% loss)
+                TCP handshake, also one round trip — ICMP got no reply
+  DNS         :      3.4 ms median to resolve 3 name(s)
 ```
 
-Latency and jitter are usually the more useful half. A 500 Mbit/s link with
+**Ping and jitter are usually the more useful half.** A 500 Mbit/s link with
 30 ms of jitter makes calls stutter and shells feel laggy; a 50 Mbit/s link
-with 2 ms does neither.
+with 2 ms does neither. Jitter here is the mean difference between
+*consecutive* round trips (the RFC 3550 definition), not the spread — one
+spike and a permanently unsteady connection have the same spread and very
+different jitter.
+
+The ping is ICMP where ICMP answers, exactly as the `ping` command measures
+it. Many networks block or rate-limit ICMP, and on those a failed ping says
+nothing about the connection — so it falls back to timing a TCP handshake,
+which is also one round trip to the same host, and the line says which it
+used. The fallback is often the *better* number, since ICMP is frequently
+deprioritised while real traffic is not.
 
 **This one sends traffic off the machine**, so it is never part of a benchmark
 run — it is its own mode and has to be named every time. It downloads up to

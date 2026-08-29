@@ -186,6 +186,9 @@ See [ml-algorithms.md](ml-algorithms.md) for how each algorithm actually works.
 | **HTML** | **H**yper**T**ext **M**arkup **L**anguage | Web-page format; used for the shareable report. |
 | **protobuf** | **Proto**col **Buf**fers | Google's binary data format. Core ML and ONNX model files are protobufs — this tool writes them directly to avoid heavy dependencies. |
 | **POSIX** | **P**ortable **O**perating **S**ystem **I**nterface | The Unix standard macOS and Linux both follow. |
+| **ICMP** | **I**nternet **C**ontrol **M**essage **P**rotocol | The protocol `ping` uses. Many networks block it, so a failed ping is usually a policy, not a fault. |
+| **jitter** | — | The mean difference between *consecutive* round trips (RFC 3550). It, not average latency, is what decides whether calls and remote shells feel steady. |
+| **RTT** | **R**ound-**T**rip **T**ime | How long a packet takes to reach a host and come back — what a ping reports. |
 | **WMI** | **W**indows **M**anagement **I**nstrumentation | Windows' system-information service. |
 | **RAPL** | **R**unning **A**verage **P**ower **L**imit | Intel/AMD on-chip energy counters — the source of real power readings on Linux. |
 | **SMC** | **S**ystem **M**anagement **C**ontroller | The Mac subsystem managing fans, power, and temperature sensors. |

@@ -400,10 +400,30 @@ measurement rather than guessed. The body is `os.urandom` bytes, incompressible
 so a transparent proxy cannot flatter the result, and containing nothing from
 the machine.
 
+#### `icmp_ping(host, count=3, timeout=1.0) -> dict`
+Round-trip time via the system `ping`, which is setuid everywhere and needs
+no privilege this tool would otherwise have to ask for. Per-packet `time=`
+lines are parsed rather than the summary, which avoids every localisation
+problem and yields the samples jitter needs. A hostname that is empty, starts
+with `-`, or contains whitespace is refused before it can reach `ping` as an
+option.
+
+#### `ping_summary(icmp, tcp) -> dict`
+One round-trip figure with the method that produced it. ICMP when it answers;
+otherwise the TCP handshake, which is the same single round trip to a host
+already serving the test. Reports `method` because they are not
+interchangeable — ICMP is often deprioritised, so the TCP figure can be the
+better estimate of what real traffic sees.
+
+#### `_jitter(samples) -> float`
+Mean absolute difference between consecutive round trips — RFC 3550. Used by
+the two-node test, `tcp_latency` and the ping alike, so the word means one
+thing throughout.
+
 #### `render_internet(result) -> str`
-Both directions, latency with jitter (p99 − min), and DNS. A section that
-failed and a section that never ran are reported differently, and neither
-crashes the report.
+Both directions, the ping with its method, and DNS. A section that failed and
+a section that never ran are reported differently, and neither crashes the
+report.
 
 ---
 
