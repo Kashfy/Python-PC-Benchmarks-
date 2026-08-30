@@ -828,7 +828,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.24 > Main menu
+  pcbench 11.25 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -1586,6 +1586,13 @@ installs `onnxruntime-gpu[cuda,cudnn]` on NVIDIA, `onnxruntime-gpu` for ROCm,
 `onnxruntime-directml` on Windows, or the plain wheel on macOS where Core ML
 is already in it. For an Intel NPU or a Qualcomm Hexagon, add
 `onnxruntime-openvino` or `onnxruntime-qnn` by hand.
+
+On NVIDIA the tier also installs **TensorRT**, the provider ONNX Runtime tries
+first and typically 30-50% faster than the plain CUDA one. Its version cannot
+be guessed — ONNX Runtime pins a major and pip's newest runs ahead of it — so
+the installer reads the required `libnvinfer` soname out of ONNX Runtime's own
+provider library and constrains the install to match. On anything but NVIDIA
+the package is not offered at all.
 
 ```
 NPU — cross-vendor (ONNX Runtime)

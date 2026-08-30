@@ -41,11 +41,18 @@ from . import onnx_model
 #
 # Harmless when the wheels are absent, when CUDA comes from the system instead,
 # and on platforms that have no CUDA at all: it globs, finds nothing, returns.
-_CUDA_WHEEL_DIRS = ("nvidia", "*", "lib")
+#
+# TensorRT lands in a directory of its own and needs the same treatment: its
+# provider is the one ONNX Runtime tries *first* on NVIDIA, so a TensorRT that
+# cannot be found costs a failed provider on every run.
+_WHEEL_LIB_DIRS = (
+    ("nvidia", "*", "lib"),     # CUDA runtime, cuBLAS, cuDNN, cuFFT ...
+    ("tensorrt_libs",),         # libnvinfer.so.N and its plugins
+)
 
 
 def _preload_wheel_cuda() -> list[str]:
-    """Load pip-installed CUDA libraries so ONNX Runtime can find them.
+    """Load pip-installed CUDA and TensorRT libraries so ORT can find them.
 
     Returns the libraries loaded, for diagnostics. Never raises: a machine
     without these wheels is the normal case.
@@ -64,20 +71,20 @@ def _preload_wheel_cuda() -> list[str]:
 
     loaded = []
     for root in roots:
-        for directory in sorted(glob.glob(os.path.join(root,
-                                                       *_CUDA_WHEEL_DIRS))):
-            if os.name == "nt":
-                try:
-                    os.add_dll_directory(directory)
-                except (OSError, AttributeError):
-                    pass
-                continue
-            for lib in sorted(glob.glob(os.path.join(directory, "*.so*"))):
-                try:
-                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
-                    loaded.append(os.path.basename(lib))
-                except OSError:
-                    pass          # a stub, or a dependency not yet loaded
+        for parts in _WHEEL_LIB_DIRS:
+            for directory in sorted(glob.glob(os.path.join(root, *parts))):
+                if os.name == "nt":
+                    try:
+                        os.add_dll_directory(directory)
+                    except (OSError, AttributeError):
+                        pass
+                    continue
+                for lib in sorted(glob.glob(os.path.join(directory, "*.so*"))):
+                    try:
+                        ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
+                        loaded.append(os.path.basename(lib))
+                    except OSError:
+                        pass      # a stub, or a dependency not yet loaded
     return loaded
 
 

@@ -131,7 +131,7 @@ Or with pip extras: `pip install -e ".[compute]"` … `".[all]"`.
 | `gpu` | pyopencl, nvidia-ml-py | GPU compute on NVIDIA/AMD/Intel/Apple; NVIDIA temp, power, VRAM |
 | `crypto` | cryptography, zstandard, lz4, blake3 | AES-256-GCM via AES-NI, modern compression and hashing |
 | `data` | numpy, polars, pandas, duckdb | Dataframe benchmarks and LINPACK's optimised BLAS |
-| `ai` | onnxruntime | Cross-vendor NPU and GPU inference through execution providers |
+| `ai` | onnxruntime, tensorrt *(NVIDIA only)* | Cross-vendor NPU and GPU inference through execution providers |
 | `system` | psutil, py-cpuinfo, rich, matplotlib, scikit-learn | Sensors on Windows/Linux, charts, tables, reference ML |
 
 **The `ai` tier resolves its own wheel.** `onnxruntime` is one import name and
@@ -152,6 +152,31 @@ picks:
 The pip extra `".[ai]"` installs the CPU-only wheel, because a static
 dependency list cannot know the hardware. Use `install.py` to get the right
 one.
+
+**TensorRT is installed only where it can load.** It is NVIDIA's optimising
+inference runtime and the provider ONNX Runtime tries *first* on NVIDIA —
+typically 30-50% faster than the plain CUDA one — so a TensorRT that cannot be
+found costs a failed provider on every run. Two things make the version hard
+to guess, and `install.py` handles both:
+
+- **ONNX Runtime pins a major, and pip's newest runs ahead of it.** `pip
+  install tensorrt` today fetches 11.x while ONNX Runtime 1.29 dlopens
+  `libnvinfer.so.10`. The installer reads the required soname out of the
+  provider library's bytes and constrains the install to that major.
+- **Only the `-libs` package, never the metapackage.** ONNX Runtime uses the
+  C++ library and never the Python bindings, and the bindings are the part
+  that lags — there is no TensorRT 10 binding wheel for Python 3.14 at all, so
+  asking for `tensorrt` on a 3.14 interpreter resolves to an 11.x that ONNX
+  Runtime cannot load.
+
+Both mean the answer depends on what `onnxruntime` put on disk, so the
+installer resolves each package immediately before installing it rather than
+planning the whole batch up front. On a machine with no NVIDIA GPU the package
+is not listed as missing at all: 1.2 GB of libraries nothing can load is not
+"not installed yet".
+
+Like the CUDA wheels, TensorRT lands somewhere the loader does not look
+(`site-packages/tensorrt_libs/`); `pcbench.npu` loads it too.
 
 **pyopencl is only half of the `gpu` tier.** The other half is the vendor's
 *ICD*, a system package that pip cannot install. A machine can have a working

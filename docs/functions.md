@@ -591,7 +591,24 @@ imported merely to test for them.
 
 #### `version_of(module) -> str | None` · `summary_line() -> str`
 
-#### `onnxruntime_distribution() -> str` · `pip_target(pkg) -> str`
+#### `tensorrt_distribution() -> str | None`
+The TensorRT distribution ONNX Runtime *here* can actually load. ONNX Runtime
+pins a TensorRT major and pip's newest runs ahead of it — `pip install
+tensorrt` today fetches 11.x while ONNX Runtime 1.29 dlopens
+`libnvinfer.so.10` — so the requirement is read out of the provider library's
+bytes rather than hardcoded. Resolves to the `-libs` package only, never the
+metapackage: ONNX Runtime uses the C++ library and never the Python bindings,
+and the bindings are the part that lags (there is no TensorRT 10 binding wheel
+for Python 3.14 at all). `None` when it cannot be determined, which means
+installing would be 1.2 GB of libraries nothing loads.
+
+#### `applies(pkg) -> bool` · `tier_packages(name) -> list[Package]`
+A tier's packages less the ones this machine's hardware rules out. A TensorRT
+that could never load is not "not installed yet", it is not applicable, and
+listing it as missing on an AMD machine would be an instruction to download
+1.2 GB for nothing.
+
+#### `onnxruntime_distribution() -> str` · `pip_target(pkg) -> str | None`
 Which wheel to install for a package whose distribution depends on the
 hardware. `onnxruntime` is one import name and several distributions, and the
 plain PyPI wheel carries only `CPUExecutionProvider` on Windows and Linux —
@@ -600,7 +617,10 @@ engages nothing and reports the CPU. Resolves to
 `onnxruntime-gpu[cuda,cudnn]` on NVIDIA (the extras bring the CUDA runtime and
 cuDNN), `onnxruntime-gpu` for ROCm, `onnxruntime-directml` on Windows, and the
 plain wheel on macOS where Core ML is already in it. `pip_target` passes every
-other package through unchanged.
+other package through unchanged, and returns `None` for a package this
+machine's hardware rules out. It is called once per package immediately before
+installing, not once for the batch: TensorRT's version depends on what
+`onnxruntime` — earlier in the same tier — put on disk.
 
 #### `opencl_icd_hint() -> str | None`
 The command that registers an OpenCL driver on this machine, or None where the

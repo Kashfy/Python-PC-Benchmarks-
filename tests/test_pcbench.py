@@ -1627,12 +1627,43 @@ class TestOptionalRegistry(unittest.TestCase):
         if platform.system() == "Darwin":
             self.assertEqual(dist, "onnxruntime")   # Core ML is in the wheel
 
+    #: Packages whose distribution depends on the hardware rather than being
+    #: the name in the registry.
+    RESOLVED = {"onnxruntime", "tensorrt_libs"}
+
     def test_pip_target_passes_ordinary_packages_through(self):
         for pkg in optional.all_packages():
-            target = optional.pip_target(pkg)
-            if pkg.import_name != "onnxruntime":
-                self.assertEqual(target, pkg.pip_name)
-            self.assertTrue(target)
+            if pkg.import_name in self.RESOLVED:
+                continue
+            self.assertEqual(optional.pip_target(pkg), pkg.pip_name)
+
+    def test_tensorrt_matches_the_major_onnxruntime_was_built_against(self):
+        # ONNX Runtime pins a TensorRT major and pip's newest routinely runs
+        # ahead of it: `pip install tensorrt` today fetches 11.x while ONNX
+        # Runtime 1.29 dlopens libnvinfer.so.10, which fails at load with
+        # nothing in the report but "the accelerator did not engage".
+        major = optional._tensorrt_major()
+        dist = optional.tensorrt_distribution()
+        if major is None:
+            self.assertIsNone(dist)
+            self.skipTest("onnxruntime has no TensorRT provider here")
+        self.assertIn("-libs", dist)      # never the metapackage
+        self.assertIn(f">={major},<{int(major) + 1}", dist)
+
+    def test_tensorrt_is_skipped_where_it_could_never_load(self):
+        trt = next(p for p in optional.TIERS["ai"]["packages"]
+                   if p.import_name == "tensorrt_libs")
+        self.assertEqual(trt.needs_gpu, "nvidia")
+        if "nvidia" not in optional._gpu_vendors():
+            # 1.2 GB of libraries nothing can load is not "not installed yet".
+            self.assertIsNone(optional.pip_target(trt))
+            self.assertNotIn(trt, optional.tier_packages("ai"))
+            self.assertNotIn(trt, optional.missing(["ai"]))
+
+    def test_tier_packages_is_a_subset_of_the_registry(self):
+        for name, tier in optional.TIERS.items():
+            for pkg in optional.tier_packages(name):
+                self.assertIn(pkg, tier["packages"], name)
 
     def test_opencl_icd_hint_is_actionable_or_absent(self):
         # pip cannot install an OpenCL driver, so the installer has to name
@@ -1694,6 +1725,14 @@ class TestOptionalBenchmarksDegrade(unittest.TestCase):
             self.skipTest("OpenCL works here; testing the failure paths")
         self.assertIn("matmul", r)
         self.assertIn("nvidia", r)
+
+    def test_nvidia_telemetry_survives_an_unhappy_card(self):
+        # Every metric was already optional, but the device handle was not, so
+        # one GPU in a bad power state raised out of the whole GPU section.
+        entries = gpucompute.nvidia_telemetry()
+        self.assertIsInstance(entries, list)
+        for entry in entries:
+            self.assertIn("index", entry)
 
     def test_missing_icd_is_explained_not_just_reported(self):
         note = gpucompute._enumeration_note(

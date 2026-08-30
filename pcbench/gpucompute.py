@@ -268,8 +268,20 @@ def nvidia_telemetry() -> list[dict]:
         return []
     out = []
     try:
-        for i in range(pynvml.nvmlDeviceGetCount()):
-            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+        except Exception:
+            count = 0
+        for i in range(count):
+            # Enumeration itself can fail per device — a GPU in a bad power
+            # state, a container without the device node, a driver mid-reset.
+            # Every *metric* below was already optional; the handle was not,
+            # so one unhappy card raised out of the whole GPU section.
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            except Exception as e:
+                out.append({"index": i, "error": f"{type(e).__name__}: {e}"})
+                continue
             entry: dict = {"index": i}
 
             def attempt(key, fn, scale=1.0, ndigits=1):

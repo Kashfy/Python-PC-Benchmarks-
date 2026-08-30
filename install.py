@@ -51,13 +51,13 @@ def show_status(venv_dir: str = VENV_DIR) -> None:
         state = st["tiers"][name]
         mark = "✓" if state["complete"] else ("~" if state["usable"] else " ")
         print(f"\n  [{mark}] {name}  —  {tier['summary']}")
-        for pkg in tier["packages"]:
+        for pkg in optional.tier_packages(name):
             installed = state["packages"][pkg.pip_name]
             tick = "✓" if installed else "·"
             ver = f" ({optional.version_of(pkg.import_name)})" if installed \
                 else f" ~{pkg.approx_mb} MB"
             target = optional.pip_target(pkg)
-            label = pkg.pip_name if target == pkg.pip_name \
+            label = pkg.pip_name if target in (None, pkg.pip_name) \
                 else f"{pkg.pip_name} → {target}"
             print(f"        {tick} {label:<16}{ver}")
             print(f"          {pkg.purpose}")
@@ -106,15 +106,26 @@ def ensure_venv(venv_dir: str) -> str | None:
     return python
 
 
-def pip_install(python: str, packages: list[str]) -> tuple[list[str], list[str]]:
-    """Install packages one at a time. Returns (succeeded, failed).
+def pip_install(python: str,
+                packages: list) -> tuple[list[str], list[str], list[str]]:
+    """Install packages one at a time. Returns (succeeded, failed, skipped).
 
     Installed individually rather than in one command so a single unavailable
     wheel — pyopencl has no wheel on some platforms — does not abort the whole
     batch.
+
+    Each package's distribution is resolved *here*, immediately before it is
+    installed, rather than up front: TensorRT's version is read out of the
+    provider library ONNX Runtime ships, so it cannot be known until ONNX
+    Runtime — earlier in the same tier — is on disk.
     """
-    ok, failed = [], []
-    for name in packages:
+    ok, failed, skipped = [], [], []
+    for pkg in packages:
+        name = optional.pip_target(pkg)
+        if not name:
+            skipped.append(pkg.pip_name)
+            print(f"\n  – skipping {pkg.pip_name}: nothing here can use it")
+            continue
         print(f"\n  → installing {name} ...", flush=True)
         proc = subprocess.run(
             [python, "-m", "pip", "install", "--upgrade", name],
@@ -127,7 +138,7 @@ def pip_install(python: str, packages: list[str]) -> tuple[list[str], list[str]]
             tail = (proc.stderr or proc.stdout).strip().splitlines()
             reason = tail[-1][:160] if tail else "unknown error"
             print(f"    ✗ {name} — {reason}")
-    return ok, failed
+    return ok, failed, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +244,7 @@ def main(argv=None) -> int:
           f"roughly {total_mb} MB total\n")
     for pkg in missing:
         target = optional.pip_target(pkg)
-        label = pkg.pip_name if target == pkg.pip_name else target
+        label = target or f"{pkg.pip_name} (resolved after its tier-mates)"
         print(f"    {label:<28} ~{pkg.approx_mb:>4} MB   {pkg.purpose}")
 
     target = "the current Python environment" if args.here \
@@ -260,11 +271,11 @@ def main(argv=None) -> int:
         if not python:
             return 3
 
-    ok, failed = pip_install(python, [optional.pip_target(pkg)
-                                      for pkg in missing])
+    ok, failed, skipped = pip_install(python, missing)
 
     hr("Result")
-    print(f"  Installed: {len(ok)}   Failed: {len(failed)}")
+    print(f"  Installed: {len(ok)}   Failed: {len(failed)}"
+          + (f"   Skipped: {len(skipped)}" if skipped else ""))
     if failed:
         print(f"\n  These could not be installed: {', '.join(failed)}")
         print("  That is not fatal — pcbench skips whatever is absent.")

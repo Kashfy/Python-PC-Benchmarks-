@@ -21,9 +21,12 @@ rather than raised, and the stdlib results remain untouched either way.
 
 from __future__ import annotations
 
+import glob
 import importlib
 import importlib.util
 import os
+import re
+import site
 from typing import NamedTuple
 
 
@@ -34,6 +37,7 @@ class Package(NamedTuple):
     purpose: str            # why the tool wants it
     approx_mb: int          # rough download size, for the installer prompt
     critical: bool = False  # the tier is largely pointless without it
+    needs_gpu: str = ""     # only applies with this GPU vendor present
 
 
 TIERS: dict[str, dict] = {
@@ -97,6 +101,13 @@ TIERS: dict[str, dict] = {
                     "NPU and GPU inference through execution providers — "
                     "CUDA, ROCm, DirectML, Core ML, OpenVINO, QNN",
                     40, critical=True),
+            # After onnxruntime, always: the version to install is read out of
+            # the provider library ONNX Runtime ships.
+            Package("tensorrt_libs", "tensorrt",
+                    "NVIDIA's optimising inference runtime — the provider "
+                    "ONNX Runtime tries first on NVIDIA, and typically 30-50% "
+                    "faster than the plain CUDA one",
+                    1200, needs_gpu="nvidia"),
         ],
     },
     "system": {
@@ -132,6 +143,22 @@ HEAVY = [
 # --------------------------------------------------------------------------- #
 # Distributions that depend on the hardware
 # --------------------------------------------------------------------------- #
+def _site_dirs() -> list[str]:
+    """Every site-packages directory this interpreter reads from."""
+    paths = []
+    try:
+        paths.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user = site.getusersitepackages()
+        if isinstance(user, str):
+            paths.append(user)
+    except Exception:
+        pass
+    return paths
+
+
 def _gpu_vendors() -> set[str]:
     """Lower-cased vendor names of the GPUs in this machine.
 
@@ -174,11 +201,95 @@ def onnxruntime_distribution() -> str:
     return "onnxruntime"
 
 
-def pip_target(pkg: Package) -> str:
-    """The distribution to install for ``pkg`` on this machine."""
+#: Where ONNX Runtime keeps the provider library that dlopens TensorRT, and
+#: the soname it was built against. Reading the requirement out of the binary
+#: beats hardcoding a version: ONNX Runtime pins a TensorRT major, and pip's
+#: newest is routinely ahead of it — today `pip install tensorrt` fetches 11.x
+#: while ONNX Runtime 1.29 wants libnvinfer.so.10, which fails at load with
+#: nothing in the report but "the accelerator did not engage".
+_NVINFER_SONAME = re.compile(rb"libnvinfer\.so\.(\d+)")
+
+
+def _tensorrt_major() -> str | None:
+    """The TensorRT major ONNX Runtime's TensorRT provider was built against."""
+    try:
+        import onnxruntime
+        capi = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
+        for name in os.listdir(capi):
+            if "providers_tensorrt" not in name:
+                continue
+            with open(os.path.join(capi, name), "rb") as fh:
+                found = _NVINFER_SONAME.findall(fh.read())
+            if found:
+                return max(found, key=int).decode()
+    except Exception:
+        pass
+    return None
+
+
+def _cuda_major() -> str:
+    """The CUDA major the installed NVIDIA wheels are built for."""
+    for path in _site_dirs():
+        for entry in sorted(glob.glob(os.path.join(path, "nvidia", "cu*")),
+                            reverse=True):
+            digits = os.path.basename(entry)[2:]
+            if digits.isdigit():
+                return digits
+    return "13"
+
+
+def tensorrt_distribution() -> str | None:
+    """The TensorRT distribution ONNX Runtime here can actually load.
+
+    ``None`` when it cannot be determined, which means ONNX Runtime is not
+    installed yet or was built without the TensorRT provider — installing a
+    guess would be 1.2 GB of libraries nothing loads.
+
+    Only the ``-libs`` package, never the metapackage. ONNX Runtime dlopens
+    the C++ library and never touches the Python bindings, and the bindings
+    are the part that lags: at the time of writing there is no TensorRT 10
+    binding wheel for Python 3.14 at all, so asking for `tensorrt` on a 3.14
+    interpreter resolves to 11.x, which ONNX Runtime cannot load.
+    """
+    major = _tensorrt_major()
+    if not major:
+        return None
+    ceiling = int(major) + 1
+    return (f"tensorrt-cu{_cuda_major()}-libs>={major},<{ceiling}")
+
+
+def pip_target(pkg: Package) -> str | None:
+    """The distribution to install for ``pkg`` on this machine.
+
+    ``None`` when the package does not apply here and must be skipped.
+    Resolved one package at a time, immediately before installing it, because
+    some answers depend on what an earlier package in the same tier installed.
+    """
+    if pkg.needs_gpu and pkg.needs_gpu not in _gpu_vendors():
+        return None
     if pkg.import_name == "onnxruntime":
         return onnxruntime_distribution()
+    if pkg.import_name == "tensorrt_libs":
+        return tensorrt_distribution()
     return pkg.pip_name
+
+
+def applies(pkg: Package) -> bool:
+    """Whether ``pkg`` is relevant to this machine's hardware at all."""
+    return not pkg.needs_gpu or pkg.needs_gpu in _gpu_vendors()
+
+
+def tier_packages(name: str) -> list[Package]:
+    """A tier's packages, less the ones this machine's hardware rules out.
+
+    A TensorRT that will never load is not "not installed yet", it is not
+    applicable — listing it as missing on an AMD machine would be an
+    instruction to download 1.2 GB for nothing.
+    """
+    tier = TIERS.get(name)
+    if not tier:
+        return []
+    return [pkg for pkg in tier["packages"] if applies(pkg)]
 
 
 # --------------------------------------------------------------------------- #
@@ -262,17 +373,16 @@ def status() -> dict:
     """Which optional packages are present, grouped by tier."""
     result: dict = {"tiers": {}, "heavy": {}}
     for name, tier in TIERS.items():
-        entries = {}
-        for pkg in tier["packages"]:
-            entries[pkg.pip_name] = _importable(pkg.import_name)
+        packages = tier_packages(name)
+        entries = {pkg.pip_name: _importable(pkg.import_name)
+                   for pkg in packages}
         result["tiers"][name] = {
             "summary": tier["summary"],
             "packages": entries,
             "complete": all(entries.values()),
             "usable": any(
-                entries[p.pip_name] for p in tier["packages"] if p.critical
-            ) if any(p.critical for p in tier["packages"]) else any(
-                entries.values()),
+                entries[p.pip_name] for p in packages if p.critical
+            ) if any(p.critical for p in packages) else any(entries.values()),
         }
     for pkg in HEAVY:
         result["heavy"][pkg.pip_name] = _importable(pkg.import_name)
@@ -284,10 +394,7 @@ def missing(tier_names: list[str] | None = None) -> list[Package]:
     names = tier_names or list(TIERS)
     out = []
     for name in names:
-        tier = TIERS.get(name)
-        if not tier:
-            continue
-        for pkg in tier["packages"]:
+        for pkg in tier_packages(name):
             if not _importable(pkg.import_name):
                 out.append(pkg)
     return out
