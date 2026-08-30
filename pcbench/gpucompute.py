@@ -189,12 +189,21 @@ def devices() -> list[dict]:
 
 def _bench_device(dev, seconds: float) -> dict:
     """FMA throughput and copy bandwidth for one OpenCL device."""
+    import warnings
+
     import numpy as np
     import pyopencl as cl
 
     ctx = cl.Context(devices=[dev])
     queue = cl.CommandQueue(ctx)
-    program = cl.Program(ctx, _KERNEL).build()
+    with warnings.catch_warnings():
+        # Several vendors' compilers emit notes on a clean build, and pyopencl
+        # raises each as a CompilerWarning with a stack trace. A build that
+        # actually fails raises instead, so this hides nothing that matters --
+        # and printing a Python traceback into the middle of the report reads
+        # as a fault.
+        warnings.simplefilter("ignore", cl.CompilerWarning)
+        program = cl.Program(ctx, _KERNEL).build()
     mf = cl.mem_flags
 
     dev_type = cl.device_type.to_string(dev.type)

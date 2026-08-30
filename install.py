@@ -44,7 +44,7 @@ def hr(title: str = "") -> None:
     print(f"\n{line}\n{title}\n{line}" if title else line)
 
 
-def show_status() -> None:
+def show_status(venv_dir: str = VENV_DIR) -> None:
     st = optional.status()
     hr("Optional package tiers")
     for name, tier in optional.TIERS.items():
@@ -56,7 +56,10 @@ def show_status() -> None:
             tick = "✓" if installed else "·"
             ver = f" ({optional.version_of(pkg.import_name)})" if installed \
                 else f" ~{pkg.approx_mb} MB"
-            print(f"        {tick} {pkg.pip_name:<16}{ver}")
+            target = optional.pip_target(pkg)
+            label = pkg.pip_name if target == pkg.pip_name \
+                else f"{pkg.pip_name} → {target}"
+            print(f"        {tick} {label:<16}{ver}")
             print(f"          {pkg.purpose}")
 
     print("\n  Large, hardware-specific — install manually if wanted:")
@@ -64,6 +67,13 @@ def show_status() -> None:
         tick = "✓" if st["heavy"][pkg.pip_name] else "·"
         print(f"        {tick} {pkg.pip_name:<16} ~{pkg.approx_mb} MB — "
               f"{pkg.purpose}")
+
+    # Probe the environment the benchmark will actually run in, which is the
+    # venv when one exists — `python3 install.py --list` is otherwise reporting
+    # on an interpreter nobody uses.
+    print()
+    runner = venv_python(venv_dir)
+    report_opencl(runner if os.path.isfile(runner) else sys.executable)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +131,58 @@ def pip_install(python: str, packages: list[str]) -> tuple[list[str], list[str]]
 
 
 # --------------------------------------------------------------------------- #
+# OpenCL, which pip cannot install
+# --------------------------------------------------------------------------- #
+def opencl_platforms(python: str) -> int | None:
+    """How many OpenCL platforms the target interpreter can see.
+
+    None when pyopencl is not installed there. Zero is the interesting answer:
+    the binding imports, the GPU is fine, and no vendor driver is registered
+    with the loader.
+    """
+    probe = ("import pyopencl;"
+             "print(len(pyopencl.get_platforms()))")
+    proc = subprocess.run([python, "-c", probe],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        out = (proc.stderr or "")
+        if "ModuleNotFoundError" in out or "ImportError" in out:
+            return None
+        return 0                    # imported, then failed to enumerate
+    try:
+        return int((proc.stdout or "0").strip())
+    except ValueError:
+        return 0
+
+
+def report_opencl(python: str) -> None:
+    """Say whether the GPU section will actually have a driver to talk to.
+
+    `pyopencl` is only the Python binding; the driver is the vendor's ICD, a
+    *system* package. A machine can have a working GPU, a current driver and
+    pyopencl installed and still enumerate nothing, and the error it raises
+    — PLATFORM_NOT_FOUND_KHR — reads like a hardware fault. pip cannot fix
+    this, so the installer at least has to name what will.
+    """
+    count = opencl_platforms(python)
+    if count is None:
+        return
+    if count:
+        print(f"  OpenCL: {count} platform(s) visible — the GPU section has "
+              f"a driver to talk to.")
+        return
+    print("  OpenCL: pyopencl is installed but no driver is registered, so "
+          "GPU\n          shader throughput cannot be measured. That is a "
+          "system\n          package, not a pip one.")
+    hint = optional.opencl_icd_hint()
+    if hint:
+        print(f"\n              {hint}\n")
+    elif os.name == "nt":
+        print("\n          Reinstall the GPU vendor's display driver, which "
+              "registers\n          the OpenCL runtime.\n")
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
@@ -140,7 +202,7 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
 
     if args.list:
-        show_status()
+        show_status(args.venv_dir)
         return 0
 
     tiers = ([t.strip() for t in args.tier.split(",") if t.strip()]
@@ -154,6 +216,14 @@ def main(argv=None) -> int:
     missing = optional.missing(tiers)
     if not missing:
         print("Everything for the selected tier(s) is already installed.")
+        # Still worth saying, and this is the case where it matters most: the
+        # gpu tier can be complete and the GPU section still measure nothing,
+        # because the driver it needs is not a pip package.
+        if "gpu" in tiers:
+            runner = venv_python(args.venv_dir)
+            print()
+            report_opencl(runner if os.path.isfile(runner) and not args.here
+                          else sys.executable)
         return 0
 
     hr("pcbench optional package installer")
@@ -162,7 +232,9 @@ def main(argv=None) -> int:
     print(f"  To install     : {len(missing)} package(s), "
           f"roughly {total_mb} MB total\n")
     for pkg in missing:
-        print(f"    {pkg.pip_name:<16} ~{pkg.approx_mb:>4} MB   {pkg.purpose}")
+        target = optional.pip_target(pkg)
+        label = pkg.pip_name if target == pkg.pip_name else target
+        print(f"    {label:<28} ~{pkg.approx_mb:>4} MB   {pkg.purpose}")
 
     target = "the current Python environment" if args.here \
         else f"a virtual environment at ./{args.venv_dir}"
@@ -188,7 +260,8 @@ def main(argv=None) -> int:
         if not python:
             return 3
 
-    ok, failed = pip_install(python, [pkg.pip_name for pkg in missing])
+    ok, failed = pip_install(python, [optional.pip_target(pkg)
+                                      for pkg in missing])
 
     hr("Result")
     print(f"  Installed: {len(ok)}   Failed: {len(failed)}")
@@ -197,6 +270,10 @@ def main(argv=None) -> int:
         print("  That is not fatal — pcbench skips whatever is absent.")
         print("  A common cause is a package with no prebuilt wheel for this "
               "platform\n  (pyopencl often needs system OpenCL headers).")
+
+    if "gpu" in tiers or "ai" in tiers:
+        print()
+        report_opencl(python)
 
     if not args.here:
         runner = venv_python(args.venv_dir)

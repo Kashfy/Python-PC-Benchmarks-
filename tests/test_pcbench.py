@@ -1614,6 +1614,40 @@ class TestOptionalRegistry(unittest.TestCase):
     def test_summary_line_is_string(self):
         self.assertIsInstance(optional.summary_line(), str)
 
+    def test_onnxruntime_resolves_to_a_hardware_appropriate_wheel(self):
+        # One import name, several distributions. The plain PyPI wheel carries
+        # only CPUExecutionProvider on Windows and Linux, so installing it on
+        # a machine with a discrete GPU gives an NPU section that engages
+        # nothing and reports the CPU.
+        dist = optional.onnxruntime_distribution()
+        self.assertTrue(dist.startswith("onnxruntime"))
+        self.assertIn(dist.split("[")[0],
+                      ("onnxruntime", "onnxruntime-gpu",
+                       "onnxruntime-directml"))
+        if platform.system() == "Darwin":
+            self.assertEqual(dist, "onnxruntime")   # Core ML is in the wheel
+
+    def test_pip_target_passes_ordinary_packages_through(self):
+        for pkg in optional.all_packages():
+            target = optional.pip_target(pkg)
+            if pkg.import_name != "onnxruntime":
+                self.assertEqual(target, pkg.pip_name)
+            self.assertTrue(target)
+
+    def test_opencl_icd_hint_is_actionable_or_absent(self):
+        # pip cannot install an OpenCL driver, so the installer has to name
+        # the system package -- but a wrong command is worse than none.
+        hint = optional.opencl_icd_hint()
+        if platform.system() != "Linux":
+            self.assertIsNone(hint)
+        elif hint is not None:
+            self.assertTrue(hint.startswith("sudo "))
+            self.assertGreater(len(hint.split()), 2)
+
+    def test_torch_is_the_only_package_left_to_install_by_hand(self):
+        self.assertEqual([p.pip_name for p in optional.HEAVY], ["torch"])
+        self.assertIn("ai", optional.TIERS)
+
     def test_pyproject_extras_match_registry(self):
         # A tier added to the registry but not to pyproject would be
         # uninstallable via pip.
@@ -1707,6 +1741,21 @@ class TestInstaller(unittest.TestCase):
     def test_unknown_tier_rejected(self):
         import install
         self.assertEqual(install.main(["--tier", "nonsense"]), 2)
+
+    def test_opencl_probe_reports_absence_rather_than_failing(self):
+        import install
+        # An interpreter without pyopencl must come back as None (not
+        # installed), never as an exception or a bogus platform count.
+        count = install.opencl_platforms(sys.executable)
+        self.assertTrue(count is None or count >= 0)
+
+    def test_opencl_report_never_raises(self):
+        import contextlib
+        import io
+        import install
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            install.report_opencl(sys.executable)
 
     def test_declining_installs_nothing(self):
         # Confirmation is required; a non-affirmative answer must abort.

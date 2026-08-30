@@ -362,9 +362,26 @@ identical existing file.
 
 ## `pcbench.npu` — cross-vendor NPU benchmarking
 
+#### `_preload_wheel_cuda() -> list[str]`
+Loads the CUDA libraries that `onnxruntime-gpu[cuda,cudnn]` installs under
+`site-packages/nvidia/*/lib`, which is on no loader search path. Without this
+ONNX Runtime lists `CUDAExecutionProvider`, fails to `dlopen` its provider
+library, and falls back to the CPU — reported as "the accelerator did not
+engage" when the real problem is a missing `LD_LIBRARY_PATH`. `RTLD_GLOBAL` is
+what makes the symbols visible to the provider library that loads later; on
+Windows the directory is added with `os.add_dll_directory`. A no-op when the
+wheels are absent, when CUDA comes from the system, and on macOS.
+
+#### `_quiet()`
+Context manager swallowing ONNX Runtime's own console output while a session is
+built. A provider that cannot load is a *result* here, reported by name with a
+reason; ORT also announces it in red with C++ source paths, straight into the
+middle of the report.
+
 #### `detect() -> dict`
 Reports ONNX Runtime availability and which execution providers are installed,
-split into all providers and accelerator providers.
+split into all providers and accelerator providers. Sets the ORT logger to
+fatal-only for the same reason as `_quiet`.
 
 #### `run(seconds, out_dir) -> dict`
 Benchmarks the CPU provider as a baseline, then every accelerator provider, and
@@ -380,7 +397,8 @@ never scored.
 ## `pcbench.power` — power & perf-per-watt
 
 #### `estimate_tdp(cpu_model) -> int | None`
-Rough package-TDP lookup by chip family.
+Rough package-TDP lookup, matching the part-number suffix before the family
+name — a Ryzen 7 7800X3D and a 7840U are not both 45 W.
 
 #### `measure(cpu_model="") -> dict`
 A reading with its `source` and an `estimated` flag: `powermetrics` (macOS,
@@ -572,6 +590,24 @@ modules before importing. Uses `find_spec`, so heavyweight packages are never
 imported merely to test for them.
 
 #### `version_of(module) -> str | None` · `summary_line() -> str`
+
+#### `onnxruntime_distribution() -> str` · `pip_target(pkg) -> str`
+Which wheel to install for a package whose distribution depends on the
+hardware. `onnxruntime` is one import name and several distributions, and the
+plain PyPI wheel carries only `CPUExecutionProvider` on Windows and Linux —
+installing it on a machine with a discrete GPU gives an NPU section that
+engages nothing and reports the CPU. Resolves to
+`onnxruntime-gpu[cuda,cudnn]` on NVIDIA (the extras bring the CUDA runtime and
+cuDNN), `onnxruntime-gpu` for ROCm, `onnxruntime-directml` on Windows, and the
+plain wheel on macOS where Core ML is already in it. `pip_target` passes every
+other package through unchanged.
+
+#### `opencl_icd_hint() -> str | None`
+The command that registers an OpenCL driver on this machine, or None where the
+ICD arrives with the driver (Windows) or the OS (macOS), or where no package
+manager is recognised — a wrong command is worse than none. `pyopencl` is only
+the binding; without an ICD the loader raises `PLATFORM_NOT_FOUND_KHR`, which
+reads like a hardware fault and is not one, and pip cannot fix it.
 
 ---
 

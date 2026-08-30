@@ -130,7 +130,44 @@ Or with pip extras: `pip install -e ".[compute]"` … `".[all]"`.
 | `compute` | numpy, scipy, numba | BLAS matmul (FP64/FP32), FFT, LAPACK SVD/Cholesky/eigenvalues |
 | `gpu` | pyopencl, nvidia-ml-py | GPU compute on NVIDIA/AMD/Intel/Apple; NVIDIA temp, power, VRAM |
 | `crypto` | cryptography, zstandard, lz4, blake3 | AES-256-GCM via AES-NI, modern compression and hashing |
+| `data` | numpy, polars, pandas, duckdb | Dataframe benchmarks and LINPACK's optimised BLAS |
+| `ai` | onnxruntime | Cross-vendor NPU and GPU inference through execution providers |
 | `system` | psutil, py-cpuinfo, rich, matplotlib, scikit-learn | Sensors on Windows/Linux, charts, tables, reference ML |
+
+**The `ai` tier resolves its own wheel.** `onnxruntime` is one import name and
+several distributions, and the difference is the point of the tier: the plain
+PyPI wheel carries only `CPUExecutionProvider` on Windows and Linux, so
+installing it on a machine with a discrete GPU produces a section that runs,
+engages nothing, and reports the CPU. `install.py` inspects the hardware and
+picks:
+
+| Machine | Installed |
+|---------|-----------|
+| NVIDIA GPU | `onnxruntime-gpu[cuda,cudnn]` — the extras bring the CUDA runtime and cuDNN, without which ONNX Runtime advertises the provider and then fails to load it |
+| AMD GPU on Linux | `onnxruntime-gpu` — ROCm execution provider |
+| Windows, no discrete GPU | `onnxruntime-directml` — reaches any DX12 GPU or NPU |
+| macOS | `onnxruntime` — Core ML is in the default wheel |
+| anything else | `onnxruntime` |
+
+The pip extra `".[ai]"` installs the CPU-only wheel, because a static
+dependency list cannot know the hardware. Use `install.py` to get the right
+one.
+
+**pyopencl is only half of the `gpu` tier.** The other half is the vendor's
+*ICD*, a system package that pip cannot install. A machine can have a working
+GPU, a current driver and `pyopencl` installed and still enumerate nothing —
+`PLATFORM_NOT_FOUND_KHR`, which reads like a hardware fault and is not one.
+`install.py` checks after installing and names the package:
+
+```bash
+sudo pacman -S opencl-nvidia        # Arch, NVIDIA
+sudo apt install nvidia-opencl-icd  # Debian/Ubuntu, NVIDIA
+sudo apt install mesa-opencl-icd    # Debian/Ubuntu, AMD
+sudo apt install intel-opencl-icd   # Debian/Ubuntu, Intel
+```
+
+Windows ships the ICD with the display driver and macOS ships it with the OS,
+so neither normally needs anything.
 
 **Why a venv by default.** Installing into a system interpreter risks
 permission problems and leaves packages that are awkward to remove. The
@@ -139,26 +176,47 @@ approximate size, and does nothing until you confirm. Packages are installed
 one at a time so a single unavailable wheel — `pyopencl` has none on some
 platforms — does not abort the batch.
 
-## Optional dependency: an ML framework (AI tier only)
+## Optional dependency: an ML framework
 
-The AI training/inference benchmark uses **PyTorch** if installed, or **ONNX
-Runtime** as an inference-only fallback. Neither is required — the section is
-skipped otherwise. This is the only place the tool uses a heavy dependency, and
-only when you opt in by installing it:
+ONNX Runtime comes with the `ai` tier above. **PyTorch** stays a manual
+install: its build matrix is hardware-specific enough that picking wrong
+silently gives a CPU-only build, and the wheel is ~800 MB before CUDA.
 
 ```bash
-pip install torch          # real training + inference, CUDA/ROCm/MPS/CPU
-pip install onnxruntime    # inference + cross-vendor NPU benchmarking
+pip install torch          # Linux: CUDA is bundled. macOS: MPS.
+# Windows -- the PyPI wheel is CPU-only, so name the CUDA index explicitly:
+pip install torch --index-url https://download.pytorch.org/whl/cu130
+# AMD on Linux, likewise:
+pip install torch --index-url https://download.pytorch.org/whl/rocm6.2
 ```
 
-`onnxruntime` additionally unlocks **cross-vendor NPU benchmarking** (Intel,
-AMD, Qualcomm, DirectML). Vendor-specific builds target their own NPU:
+A CPU-only build is not an error and says nothing: `torch.cuda.is_available()`
+is simply False, the matmul is skipped with "no PyTorch GPU device", and the
+report looks the same as having no torch at all. Check with:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Without it the GPU section's **Matmul FP32/FP16 (TFLOPS)** row is skipped with
+a reason. That figure is the AI-compute number — on hardware with tensor cores
+it is several times the OpenCL shader figure, and OpenCL cannot reach the
+matrix hardware that produces it at all.
+
+Vendor-specific ONNX Runtime builds beyond what `install.py` picks:
 
 ```bash
 pip install onnxruntime-openvino    # Intel AI Boost NPU
-pip install onnxruntime-directml    # any DirectML device on Windows
 pip install onnxruntime-qnn         # Qualcomm Hexagon NPU
 ```
+
+**CUDA libraries from pip wheels.** `onnxruntime-gpu[cuda,cudnn]` installs
+`libcublas`, `libcudnn` and friends under `site-packages/nvidia/*/lib`, which
+is on no loader search path. ONNX Runtime then lists `CUDAExecutionProvider`,
+fails to `dlopen` its provider library, and falls back to the CPU — which the
+report would show as "the accelerator did not engage". `pcbench.npu` loads
+those libraries itself before importing ONNX Runtime, the same way PyTorch
+does, so no `LD_LIBRARY_PATH` is needed.
 
 The `onnx` package is **not** required — pcbench writes the ONNX protobuf
 itself.

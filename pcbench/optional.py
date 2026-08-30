@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 from typing import NamedTuple
 
 
@@ -89,6 +90,15 @@ TIERS: dict[str, dict] = {
                     "Embedded analytical SQL over the same data", 40),
         ],
     },
+    "ai": {
+        "summary": "Cross-vendor NPU and GPU inference through ONNX Runtime",
+        "packages": [
+            Package("onnxruntime", "onnxruntime",
+                    "NPU and GPU inference through execution providers — "
+                    "CUDA, ROCm, DirectML, Core ML, OpenVINO, QNN",
+                    40, critical=True),
+        ],
+    },
     "system": {
         "summary": "Better sensors, richer output, and reference ML",
         "packages": [
@@ -109,14 +119,116 @@ TIERS: dict[str, dict] = {
     },
 }
 
-# PyTorch and ONNX Runtime are large and hardware-specific, so they are named
-# separately rather than bundled into a tier the installer offers by default.
+# PyTorch is large enough, and its build matrix hardware-specific enough, that
+# it is named rather than offered: the wheel that reaches a GPU differs by
+# vendor and CUDA version, and picking wrong silently installs a CPU-only build.
 HEAVY = [
     Package("torch", "torch",
-            "Real neural-network training on CUDA / ROCm / MPS / CPU", 800),
-    Package("onnxruntime", "onnxruntime",
-            "Cross-vendor NPU benchmarking via execution providers", 40),
+            "Dense GEMM in TFLOPS on CUDA / ROCm / MPS — the AI-compute "
+            "figure in the GPU section", 800),
 ]
+
+
+# --------------------------------------------------------------------------- #
+# Distributions that depend on the hardware
+# --------------------------------------------------------------------------- #
+def _gpu_vendors() -> set[str]:
+    """Lower-cased vendor names of the GPUs in this machine.
+
+    Imported lazily: this module is imported by everything, and GPU detection
+    shells out on some platforms.
+    """
+    try:
+        from . import accel
+        return {(gpu.get("vendor") or "").lower()
+                for gpu in accel.detect_gpus()}
+    except Exception:
+        return set()
+
+
+def onnxruntime_distribution() -> str:
+    """Which ONNX Runtime wheel actually reaches this machine's accelerators.
+
+    One import name, several distributions, and the difference is the whole
+    point of the tier. The plain ``onnxruntime`` wheel on PyPI carries only
+    ``CPUExecutionProvider`` on Windows and Linux, so installing it on a
+    machine with a discrete GPU produces an NPU section that runs, engages
+    nothing, and reports the CPU. macOS is the exception: Core ML is in the
+    default wheel.
+
+    The CUDA build additionally needs a CUDA runtime and cuDNN, which come as
+    extras — without them ONNX Runtime advertises the provider and then fails
+    to load it, which reads as "the accelerator did not engage".
+    """
+    import platform as _platform
+    system = _platform.system()
+    if system == "Darwin":
+        return "onnxruntime"
+    vendors = _gpu_vendors()
+    if "nvidia" in vendors:
+        return "onnxruntime-gpu[cuda,cudnn]"
+    if "amd" in vendors and system == "Linux":
+        return "onnxruntime-gpu"              # ROCm execution provider
+    if system == "Windows":
+        return "onnxruntime-directml"         # reaches any DX12 GPU or NPU
+    return "onnxruntime"
+
+
+def pip_target(pkg: Package) -> str:
+    """The distribution to install for ``pkg`` on this machine."""
+    if pkg.import_name == "onnxruntime":
+        return onnxruntime_distribution()
+    return pkg.pip_name
+
+
+# --------------------------------------------------------------------------- #
+# OpenCL, which pip cannot install
+# --------------------------------------------------------------------------- #
+# `pyopencl` is only the Python binding. The driver it talks to is the vendor's
+# *ICD*, a system package, and a machine can have a working GPU, a working
+# driver and pyopencl installed and still enumerate nothing —
+# `PLATFORM_NOT_FOUND_KHR`, which reads like a hardware fault. Only Linux
+# normally needs anything: Windows ships the ICD with the display driver and
+# macOS ships it with the OS.
+_ICD_PACKAGES = {
+    "pacman": {"nvidia": "opencl-nvidia", "amd": "rocm-opencl-runtime",
+               "intel": "intel-compute-runtime", None: "ocl-icd"},
+    "apt": {"nvidia": "nvidia-opencl-icd", "amd": "mesa-opencl-icd",
+            "intel": "intel-opencl-icd", None: "ocl-icd-libopencl1"},
+    "dnf": {"nvidia": "xorg-x11-drv-nvidia-cuda",
+            "amd": "mesa-libOpenCL", "intel": "intel-compute-runtime",
+            None: "ocl-icd"},
+    "zypper": {"nvidia": "nvidia-computeG06", "amd": "Mesa-libOpenCL",
+               "intel": "intel-opencl", None: "ocl-icd-devel"},
+}
+
+_PACKAGE_MANAGERS = (("pacman", "/usr/bin/pacman", "sudo pacman -S"),
+                     ("apt", "/usr/bin/apt", "sudo apt install"),
+                     ("dnf", "/usr/bin/dnf", "sudo dnf install"),
+                     ("zypper", "/usr/bin/zypper", "sudo zypper install"))
+
+
+def opencl_icd_hint() -> str | None:
+    """The command that registers an OpenCL driver here, if one is needed.
+
+    Returns None on platforms where the ICD arrives with the driver or the OS,
+    and where no package manager is recognised — a wrong command is worse than
+    no command.
+    """
+    import platform as _platform
+    if _platform.system() != "Linux":
+        return None
+    for name, probe, command in _PACKAGE_MANAGERS:
+        if not os.path.exists(probe):
+            continue
+        table = _ICD_PACKAGES[name]
+        vendors = _gpu_vendors()
+        wanted = [table[key] for key in ("nvidia", "amd", "intel")
+                  if key in vendors and table.get(key)]
+        if not wanted:
+            wanted = [table[None]]
+        return f"{command} {' '.join(dict.fromkeys(wanted))}"
+    return None
 
 
 def _importable(module: str) -> bool:

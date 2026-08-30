@@ -828,7 +828,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.23 > Main menu
+  pcbench 11.24 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -1575,8 +1575,17 @@ model measures whichever accelerator a machine has — OpenVINO (Intel), Vitis A
 (AMD), QNN (Qualcomm), DirectML, CUDA, ROCm, or Core ML:
 
 ```bash
-pip install onnxruntime      # or onnxruntime-openvino / -directml / -qnn
+python3 install.py --tier ai   # picks the build that reaches this hardware
 ```
+
+The build matters more than the package name here. The plain `onnxruntime`
+wheel on PyPI carries only `CPUExecutionProvider` on Windows and Linux, so
+installing it on a machine with a discrete GPU gives a section that runs,
+engages nothing, and reports the CPU. `install.py` inspects the hardware and
+installs `onnxruntime-gpu[cuda,cudnn]` on NVIDIA, `onnxruntime-gpu` for ROCm,
+`onnxruntime-directml` on Windows, or the plain wheel on macOS where Core ML
+is already in it. For an Intel NPU or a Qualcomm Hexagon, add
+`onnxruntime-openvino` or `onnxruntime-qnn` by hand.
 
 ```
 NPU — cross-vendor (ONNX Runtime)
@@ -1648,10 +1657,33 @@ python3 install.py --tier gpu     # pyopencl: shader GFLOPS + bandwidth, all ven
 pip install torch                 # matmul TFLOPS; CUDA, ROCm, Intel XPU, or MPS
 ```
 
+On Windows the PyPI `torch` wheel is CPU-only, so the matmul is skipped exactly
+as if torch were absent — name the CUDA index (`--index-url
+https://download.pytorch.org/whl/cu130`) to get a build that reaches the GPU.
+On Linux CUDA is bundled and on macOS MPS is built in.
+
 Either backend works alone. With only PyTorch you still get the matmul figures
 on a CUDA/ROCm/XPU device; with only OpenCL you get shader throughput on
 everything. `pynvml` (in the same tier) adds NVIDIA temperature, power draw,
 VRAM and utilisation.
+
+**`pyopencl` is only the Python binding.** The driver it talks to is the
+vendor's *ICD*, a system package, and pip cannot install one. A machine can
+have a working GPU, a current driver and `pyopencl` installed and still
+enumerate nothing — `PLATFORM_NOT_FOUND_KHR`, which reads like a hardware
+fault and is not one. `install.py` checks afterwards and names the package for
+your distribution:
+
+```
+OpenCL: pyopencl is installed but no driver is registered, so GPU
+        shader throughput cannot be measured. That is a system
+        package, not a pip one.
+
+            sudo pacman -S opencl-nvidia
+```
+
+Windows ships the ICD with the display driver and macOS ships it with the OS,
+so neither normally needs anything.
 
 ## GPU and Neural Engine
 
