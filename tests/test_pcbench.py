@@ -4714,6 +4714,198 @@ class TestCheckupChecks(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestCheckupPlatformParsers(unittest.TestCase):
+    """Every platform's parser against real output from that platform.
+
+    Only one of the three can be exercised on any given machine, so the other
+    two would otherwise ship untested. These fixtures are the actual shapes
+    each source emits.
+    """
+
+    LINUX_MEMINFO = """MemTotal:       16386412 kB
+MemFree:          312560 kB
+MemAvailable:    4881232 kB
+Buffers:          185464 kB
+SwapTotal:       4194300 kB
+SwapFree:        3145724 kB
+HugePages_Total:       0
+Hugepagesize:       2048 kB
+"""
+
+    MACOS_VM_STAT = """Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                               25000.
+Pages active:                            300000.
+Pages inactive:                          180000.
+Pages wired down:                        200000.
+Pages occupied by compressor:            120000.
+Pageins:                               12345678.
+"""
+
+    def test_linux_meminfo(self):
+        fields = checkup.parse_meminfo(self.LINUX_MEMINFO)
+        self.assertEqual(fields["MemTotal"], 16386412 * 1024)
+        self.assertEqual(fields["MemAvailable"], 4881232 * 1024)
+        # A value with no unit is a count, not kilobytes.
+        self.assertEqual(fields["HugePages_Total"], 0)
+
+        result = checkup._memory_result(
+            fields["MemTotal"], fields["MemAvailable"],
+            fields["SwapTotal"], fields["SwapTotal"] - fields["SwapFree"])
+        self.assertAlmostEqual(result["available_percent"], 29.8, places=0)
+        self.assertAlmostEqual(result["swap_used_percent"], 25.0, places=0)
+
+    def test_linux_proc_stat_with_awkward_process_names(self):
+        # comm is parenthesised and may contain spaces and parentheses.
+        # Splitting on whitespace misaligns every field after it.
+        cases = [
+            ("42 (bash) S 1 42 42 0 -1 4194304 900 0 0 0 120 34 0 0 20 0 1 "
+             "0 900 0 0", (154, "bash")),
+            ("77 (Web Content) S 1 77 0 0 -1 0 5 0 0 0 8250 1400 0 0 20 0 5 "
+             "0 5 0 0", (9650, "Web Content")),
+            ("88 (a (b) c) R 1 88 0 0 -1 0 1 0 0 0 10 5 0 0 20 0 1 0 1 0 0",
+             (15, "a (b) c")),
+        ]
+        for data, expected in cases:
+            self.assertEqual(checkup.parse_proc_stat(data), expected)
+
+    def test_linux_proc_stat_rejects_garbage(self):
+        for bad in ("", "no parens here", "1 (short) S 1 2 3"):
+            self.assertIsNone(checkup.parse_proc_stat(bad))
+
+    def test_macos_vm_stat(self):
+        counts, page = checkup.parse_vm_stat(self.MACOS_VM_STAT)
+        self.assertEqual(page, 16384, "page size must come from the header")
+        self.assertEqual(counts["Pages free"], 25000)
+        self.assertEqual(counts["Pages occupied by compressor"], 120000)
+
+    def test_macos_vm_stat_rejects_garbage(self):
+        counts, page = checkup.parse_vm_stat("not vm_stat output")
+        self.assertEqual(counts, {})
+        self.assertEqual(page, 4096, "a sane default when unstated")
+
+    def test_macos_swapusage(self):
+        line = ("total = 2048.00M  used = 512.25M  free = 1535.75M  "
+                "(encrypted)")
+        total, used = checkup.parse_swapusage(line)
+        self.assertEqual(total, 2048 * 1024 * 1024)
+        self.assertEqual(used, int(512.25 * 1024 * 1024))
+        self.assertEqual(checkup.parse_swapusage(""), (0, 0))
+
+    def test_windows_process_list(self):
+        out = ("chrome|97|4412\r\n"
+               "MsMpEng|41|2201\r\n"
+               "svchost|0|900\r\n")
+        result = checkup._parse_windows_processes(out, 5)
+        self.assertEqual(result["processes"][0]["name"], "chrome")
+        self.assertEqual(result["processes"][0]["cpu_percent"], 97.0)
+        self.assertEqual(result["processes"][0]["pid"], 4412)
+        self.assertEqual(result["counted"], 3)
+
+    def test_windows_process_list_survives_junk(self):
+        self.assertIn("error",
+                      checkup._parse_windows_processes("", 5))
+        self.assertIn("error",
+                      checkup._parse_windows_processes("garbage\nlines", 5))
+        # One malformed row must not lose the good ones.
+        mixed = checkup._parse_windows_processes("good|5|1\nbad|row\n", 5)
+        self.assertEqual(len(mixed["processes"]), 1)
+
+    def test_every_platform_branch_is_reachable(self):
+        # Guard against a branch being deleted or renamed: each helper the
+        # dispatchers name must exist.
+        for name in ("_memory_linux", "_memory_macos", "_memory_windows",
+                     "_top_processes_linux", "_top_processes_windows",
+                     "parse_proc_stat", "parse_meminfo", "parse_vm_stat",
+                     "parse_swapusage"):
+            self.assertTrue(callable(getattr(checkup, name, None)),
+                            f"{name} is missing")
+
+    def test_gathering_works_on_this_platform_whatever_it_is(self):
+        # The one end-to-end assertion that can be made anywhere: every
+        # source returns a dict, and none of them raise.
+        evidence = checkup.gather(".")
+        for key in ("system", "state", "processes", "memory", "disks",
+                    "power_mode", "provenance", "drives", "accelerators"):
+            self.assertIn(key, evidence)
+            self.assertIsInstance(evidence[key], dict)
+        self.assertEqual(checkup.analyse(evidence), checkup.analyse(evidence),
+                         "analysis must be deterministic for one snapshot")
+
+
+# --------------------------------------------------------------------------- #
+class TestCheckupCoverage(unittest.TestCase):
+    """Every subsystem a user would name has a check that can fire."""
+
+    def test_all_areas_are_covered(self):
+        areas = {
+            "thermal": {"state": {"thermal": "throttled", "cpu_celsius": 99}},
+            "power": {"state": {"on_ac_power": False}, "power_mode": {}},
+            "cpu": {"provenance": {"smt": {"available": True,
+                                           "supported": True,
+                                           "enabled": False}},
+                    "system": {}, "confinement": {}},
+            "gpu": {"accelerators": {"nvidia": [
+                {"index": 0, "name": "RTX 4090", "celsius": 89.0}]}},
+            "contention": {"state": {"load_per_core": 1.5}, "processes": {}},
+            "memory": {"memory": {"total_bytes": 8 * 1024**3,
+                                  "available_bytes": 10**8,
+                                  "available_percent": 3.0,
+                                  "swap_used_percent": 80.0}},
+            "storage": {"disks": {"volumes": [
+                {"mount": "/", "total_bytes": 10**12, "free_bytes": 10**10,
+                 "free_percent": 1.0}]}, "drives": {}},
+        }
+        for area, evidence in areas.items():
+            found = checkup.analyse(evidence)
+            self.assertTrue(any(f["area"] == area for f in found),
+                            f"nothing fires for {area}: {found}")
+
+    def test_gpu_vram_exhaustion_is_detected(self):
+        found = checkup._check_gpu({"accelerators": {"nvidia": [
+            {"index": 0, "name": "RTX 3080", "vram_total_mb": 10000,
+             "vram_used_mb": 9800}]}})
+        self.assertTrue(any("VRAM" in f["title"] for f in found))
+
+    def test_a_cool_gpu_with_free_vram_is_not_flagged(self):
+        self.assertEqual(checkup._check_gpu({"accelerators": {"nvidia": [
+            {"index": 0, "name": "RTX 3080", "celsius": 55.0,
+             "vram_total_mb": 10000, "vram_used_mb": 1200}]}}), [])
+
+    def test_small_ram_is_flagged_but_normal_ram_is_not(self):
+        self.assertTrue(checkup._check_ram_config(
+            {"system": {"ram_total_bytes": 4 * 1024**3}, "confinement": {}}))
+        self.assertEqual(checkup._check_ram_config(
+            {"system": {"ram_total_bytes": 32 * 1024**3},
+             "confinement": {}}), [])
+
+    def test_regression_only_compares_size_independent_metrics(self):
+        # The probe uses a 64 MB disk file against the 256 MB a real run
+        # uses. Comparing those reported a 74% disk regression on a healthy
+        # machine, so only time-boxed rates are compared.
+        columns = {column for _, column, _ in checkup._HISTORY_METRICS}
+        self.assertNotIn("disk_read_mb_s", columns)
+        self.assertNotIn("mem_mb_s", columns)
+        self.assertIn("cpu_int_primes_s", columns)
+
+    def test_regression_fires_only_on_a_real_drop(self):
+        history = [{"cpu_int_primes_s": "4000000",
+                    "timestamp_utc": "2026-01-01T00:00:00Z"}]
+        same = checkup._check_regression(
+            {"probe": {"cpu_int": {"rate": 3_950_000.0}},
+             "history": history})
+        self.assertEqual(same, [])
+        slower = checkup._check_regression(
+            {"probe": {"cpu_int": {"rate": 2_000_000.0}},
+             "history": history})
+        self.assertEqual(len(slower), 1)
+        self.assertIn("50% slower", slower[0]["title"])
+
+    def test_regression_is_silent_without_history(self):
+        self.assertEqual(checkup._check_regression(
+            {"probe": {"cpu_int": {"rate": 1.0}}, "history": []}), [])
+
+
+# --------------------------------------------------------------------------- #
 class TestCheckupReport(unittest.TestCase):
     def _result(self, findings, measured=True):
         return {"findings": findings, "evidence": {}, "measured": measured,
@@ -4983,7 +5175,7 @@ class TestDriveSpeedReport(unittest.TestCase):
 
 # --------------------------------------------------------------------------- #
 class TestTuiKeys(unittest.TestCase):
-    """Escape-sequence decoding: the subtlest part, and invisible when wrong."""
+    """Escape-sequence decoding: subtle, and invisible when wrong."""
 
     def _feed(self, data):
         """Hand _read_posix these characters as if the terminal sent them."""
@@ -5225,32 +5417,36 @@ class TestWizardByKeys(unittest.TestCase):
 
     def test_quick_benchmark_by_arrow_keys(self):
         # benchmark > quick pass > no extras > no output > run
-        argv, _ = self._drive([_menu_number("Run a benchmark"), "ENTER",   # benchmark
-                               "ENTER",              # quick pass
-                               "ENTER", "ENTER",     # no extras, no output
-                               "ENTER"])             # run
+        argv, _ = self._drive(
+            [_menu_number("Run a benchmark"), "ENTER",  # into benchmark
+             "ENTER",                  # quick pass
+             "ENTER", "ENTER",         # no extras, no output
+             "ENTER"])                 # run
         self.assertEqual(argv, ["--quick"])
 
     def test_ticking_an_output_with_space(self):
-        argv, _ = self._drive([_menu_number("Run a benchmark"), "ENTER", "ENTER", "ENTER",
-                               " ", "ENTER",          # tick HTML report
-                               "ENTER"])
+        argv, _ = self._drive(
+            [_menu_number("Run a benchmark"), "ENTER", "ENTER", "ENTER",
+             " ", "ENTER",             # tick the HTML report
+             "ENTER"])
         self.assertEqual(argv, ["--quick", "--html"])
 
     def test_escape_climbs_back_out_of_a_branch(self):
-        argv, output = self._drive([_menu_number("Run a benchmark"), "ENTER", "ESC",   # in, back out
-                                    _menu_number("Read hardware stats"), "ENTER",  # stats
-                                    "ENTER",           # every section, ticked
-                                    "ENTER",           # readable report
-                                    "ENTER"])          # run
+        argv, output = self._drive(
+            [_menu_number("Run a benchmark"), "ENTER", "ESC",  # in, out
+             _menu_number("Read hardware stats"), "ENTER",
+             "ENTER",                  # every section, already ticked
+             "ENTER",                  # readable report
+             "ENTER"])                 # run
         self.assertEqual(argv, ["--stats"])
         self.assertIn("Main menu", output)
 
     def test_sections_start_ticked_where_all_is_the_sensible_answer(self):
         # The stats screen defaults to every section, so untick one rather
         # than tick eleven.
-        argv, _ = self._drive([_menu_number("Read hardware stats"), "ENTER", " ", "ENTER", "ENTER",
-                               "ENTER"])
+        argv, _ = self._drive(
+            [_menu_number("Read hardware stats"), "ENTER",
+             " ", "ENTER", "ENTER", "ENTER"])
         self.assertEqual(argv[0], "--stats")
         self.assertNotIn("cpu", argv[1].split(","))
 

@@ -23,6 +23,13 @@ Everything degrades with a stated reason; nothing fails silently.
 | NUMA topology | n/a (unified) | yes | socket count | — |
 | NUMA bandwidth matrix | n/a | needs `numactl` | **no** | `numactl` is Linux-only |
 | Soak, monitor, gates, exports, A/B | yes | yes | yes | — |
+| **Checkup** (`--checkup`) | yes | yes | yes | PowerShell for processes, memory and uptime |
+| ↳ running processes | `ps` | `/proc` sampled twice | `Win32_PerfFormattedData` | — |
+| ↳ memory & swap pressure | `vm_stat` + `sysctl` | `/proc/meminfo` | `Win32_OperatingSystem` | — |
+| ↳ uptime | `sysctl kern.boottime` | `/proc/uptime` | `LastBootUpTime` | — |
+| ↳ power profile | `pmset` | cpufreq governor | `powercfg` | — |
+| ↳ disk headroom, drive health | yes | yes | partial | inherits the drive-lifetime limits above |
+| ↳ GPU temperature / VRAM | no | needs pynvml | needs pynvml | NVIDIA only; `pip install nvidia-ml-py` |
 
 ### Windows compiler selection
 
@@ -345,6 +352,11 @@ Python 3.11+; JSON works everywhere. Precedence is command line > `PCBENCH_*`
 environment > config file > defaults.
 
 ### Diagnosis
+
+Covers CPU, GPU, storage, memory, thermal, power, contention and
+configuration. Where a source is unavailable on the platform the finding is
+absent rather than wrong — see the [support matrix](#platform-support-matrix)
+above for what each OS supplies.
 
 | Flag | Description |
 |------|-------------|

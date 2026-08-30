@@ -723,11 +723,19 @@ pcbench --checkup            # about 15 seconds
 pcbench --checkup --no-measure   # instant; reads state only, no load
 ```
 
-It gathers evidence rather than scores: thermal state, power profile, what is
-using the CPU right now, memory and swap pressure, disk headroom, SMART
-health, uptime, container limits — then measures briefly and holds load for
-eight seconds to catch throttling. Findings are ranked by how much each is
-likely costing:
+It gathers evidence rather than scores, across every subsystem:
+
+| Area | What it checks |
+|------|----------------|
+| **CPU** | Thermal throttling, boost disabled, power governor, SMT turned off, mitigation load, restricted affinity, load per core |
+| **GPU** | Temperature against the point cards clock down, VRAM exhaustion, a discrete GPU that cannot be verified as the one in use |
+| **Storage** | Volume headroom, SMART health and wear, sequential and random floors |
+| **Memory** | Available RAM, swap pressure, total RAM, cgroup caps |
+| **Software** | What is using the CPU *right now*, by name; uptime; virtualization and container limits |
+| **History** | Whether this machine is measurably slower than its own past runs |
+
+Then it measures briefly and holds load for eight seconds to catch
+throttling. Findings are ranked by how much each is likely costing:
 
 ```
   The most likely cause is: the cpu is being thermally throttled right
@@ -772,11 +780,26 @@ on:
   Under load : throughput fell 0% over 8s
 ```
 
+The last row is the strongest signal there is. "It used to be fast" is the
+actual complaint most of the time, and a single snapshot cannot answer it —
+but where this tool has run before, comparing against the same machine's own
+record controls for the hardware entirely.
+
 Two rules keep it honest. **An observation is not a verdict** — a spinning
 disk is a specification, not a fault; long uptime is worth knowing, not a
 problem. Findings say which they are, and severity reflects confidence as
-much as impact. And **a check that could not run says so**, because a clean
-report that quietly skipped half its checks is worse than no report.
+much as impact. There is deliberately no CPU floor: a slow CPU with no
+history is almost always just an old CPU. And **a check that could not run
+says so**, because a clean report that quietly skipped half its checks is
+worse than no report.
+
+**All three platforms**, with the per-OS source for each check listed in the
+[support matrix](docs/packages.md#platform-support-matrix). Processes come
+from `ps` on macOS, `/proc` sampled twice on Linux — `ps` there reports CPU
+averaged over a process's whole life, which is the wrong number for "what is
+using it now" — and performance counters on Windows. GPU temperature and
+VRAM need `nvidia-ml-py` and are NVIDIA-only; everything else is
+standard-library.
 
 Exit code is 1 when something is actively hurting performance and 0
 otherwise, so a fleet check can gate on it.
@@ -805,7 +828,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.21 > Main menu
+  pcbench 11.22 > Main menu
 ====================================================================================
 
   What would you like to do?

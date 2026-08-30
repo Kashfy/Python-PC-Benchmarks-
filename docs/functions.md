@@ -658,6 +658,41 @@ does that — but to catch the two faults that only appear under load: a
 subsystem below any reasonable floor, and throughput that collapses as the
 machine heats up.
 
+#### Checks
+`_check_thermal` (throttling, strain, temperature) · `_check_power` (battery,
+power profile, boost disabled) · `_check_cpu` (SMT off, mitigation load,
+restricted affinity) · `_check_gpu` (NVIDIA temperature, VRAM exhaustion,
+untestable multi-GPU) · `_check_contention` (load per core, named processes) ·
+`_check_memory` (available, swap) · `_check_ram_config` (total RAM, cgroup
+cap) · `_check_storage` (volume headroom, SMART) · `_check_configuration`
+(uptime, CPU quota, virtualization) · `_check_measured` (subsystem floors,
+sustained droop) · `_check_regression` (slower than this machine's own
+history).
+
+There is deliberately no CPU *floor*. A slow CPU with no history is almost
+always an old CPU, and calling a specification a fault is the mistake the
+reference floors were rewritten to avoid.
+
+#### `history_rows(output_dir="results") -> list[dict]`
+Past runs for this hostname, oldest first. `_check_regression` compares the
+probe against them — the strongest signal available that a machine actually
+*got* slower, because it controls for the hardware entirely. Only
+`cpu_int` is compared: the probe's disk and memory sizes differ from a full
+run's, and comparing those reported a 74% disk regression on a healthy
+machine.
+
+#### Platform parsers
+`parse_proc_stat` (Linux `/proc/PID/stat` — the comm field is parenthesised
+and may contain spaces and parentheses, so the split starts after the last
+`)`) · `parse_meminfo` · `parse_vm_stat` · `parse_swapusage` ·
+`_parse_windows_processes`. Each is separated from its I/O so all three
+platforms are testable from any one of them.
+
+On Linux, processes are sampled from `/proc` twice rather than read from
+`ps`, because `ps` reports %CPU averaged over the whole life of a process —
+something that saturated a core for an hour and then went idle still reads
+high, which is the wrong answer for "what is using the CPU right now".
+
 #### `analyse(evidence) -> list[dict]`
 Every finding the evidence supports, most serious first. A check that raises
 becomes an "unexamined area" finding rather than taking the report down with
