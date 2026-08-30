@@ -17,6 +17,7 @@ from . import config as config_mod
 from . import container as container_mod
 from . import cores as cores_mod
 from . import diagnose
+from . import checkup as checkup_mod
 from . import counters as counters_mod
 from . import datascience as ds_mod
 from . import drivelife
@@ -289,6 +290,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "benchmark, a stats section, a monitor or a "
                         "comparison one screen at a time, then confirm the "
                         "command it builds")
+
+    g = p.add_argument_group("diagnosis")
+    g.add_argument("--checkup", action="store_true",
+                   help="Diagnose why this machine is slow: thermal, power, "
+                        "contention, memory, disk headroom, drive health and "
+                        "a short measurement, ranked by likely impact")
+    g.add_argument("--no-measure", action="store_true",
+                   help="With --checkup, read settings and live state only; "
+                        "skip the short benchmark and the throttling check")
 
     g = p.add_argument_group("analysis depth")
     g.add_argument("--counters", action="store_true",
@@ -642,6 +652,27 @@ def main(argv=None) -> int:
             print(f"  candidate: {args.compare_runs[1]}\n")
             print(stats_mod.render_payload_comparison(verdict))
         return 6 if verdict["regressions"] else 0
+
+    # Diagnosis is its own job: the question is not "how fast is this"
+    # but "what is holding it back", and the evidence for that is mostly
+    # not a benchmark result.
+    if args.checkup:
+        if not args.json_stdout:
+            report_mod.hr("Checkup — what is holding this machine back")
+            if not args.no_measure:
+                print("  reading system state, then measuring briefly ...\n")
+        result = checkup_mod.run(_repo_root(), measure=not args.no_measure,
+                                 disk_dir=None if args.no_save
+                                 else args.output_dir)
+        if args.json_stdout:
+            print(json.dumps({"tool": "pcbench", "mode": "checkup",
+                              "version": __version__, "checkup": result},
+                             indent=2, default=str))
+        else:
+            print(checkup_mod.render(result))
+        # A caller can gate on this: 1 for something actively hurting, 0 for
+        # a clean bill or advisory findings only.
+        return 1 if result["counts"].get("critical") else 0
 
     # A drive-speed check is the whole job: it answers "how fast is this
     # disk?" without the twenty other tests that surround the same numbers

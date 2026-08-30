@@ -634,6 +634,48 @@ the assessment. For a support ticket or a listing.
 
 ---
 
+## `pcbench.checkup` — diagnosis
+
+Answers "why is this slower than it should be?", which is a different job from
+scoring. Gathers evidence, then ranks findings by likely impact.
+
+#### `gather(script_dir=".") -> dict`
+Every cheap source of evidence: inventory, machine state, processes, memory,
+disks, power mode, provenance, drive health, uptime, confinement. A source
+that fails is recorded as an error rather than omitted, so a check can report
+its area as unexamined instead of clean.
+
+#### `top_processes(limit=6) -> dict` · `memory_pressure()` · `uptime_seconds()` · `disk_headroom()` · `power_mode()`
+The evidence the rest of the tool did not already collect. `top_processes`
+sorts in Python because the sort flag differs between BSD and GNU `ps` while
+the output does not. `disk_headroom` skips pseudo-filesystems, which report
+themselves permanently full, and deduplicates volumes sharing one pool (APFS,
+Btrfs) so a shared free-space figure is reported once.
+
+#### `probe(seconds=1.0, droop_seconds=8.0) -> dict`
+A deliberately small measurement. Not to score the machine — the benchmark
+does that — but to catch the two faults that only appear under load: a
+subsystem below any reasonable floor, and throughput that collapses as the
+machine heats up.
+
+#### `analyse(evidence) -> list[dict]`
+Every finding the evidence supports, most serious first. A check that raises
+becomes an "unexamined area" finding rather than taking the report down with
+it. Each finding carries `severity`, `area`, `title`, `evidence`, `impact` and
+`fix`.
+
+#### `verdict(result) -> str` · `render(result) -> str`
+One sentence naming the most likely cause, then each finding with its
+evidence and remedy, then the numbers it was all based on — shown whether or
+not anything fired.
+
+**Severity** — `critical` means measurably hurting now; `warning` means a
+common cause is present; `info` is context that shapes the other findings.
+Info-only is still a clean bill: long uptime and a spinning disk are facts,
+not explanations.
+
+---
+
 ## `pcbench.health` — RAM integrity and drive SMART
 
 #### `memory_integrity(size_mb, ram_bytes) -> dict`

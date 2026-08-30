@@ -1,4 +1,4 @@
 """pcbench — cross-platform PC benchmark & diagnostics toolkit."""
 
-__version__ = "11.20"
+__version__ = "11.21"
 __all__ = ["__version__"]

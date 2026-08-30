@@ -21,6 +21,7 @@ JSON/CSV/HTML so you can compare machines over time.
 ## Contents
 
 **Start here**
+[Why is this machine slow?](#why-is-this-machine-slow) ·
 [Is it safe for my hardware?](#is-it-safe-for-my-hardware) ·
 [Choosing what to run](#choosing-what-to-run) ·
 [Hardware stats — no benchmark required](#hardware-stats--no-benchmark-required) ·
@@ -712,6 +713,74 @@ alone is not actionable:
 `--json-stdout` works here too, so any section can feed a script or a
 monitoring check without parsing terminal output.
 
+## Why is this machine slow?
+
+A benchmark says how fast a machine is. It does not say why it is slower than
+it should be, and that is the question people actually arrive with:
+
+```bash
+pcbench --checkup            # about 15 seconds
+pcbench --checkup --no-measure   # instant; reads state only, no load
+```
+
+It gathers evidence rather than scores: thermal state, power profile, what is
+using the CPU right now, memory and swap pressure, disk headroom, SMART
+health, uptime, container limits — then measures briefly and holds load for
+eight seconds to catch throttling. Findings are ranked by how much each is
+likely costing:
+
+```
+  The most likely cause is: the cpu is being thermally throttled right
+  now. 4 other finding(s) may be contributing.
+
+  6 finding(s): 2 critical, 3 warning, 1 info
+
+  [ 1] CRITICAL The CPU is being thermally throttled right now
+       evidence : thermal pressure reports 'throttled', CPU at 99 °C
+       impact   : Clock speed is being cut to keep the chip within its limit,
+                  so everything is slower — often by a third or more.
+       fix      : Check that vents and fans are clear and the machine is on a
+                  hard surface. On a laptop, a dust-blocked fan or dried
+                  thermal paste is the usual cause.
+
+  [ 2] CRITICAL / is 98% full (8.0 GB free)
+       evidence : 8.0 GB of 500 GB free (1.6%)
+       impact   : A nearly-full filesystem has to work harder to find
+                  contiguous space for every write, and on an SSD it loses the
+                  spare area the controller uses to spread wear.
+       fix      : Free space until at least 15% is available.
+```
+
+Every finding carries **what was measured, why it matters, and what to do** —
+because "your disk is slow" is not actionable and "your boot volume has 2 GB
+free, so the filesystem can't find contiguous space to write into" is.
+
+When nothing is wrong it says so, and still shows the numbers it based that
+on:
+
+```
+  Nothing found that would explain a slowdown: no throttling, no
+  contention, memory and disk headroom are fine, and the short
+  measurement came out where it should.
+
+  ── what this was based on ─────────────────────────────────────────────
+  State      : 52 °C, nominal, on AC, load 0.19/core
+  Memory     : 4.0 GB of 15 GB available (26%), swap 13% used
+  Disk       : / — 22.9 GB free of 228 GB (10%)
+  Uptime     : 1d 16h
+  Busiest    : WindowServer 16%, fileproviderd 11%, Safari 8%
+  Under load : throughput fell 0% over 8s
+```
+
+Two rules keep it honest. **An observation is not a verdict** — a spinning
+disk is a specification, not a fault; long uptime is worth knowing, not a
+problem. Findings say which they are, and severity reflects confidence as
+much as impact. And **a check that could not run says so**, because a clean
+report that quietly skipped half its checks is worse than no report.
+
+Exit code is 1 when something is actively hurting performance and 0
+otherwise, so a fleet check can gate on it.
+
 ## Choosing what to run
 
 Twenty-two tests, thirteen profiles and twelve stats sections is a lot to read
@@ -736,7 +805,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.20 > Main menu
+  pcbench 11.21 > Main menu
 ====================================================================================
 
   What would you like to do?
@@ -1297,6 +1366,13 @@ exactly the false precision worth avoiding.
 | `--force` | off | Run despite distorting machine state |
 | `--no-autoscale` | off | Do not shrink test sizes on small or CPU-limited machines |
 | `--list-tests` | — | List every test and profile, then exit |
+
+**Diagnosis**
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--checkup` | off | [Diagnose what is holding the machine back](#why-is-this-machine-slow), ranked by likely impact. Exits 1 on a critical finding |
+| `--no-measure` | off | With `--checkup`, read state only — no benchmark, no load |
 
 **Hardware stats & guided setup**
 

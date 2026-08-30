@@ -18,6 +18,7 @@ project [README](../README.md) for a quick start, then dive in here.
 
 - **How do I pick what to run without reading every flag?** → [README: choosing what to run](../README.md#choosing-what-to-run) (`pcbench --menu`)
 - **The menu ignores my arrow keys** → [troubleshooting: --menu](troubleshooting.md#--menu-does-not-respond-to-the-arrow-keys)
+- **My PC is slow — why?** → `pcbench --checkup`, in the [README](../README.md#why-is-this-machine-slow)
 - **How fast is my SSD / my internet?** → `--drive-speed` and `--internet`, in the [README](../README.md#drive-readwrite-speed)
 - **Why did it refuse to run?** → [troubleshooting: guard rails](troubleshooting.md#system-already-busy--running-on-battery--the-run-stops)
 - **What does "VALIDATION FAILED" mean?** → [troubleshooting: validation](troubleshooting.md#validation-failed-exit-code-4)

@@ -47,6 +47,7 @@ Python-PC-Benchmarks-/
 │   ├── health.py       # RAM integrity, drive SMART (read-only)
 │   ├── drivelife.py    # SSD wear: TBW, power-on hours, endurance left
 │   ├── diagnose.py     # bottleneck analysis, spec sheet
+│   ├── checkup.py      # diagnosis: why is this machine slow
 │   ├── hwinfo.py       # hardware stats on demand, no benchmarking
 │   ├── plugins.py      # discover and run user benchmarks
 │   ├── sustained.py    # thermal / sustained-load mode
@@ -228,6 +229,8 @@ parse_args()
    ├─ --list-stats / --stats? → hwinfo.collect(), render, exit 0 (no load)
    ├─ --menu?     → wizard.run() over tui widgets, then main(chosen argv);
    │                 the menu itself starts nothing
+   ├─ --checkup?     → evidence + short probe → ranked findings,
+   │                   exit 1 if any is critical
    ├─ --drive-speed? → per-drive read/write/IOPS table, exit 0
    ├─ --internet?    → download/upload/latency to a public endpoint, exit 0
    │                   (the only mode that sends traffic off-box by default)

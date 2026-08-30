@@ -707,6 +707,7 @@ def _history() -> list[str]:
 #: (label, argv). Every entry is a real command line, shown before it runs,
 #: so the list teaches the flags rather than hiding them.
 SHORTCUTS: list[tuple[str, list[str]]] = [
+    ("Why is this machine slow? (checkup)", ["--checkup"]),
     ("Quick benchmark (about a minute)", ["--quick"]),
     ("Full benchmark (default set)", []),
     ("CPU only", ["--profile", "cpu"]),
@@ -821,7 +822,31 @@ def _network() -> list[str]:
     return _run_steps([_network_kind, _network_host, _network_confirm], {})
 
 
+def _checkup() -> list[str]:
+    index = _choose(["Checkup"], "How thorough should the checkup be?", [
+        ("Full — read the system, then measure",
+         "About 15 seconds; catches throttling and a slow subsystem too"),
+        ("Settings and live state only",
+         "Instant; no load is put on the machine"),
+    ], body=["  Looks for what is holding the machine back: heat, power",
+             "  settings, background load, memory pressure, disk headroom",
+             "  and drive health — ranked by how much each is likely",
+             "  costing you."])
+    argv = ["--checkup"] + (["--no-measure"] if index == 1 else [])
+    plan = ["reads thermal state, power mode, load, memory, disk free space "
+            "and SMART",
+            "names the processes using the most CPU right now"]
+    if index == 0:
+        plan.append("measures briefly and holds load for 8s to catch "
+                    "throttling")
+    plan.append("reports findings ranked by likely impact, with a fix for "
+                "each")
+    _confirm(["Checkup"], argv, plan)
+    return argv
+
+
 _MAIN = [
+    ("Find out why it is slow", "Diagnose what is holding this machine back"),
     ("Run a benchmark", "Measure how fast this machine is"),
     ("Read hardware stats",
      "Battery, SSD endurance, temperatures, GPUs - nothing is loaded"),
@@ -836,8 +861,8 @@ _MAIN = [
 
 
 def _main_menu() -> list[str]:
-    handlers = [_benchmark, _stats, _watch, _health, _network, _history,
-                _shortcuts]
+    handlers = [_checkup, _benchmark, _stats, _watch, _health, _network,
+                _history, _shortcuts]
     while True:
         index = _choose(["Main menu"], "What would you like to do?", _MAIN,
                         note="Every screen goes back, so nothing here "

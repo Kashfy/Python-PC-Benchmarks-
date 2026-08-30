@@ -24,7 +24,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pcbench import (accel, apps, cli, compare, config, container,  # noqa: E402
+from pcbench import (accel, apps, checkup, cli, compare, config,  # noqa: E402
+                     container,
                      core, coreml_model, cores, counters, cryptobench,
                      datascience, diagnose, drivelife, export, gates, gpucompute,
                      health, hwinfo,
@@ -4552,6 +4553,207 @@ class TestHardwareStatsMode(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestCheckupChecks(unittest.TestCase):
+    """Each check against evidence that should and should not trigger it.
+
+    The bar here is false positives, not coverage. A diagnostic that cries
+    wolf on a healthy machine is worse than no diagnostic, because the next
+    real finding gets ignored too.
+    """
+
+    def _severities(self, check, evidence):
+        return [f["severity"] for f in check(evidence)]
+
+    def test_a_healthy_machine_produces_no_findings(self):
+        healthy = {
+            "system": {"cpu_cores_logical": 8, "ram_total_bytes": 16 * 1024**3},
+            "state": {"thermal": "nominal, max 52C", "cpu_celsius": 52.0,
+                      "on_ac_power": True, "load_per_core": 0.2},
+            "processes": {"processes": [
+                {"pid": 1, "name": "idle", "cpu_percent": 3.0,
+                 "mem_percent": 1.0}]},
+            "memory": {"total_bytes": 16 * 1024**3,
+                       "available_bytes": 8 * 1024**3,
+                       "available_percent": 50.0, "swap_total_bytes": 0,
+                       "swap_used_bytes": 0, "swap_used_percent": 0.0},
+            "disks": {"volumes": [{"mount": "/", "kind": "apfs",
+                                   "total_bytes": 500 * 1024**3,
+                                   "free_bytes": 300 * 1024**3,
+                                   "free_percent": 60.0}]},
+            "power_mode": {"low_power_mode": False},
+            "uptime_seconds": 3600.0, "confinement": {}, "drives": {},
+        }
+        self.assertEqual(checkup.analyse(healthy), [])
+
+    def test_a_composed_thermal_string_is_not_read_as_a_fault(self):
+        # The state string is "nominal, max 52C", not "nominal". An earlier
+        # version tested for inequality with "nominal" and called every
+        # healthy machine throttled.
+        for text in ("nominal, max 52C", "nominal", "", "ok"):
+            self.assertEqual(
+                self._severities(checkup._check_thermal,
+                                 {"state": {"thermal": text,
+                                            "cpu_celsius": 55}}), [],
+                f"{text!r} must not read as a fault")
+
+    def test_throttling_and_strain_are_distinguished(self):
+        self.assertEqual(
+            self._severities(checkup._check_thermal,
+                             {"state": {"thermal": "throttled", 
+                                        "cpu_celsius": 99}}), ["critical"])
+        self.assertEqual(
+            self._severities(checkup._check_thermal,
+                             {"state": {"thermal": "serious",
+                                        "cpu_celsius": 88}}), ["warning"])
+        self.assertEqual(
+            self._severities(checkup._check_thermal,
+                             {"state": {"thermal": "nominal",
+                                        "cpu_celsius": 92}}), ["warning"])
+
+    def test_load_severity_tracks_saturation(self):
+        def load(value):
+            return self._severities(checkup._check_contention,
+                                    {"state": {"load_per_core": value},
+                                     "processes": {}})
+        self.assertEqual(load(0.2), [])
+        self.assertEqual(load(0.8), ["warning"])
+        self.assertEqual(load(1.5), ["critical"])
+
+    def test_a_busy_process_is_named_but_a_quiet_one_is_not(self):
+        evidence = {"state": {}, "processes": {"processes": [
+            {"pid": 9, "name": "indexer", "cpu_percent": 95.0,
+             "mem_percent": 2.0},
+            {"pid": 10, "name": "idle", "cpu_percent": 1.0,
+             "mem_percent": 1.0}]}}
+        found = checkup._check_contention(evidence)
+        self.assertEqual(len(found), 1)
+        self.assertIn("indexer", found[0]["title"])
+
+    def test_disk_headroom_thresholds(self):
+        def volume(percent):
+            return checkup._check_storage({"disks": {"volumes": [
+                {"mount": "/", "total_bytes": 500 * 1024**3,
+                 "free_bytes": int(500 * 1024**3 * percent / 100),
+                 "free_percent": percent}]}, "drives": {}})
+        self.assertEqual(volume(40.0), [])
+        self.assertEqual([f["severity"] for f in volume(8.0)], ["warning"])
+        self.assertEqual([f["severity"] for f in volume(2.0)], ["critical"])
+
+    def test_memory_thresholds(self):
+        def memory(percent):
+            return self._severities(checkup._check_memory, {"memory": {
+                "total_bytes": 8 * 1024**3,
+                "available_bytes": int(8 * 1024**3 * percent / 100),
+                "available_percent": percent, "swap_used_percent": 10.0}})
+        self.assertEqual(memory(50.0), [])
+        self.assertEqual(memory(12.0), ["warning"])
+        self.assertEqual(memory(4.0), ["critical"])
+
+    def test_battery_and_power_mode_are_separate_findings(self):
+        found = checkup._check_power({
+            "state": {"on_ac_power": False},
+            "power_mode": {"low_power_mode": True, "source": "pmset"}})
+        self.assertEqual({f["id"] for f in found},
+                         {"on_battery", "low_power_mode"})
+
+    def test_findings_are_ranked_most_serious_first(self):
+        evidence = {
+            "state": {"thermal": "throttled", "cpu_celsius": 99,
+                      "on_ac_power": False},
+            "processes": {}, "memory": {}, "disks": {}, "drives": {},
+            "power_mode": {}, "confinement": {}, "system": {},
+            "uptime_seconds": 100 * 86400,
+        }
+        severities = [f["severity"] for f in checkup.analyse(evidence)]
+        self.assertEqual(severities, sorted(
+            severities, key=lambda s: checkup.SEVERITY_ORDER[s]))
+        self.assertEqual(severities[0], "critical")
+
+    def test_a_check_that_raises_becomes_a_finding_not_a_crash(self):
+        # A diagnostic that dies halfway is worse than one that says which
+        # area it could not examine.
+        def explode(_evidence):
+            raise RuntimeError("boom")
+
+        original = checkup._CHECKS
+        checkup._CHECKS = original + (explode,)
+        try:
+            found = checkup.analyse({"state": {}, "processes": {},
+                                     "memory": {}, "disks": {}, "drives": {},
+                                     "power_mode": {}, "confinement": {},
+                                     "system": {}})
+        finally:
+            checkup._CHECKS = original
+        self.assertTrue(any("could not complete" in f["title"]
+                            for f in found))
+
+    def test_every_finding_carries_evidence_and_a_remedy(self):
+        # A finding without a fix is a complaint.
+        evidence = {
+            "state": {"thermal": "throttled", "cpu_celsius": 99,
+                      "on_ac_power": False, "load_per_core": 2.0},
+            "processes": {"processes": [{"pid": 1, "name": "x",
+                                         "cpu_percent": 90.0,
+                                         "mem_percent": 5.0}]},
+            "memory": {"total_bytes": 8 * 1024**3, "available_bytes": 10**8,
+                       "available_percent": 2.0, "swap_used_percent": 90.0},
+            "disks": {"volumes": [{"mount": "/", "total_bytes": 10**12,
+                                   "free_bytes": 10**10,
+                                   "free_percent": 1.0}]},
+            "drives": {}, "power_mode": {"low_power_mode": True},
+            "confinement": {}, "system": {}, "uptime_seconds": 90 * 86400,
+        }
+        found = checkup.analyse(evidence)
+        self.assertGreater(len(found), 5)
+        for finding in found:
+            for field in ("id", "severity", "area", "title", "evidence",
+                          "impact", "fix"):
+                self.assertTrue(finding.get(field),
+                                f"{finding['id']} has no {field}")
+            self.assertIn(finding["severity"], checkup.SEVERITY_ORDER)
+
+
+# --------------------------------------------------------------------------- #
+class TestCheckupReport(unittest.TestCase):
+    def _result(self, findings, measured=True):
+        return {"findings": findings, "evidence": {}, "measured": measured,
+                "counts": {level: sum(1 for f in findings
+                                      if f["severity"] == level)
+                           for level in ("critical", "warning", "info")}}
+
+    def test_a_clean_report_says_so_plainly(self):
+        text = checkup.render(self._result([]))
+        self.assertIn("Nothing found", text)
+
+    def test_info_only_still_counts_as_clean(self):
+        # Long uptime is context, not an explanation for slowness.
+        info = [checkup._finding("x", "info", "software", "t", "e", "i", "f")]
+        self.assertIn("Nothing found", checkup.verdict(self._result(info)))
+
+    def test_the_verdict_names_the_worst_finding(self):
+        found = [checkup._finding("a", "critical", "thermal",
+                                  "The CPU is throttled", "e", "i", "f"),
+                 checkup._finding("b", "warning", "power", "On battery",
+                                  "e", "i", "f")]
+        line = checkup.verdict(self._result(found))
+        self.assertIn("the cpu is throttled", line)
+        self.assertIn("1 other finding", line)
+
+    def test_skipping_the_measurement_is_stated(self):
+        text = checkup.render(self._result([], measured=False))
+        self.assertIn("--no-measure", text)
+
+    def test_exit_code_is_one_only_for_a_critical_finding(self):
+        import io
+        import contextlib
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = cli.main(["--checkup", "--no-measure"])
+        self.assertIn(code, (0, 1))
+        self.assertIn("what this was based on", buffer.getvalue())
+
+
+# --------------------------------------------------------------------------- #
 class TestInternetSpeed(unittest.TestCase):
     """The opt-in internet test. Nothing here contacts the network."""
 
@@ -5023,18 +5225,21 @@ class TestWizardByKeys(unittest.TestCase):
 
     def test_quick_benchmark_by_arrow_keys(self):
         # benchmark > quick pass > no extras > no output > run
-        argv, _ = self._drive(["ENTER", "ENTER", "ENTER", "ENTER", "ENTER"])
+        argv, _ = self._drive([_menu_number("Run a benchmark"), "ENTER",   # benchmark
+                               "ENTER",              # quick pass
+                               "ENTER", "ENTER",     # no extras, no output
+                               "ENTER"])             # run
         self.assertEqual(argv, ["--quick"])
 
     def test_ticking_an_output_with_space(self):
-        argv, _ = self._drive(["ENTER", "ENTER", "ENTER",
+        argv, _ = self._drive([_menu_number("Run a benchmark"), "ENTER", "ENTER", "ENTER",
                                " ", "ENTER",          # tick HTML report
                                "ENTER"])
         self.assertEqual(argv, ["--quick", "--html"])
 
     def test_escape_climbs_back_out_of_a_branch(self):
-        argv, output = self._drive(["ENTER", "ESC",    # into benchmark, out
-                                    "DOWN", "ENTER",   # stats
+        argv, output = self._drive([_menu_number("Run a benchmark"), "ENTER", "ESC",   # in, back out
+                                    _menu_number("Read hardware stats"), "ENTER",  # stats
                                     "ENTER",           # every section, ticked
                                     "ENTER",           # readable report
                                     "ENTER"])          # run
@@ -5044,7 +5249,7 @@ class TestWizardByKeys(unittest.TestCase):
     def test_sections_start_ticked_where_all_is_the_sensible_answer(self):
         # The stats screen defaults to every section, so untick one rather
         # than tick eleven.
-        argv, _ = self._drive(["DOWN", "ENTER", " ", "ENTER", "ENTER",
+        argv, _ = self._drive([_menu_number("Read hardware stats"), "ENTER", " ", "ENTER", "ENTER",
                                "ENTER"])
         self.assertEqual(argv[0], "--stats")
         self.assertNotIn("cpu", argv[1].split(","))
@@ -5081,6 +5286,20 @@ class TestWizardParsing(unittest.TestCase):
                 tui.parse_selection(bad, 4, ["a", "b", "c", "d"])
 
 
+def _menu_number(label):
+    """The main-menu number for an entry, as a string.
+
+    Tests used to hardcode these, and every new top-level entry broke all of
+    them at once. Resolving by label means only the labels are load-bearing —
+    and a digit doubles as a jump key in the arrow-driven UI, so the same
+    lookup works for both paths.
+    """
+    for index, (text, _) in enumerate(wizard._MAIN, 1):
+        if text.lower().startswith(label.lower()):
+            return str(index)
+    raise AssertionError(f"no main-menu entry starting with {label!r}")
+
+
 # --------------------------------------------------------------------------- #
 class TestWizardFlow(unittest.TestCase):
     """The guided menu exists so someone can find a task without the flags.
@@ -5089,6 +5308,9 @@ class TestWizardFlow(unittest.TestCase):
     checks the command line it hands back, because that argv is the only thing
     the wizard actually produces.
     """
+
+    def _main(self, label):
+        return _menu_number(label)
 
     def _drive(self, answers):
         import io
@@ -5102,113 +5324,132 @@ class TestWizardFlow(unittest.TestCase):
 
     def test_quick_benchmark(self):
         # main menu -> benchmark -> quick pass -> no extras -> no output -> run
-        argv, _ = self._drive(["1", "1", "none", "none", "1"])
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "1", "none", "none", "1"])
         self.assertEqual(argv, ["--quick"])
 
     def test_profile_with_html_report(self):
-        argv, _ = self._drive(["1", "3", "3", "2", "none", "1", "1"])
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "3", "3", "2", "none", "1", "1"])
         self.assertEqual(argv, ["--profile", "cpu", "--html"])
 
     def test_individual_tests_can_be_named(self):
-        argv, _ = self._drive(["1", "4", "cpu_int,disk", "1",
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "4", "cpu_int,disk", "1",
                                "none", "none", "1"])
         self.assertEqual(argv, ["--only", "cpu_int,disk", "--quick"])
 
     def test_custom_depth_becomes_seconds_and_repeats(self):
-        argv, _ = self._drive(["1", "2", "4", "4.5", "7",
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "2", "4", "4.5", "7",
                                "none", "none", "1"])
         self.assertEqual(argv, ["--seconds", "4.5", "--repeats", "7"])
 
     def test_focused_run_still_asks_for_one_test(self):
         # A benchmark run with no tests measures nothing, so the narrow
         # scope pairs the datascience work with a one-second CPU check.
-        argv, _ = self._drive(["1", "5", "1", "none", "none", "1"])
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "5", "1", "none", "none", "1"])
         self.assertEqual(argv, ["--only", "cpu_int", "--quick",
                                 "--datascience"])
 
     def test_writing_nothing_overrides_the_other_output_choices(self):
-        argv, _ = self._drive(["1", "1", "none", "1,4", "1"])
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "1", "none", "1,4", "1"])
         self.assertEqual(argv, ["--quick", "--no-save"])
 
     def test_stats_sections(self):
-        argv, _ = self._drive(["2", "battery,drives", "1", "1"])
+        argv, _ = self._drive(
+            [self._main("Read hardware stats"), "battery,drives", "1", "1"])
         self.assertEqual(argv, ["--stats", "battery,drives"])
 
     def test_stats_all_sections_needs_no_argument(self):
-        argv, _ = self._drive(["2", "all", "1", "1"])
+        argv, _ = self._drive(
+            [self._main("Read hardware stats"), "all", "1", "1"])
         self.assertEqual(argv, ["--stats"])
 
     def test_monitor_duration_and_options(self):
-        argv, _ = self._drive(["3", "1", "90s", "1", "1"])
+        argv, _ = self._drive(
+            [self._main("Watch or stress"), "1", "90s", "1", "1"])
         self.assertEqual(argv, ["--monitor", "90s", "--monitor-power"])
 
     def test_soak_defaults_to_a_minimal_companion_run(self):
-        argv, _ = self._drive(["3", "3", "2h", "none", "1"])
+        argv, _ = self._drive(
+            [self._main("Watch or stress"), "3", "2h", "none", "1"])
         self.assertEqual(argv, ["--soak", "2h", "--only", "cpu_int",
                                 "--quick"])
 
     def test_health_ram_test_carries_the_size(self):
-        argv, _ = self._drive(["4", "5", "512", "1"])
+        argv, _ = self._drive(
+            [self._main("Check hardware health"), "5", "512", "1"])
         self.assertEqual(argv, ["--health", "--health-mb", "512",
                                 "--only", "cpu_int", "--quick"])
 
     def test_history_table(self):
-        argv, _ = self._drive(["6", "1", "1"])
+        argv, _ = self._drive([self._main("Look at past runs"), "1", "1"])
         self.assertEqual(argv, ["--compare"])
 
     def test_shortcut_returns_that_entrys_argv(self):
-        argv, _ = self._drive(["7", "1"])
+        argv, _ = self._drive([self._main("Shortcuts"), "1"])
         self.assertEqual(argv, wizard.SHORTCUTS[0][1])
 
     def test_drive_speed_is_its_own_mode(self):
         # No depth, extras or output screens: it measures a drive and exits.
-        argv, _ = self._drive(["1", "8", "1", "1"])
+        argv, _ = self._drive([self._main("Run a benchmark"), "8", "1", "1"])
         self.assertEqual(argv, ["--drive-speed", "all"])
 
     def test_internet_speed_from_the_network_branch(self):
-        argv, output = self._drive(["5", "1", "1"])
+        argv, output = self._drive([self._main("Test the network"), "1", "1"])
         self.assertEqual(argv, ["--internet"])
         self.assertIn("spends bandwidth", output)
 
     def test_latency_branch_asks_for_the_host_first(self):
-        argv, _ = self._drive(["5", "2", "example.com", "1"])
+        argv, _ = self._drive(
+            [self._main("Test the network"), "2", "example.com", "1"])
         self.assertEqual(argv, ["--network-host", "example.com",
                                 "--only", "cpu_int", "--quick"])
 
     def test_two_node_client_asks_for_the_peer(self):
-        argv, _ = self._drive(["5", "5", "10.0.0.9", "1"])
+        argv, _ = self._drive(
+            [self._main("Test the network"), "5", "10.0.0.9", "1"])
         self.assertEqual(argv, ["--net-client", "10.0.0.9"])
 
     def test_network_choices_that_need_no_host_skip_that_screen(self):
-        argv, _ = self._drive(["5", "4", "1"])
+        argv, _ = self._drive([self._main("Test the network"), "4", "1"])
         self.assertEqual(argv, ["--net-server"])
 
     def test_back_leaves_a_skipped_screen_skipped(self):
         # The quick pass fixes the depth, so its screen is not shown. Going
         # back from Extras must reach the kind screen rather than stalling.
-        argv, output = self._drive(["1", "1", "b", "2", "2",
+        argv, output = self._drive(
+            [self._main("Run a benchmark"), "1", "b", "2", "2",
                                     "none", "none", "1"])
         self.assertEqual(argv, [])
         self.assertNotIn("Benchmark > Scope", output)
 
     def test_back_at_the_first_screen_returns_to_the_main_menu(self):
-        argv, output = self._drive(["1", "b", "2", "all", "1", "1"])
+        argv, output = self._drive(
+            [self._main("Run a benchmark"), "b",
+             self._main("Read hardware stats"), "all", "1", "1"])
         self.assertEqual(argv, ["--stats"])
         self.assertEqual(output.count("Main menu"), 2)
 
     def test_declining_the_confirmation_goes_back(self):
-        argv, _ = self._drive(["1", "1", "none", "none", "2",
+        argv, _ = self._drive(
+            [self._main("Run a benchmark"), "1", "none", "none", "2",
                                "1", "1", "1"])
         self.assertEqual(argv, ["--quick", "--html"])
 
     def test_nothing_runs_until_the_confirmation_is_accepted(self):
-        argv, output = self._drive(["1", "1", "none", "none", "3"])
+        argv, output = self._drive(
+            [self._main("Run a benchmark"), "1", "none", "none", "3"])
         self.assertIsNone(argv)
         self.assertIn("Nothing has started yet", output)
 
     def test_bad_input_re_asks_rather_than_giving_up(self):
-        argv, output = self._drive(["99", "banana", "1", "1",
-                                    "none", "none", "1"])
+        argv, output = self._drive(
+            ["99", "banana", self._main("Run a benchmark"), "1",
+             "none", "none", "1"])
         self.assertEqual(argv, ["--quick"])
         self.assertIn("is not one of 1-", output)
 
@@ -5222,7 +5463,8 @@ class TestWizardFlow(unittest.TestCase):
         self.assertIsNone(self._drive([KeyboardInterrupt()])[0])
 
     def test_the_command_line_it_built_is_printed(self):
-        _, output = self._drive(["1", "1", "none", "none", "1"])
+        _, output = self._drive(
+            [self._main("Run a benchmark"), "1", "none", "none", "1"])
         self.assertIn("pcbench --quick", output)
 
 

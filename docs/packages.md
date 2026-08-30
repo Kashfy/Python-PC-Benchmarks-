@@ -90,7 +90,7 @@ onto an unfamiliar machine and run immediately, with no install step and no
 | `re` | Parsing `/proc` files, sanitizing filenames |
 | `shutil` | `which`, `disk_usage`, terminal size for `--menu` |
 | `statistics` | `median`, `fmean`, `stdev` |
-| `subprocess` | `sysctl`, `pmset`, PowerShell, the native engine |
+| `subprocess` | `sysctl`, `pmset`, `ps`, `ping`, PowerShell, the native engine |
 | `sys` | Bitness, byte order, exit codes |
 | `sysconfig` | Free-threaded build detection |
 | `tempfile` | Scratch files |
@@ -343,6 +343,13 @@ Config files are found by walking up from the working directory
 (`pcbench.toml`, `.pcbench.toml`, `pcbench.json`, `.pcbench.json`). TOML needs
 Python 3.11+; JSON works everywhere. Precedence is command line > `PCBENCH_*`
 environment > config file > defaults.
+
+### Diagnosis
+
+| Flag | Description |
+|------|-------------|
+| `--checkup` | Diagnose what is holding the machine back: thermal, power profile, contention, memory, disk headroom, drive health, uptime, container limits, plus a short measurement and an 8-second throttling check. Findings are ranked by likely impact. Exit 1 if any is critical |
+| `--no-measure` | With `--checkup`, read settings and live state only — instant, and puts no load on the machine |
 
 ### Hardware stats (no benchmarking)
 

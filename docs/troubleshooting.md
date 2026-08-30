@@ -3,6 +3,54 @@
 Most problems here are environmental — power state, thermals, compilers,
 permissions — rather than bugs.
 
+## My PC is slow and I do not know where to start
+
+```bash
+python3 benchmark.py --checkup
+```
+
+It checks the things that actually make machines slow, in the order they are
+worth checking, and tells you what it found with a fix for each. Roughly 15
+seconds; `--no-measure` makes it instant by skipping the benchmark and the
+throttling check.
+
+If it reports nothing, that is a real result: heat, power settings, CPU
+contention, memory pressure, disk headroom and drive health were all examined
+and none of them explain a slowdown. At that point the cause is more likely to
+be a specific application than the machine.
+
+## `--checkup` found nothing but the machine is still slow
+
+Things it cannot see, in rough order of likelihood:
+
+1. **One application, not the machine.** A single slow program with the rest
+   of the system idle looks exactly like a healthy machine to a checkup. Watch
+   the "Busiest" line while reproducing the slowness.
+2. **Intermittent problems.** A checkup is a snapshot. If the machine is slow
+   in bursts, use `pcbench --monitor 10m` and watch for clocks dropping or
+   load spiking.
+3. **Network, not compute.** Slowness that is really an unresponsive server or
+   a saturated link feels identical from the keyboard. `pcbench --internet`
+   separates them.
+4. **Something that only appears under real load.** The checkup holds load for
+   eight seconds. `pcbench --sustained 10m` runs it long enough for a thermal
+   or power limit to appear.
+5. **A graphics or display problem.** Nothing here measures compositing or
+   frame delivery, which is what makes a desktop feel laggy when the CPU is
+   idle.
+
+## `--checkup` says my disk is slow but it is an SD card / hard disk
+
+That is the intended behaviour, and the report should say so. A floor firing
+is an observation, not a verdict: 45 MB/s is a fault on an NVMe SSD and the
+published specification on an SD card. Low sequential *and* low random
+together indicate a slow medium rather than a damaged fast one, and findings
+that match that pattern are reported as expected rather than as problems.
+
+If a drive you know to be an SSD reads like this, check the findings above it
+first — a thermally throttled or heavily loaded machine produces exactly these
+numbers, and the storage is not the cause.
+
 ## "System already busy" / "Running on BATTERY" — the run stops
 
 **This is intentional** (exit code 3). Benchmarking on battery or under load
