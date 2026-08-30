@@ -257,6 +257,43 @@ class TestWorkloadsRun(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestCacheGatedScoring(unittest.TestCase):
+    """A read that never reached the device must not be scored.
+
+    Omitting is the same principle the composite already applies to absent
+    hardware: 800,000 IOPS at 1 us is not a fast drive, it is a different
+    measurement, and scoring it made storage the strongest subsystem on every
+    machine whose test directory happened to be a RAM filesystem.
+    """
+
+    def _results(self, **flags):
+        disk = {"write_rate": 1000.0, "read_rate": 4000.0,
+                "random_read_iops": 800000.0, "peak_iops": 800000.0,
+                "cache_bypassed": True, "sequential_cache_bypassed": True}
+        disk.update(flags)
+        return {"disk": disk}
+
+    def test_cached_random_reads_are_omitted(self):
+        scores = scoring.compute_scores(self._results(cache_bypassed=False))
+        self.assertNotIn("disk_iops", scores["subscores"])
+        self.assertNotIn("disk_iops_peak", scores["subscores"])
+        # The write is timed through fsync, so it stands regardless.
+        self.assertIn("disk_write", scores["subscores"])
+        self.assertEqual(scores["omitted"], ["disk_iops", "disk_iops_peak"])
+
+    def test_cached_sequential_read_is_omitted_independently(self):
+        scores = scoring.compute_scores(
+            self._results(sequential_cache_bypassed=False))
+        self.assertNotIn("disk_read", scores["subscores"])
+        self.assertIn("disk_iops", scores["subscores"])
+
+    def test_a_clean_run_scores_everything(self):
+        scores = scoring.compute_scores(self._results())
+        for key in ("disk_write", "disk_read", "disk_iops", "disk_iops_peak"):
+            self.assertIn(key, scores["subscores"])
+        self.assertNotIn("omitted", scores)
+
+
 class TestScoring(unittest.TestCase):
     def test_baseline_rate_scores_100(self):
         results = {"cpu_int": {"rate": scoring.BASELINES["cpu_int"]}}
@@ -659,9 +696,34 @@ class TestMLFramework(unittest.TestCase):
 
 class TestPower(unittest.TestCase):
     def test_estimate_tdp_known_chips(self):
-        self.assertEqual(power.estimate_tdp("Apple M4"), 18)
+        self.assertEqual(power.estimate_tdp("Apple M4"), 16)
         self.assertEqual(power.estimate_tdp("Intel Core i7-9750H"), 45)
-        self.assertEqual(power.estimate_tdp("AMD Ryzen 9 7950X"), 65)
+        self.assertEqual(power.estimate_tdp("AMD Ryzen 9 7950X"), 170)
+
+    def test_estimate_tdp_reads_the_suffix_not_just_the_family(self):
+        # The suffix carries the power class; matching "ryzen 7" alone put a
+        # 120 W desktop part and a 25 W laptop part at the same figure.
+        desktop = power.estimate_tdp("AMD Ryzen 7 7800X3D 8-Core Processor")
+        mobile = power.estimate_tdp("AMD Ryzen 7 7840U")
+        self.assertGreater(desktop, 100)
+        self.assertLess(mobile, 40)
+        self.assertGreater(desktop, mobile * 3)
+
+    def test_estimate_tdp_matches_real_intel_model_strings(self):
+        # /proc/cpuinfo and the Windows registry both say "Core(TM) i7", which
+        # a bare "core i7" pattern never matched, so every Intel machine used
+        # to fall through to no estimate at all.
+        for model in ("13th Gen Intel(R) Core(TM) i9-13900K",
+                      "Intel(R) Core(TM) i5-12400F",
+                      "12th Gen Intel(R) Core(TM) i7-12700H",
+                      "Intel(R) Core(TM) Ultra 9 285K"):
+            self.assertIsNotNone(power.estimate_tdp(model), model)
+        self.assertGreater(
+            power.estimate_tdp("13th Gen Intel(R) Core(TM) i9-13900K"),
+            power.estimate_tdp("12th Gen Intel(R) Core(TM) i7-12700H"))
+
+    def test_rapl_status_is_one_of_three_answers(self):
+        self.assertIn(power.rapl_status(), ("ok", "permission", "absent"))
 
     def test_estimate_tdp_unknown(self):
         self.assertIsNone(power.estimate_tdp("Some Mystery CPU"))
@@ -1105,6 +1167,33 @@ class TestRegressionConfigAwareness(unittest.TestCase):
                                                    self.HIST))
         self.assertIn("skipped", out)
 
+    def test_methodology_change_is_not_a_hardware_regression(self):
+        # When the random-read test started bypassing the page cache the
+        # figure fell by more than an order of magnitude on every machine.
+        # That is a correction, not a failing drive, and comparing across it
+        # would report the most severe regression the tool can detect.
+        old = dict(self.HIST[0], method_version="1")
+        current = dict(self._current("64"), method_version="2",
+                       disk_iops="17000")
+        res = regression.analyze(current, [old])
+        self.assertIn("disk_iops", res["skipped_metrics"])
+        self.assertNotIn("disk_iops",
+                         [f["column"] for f in res["findings"]])
+
+    def test_same_methodology_still_compares(self):
+        old = dict(self.HIST[0], method_version="2")
+        current = dict(self._current("64"), method_version="2")
+        res = regression.analyze(current, [old])
+        self.assertIn("disk_iops", [f["column"] for f in res["findings"]])
+
+    def test_a_metric_can_depend_on_more_than_one_column(self):
+        # disk_iops depends on both the file size and the methodology; either
+        # differing is enough to disqualify the comparison.
+        old = dict(self.HIST[0], method_version="2")
+        current = dict(self._current("256"), method_version="2")
+        res = regression.analyze(current, [old])
+        self.assertIn("disk_iops", res["skipped_metrics"])
+
 
 class TestReportSections(unittest.TestCase):
     """Results are grouped so no category gets lost in a flat list."""
@@ -1301,6 +1390,23 @@ class TestSysbench(unittest.TestCase):
         self.assertGreater(ns, 0)
         self.assertLess(ns, 100_000)       # 100 us would be absurd
 
+    def test_syscall_excludes_interpreter_overhead(self):
+        # The figure is timed from Python, so it carries a bytecode dispatch
+        # and a call per iteration. That is interpreter speed, not kernel
+        # speed, and it differs several-fold between CPython builds.
+        overhead = sysbench._loop_overhead_ns(50_000)
+        self.assertGreater(overhead, 0)
+        self.assertLess(overhead, 10_000)
+
+    def test_syscall_baseline_is_reachable_by_a_real_machine(self):
+        # The old 50 ns baseline was a native-code figure: no machine timing a
+        # real kernel entry from Python could approach it, so every mitigated
+        # machine scored near 15 and SYSTEM became the standard "bottleneck".
+        floor_ns = 1e9 / scoring.BASELINES["syscall"]
+        self.assertGreater(floor_ns, 100)
+        measured = sysbench.bench_syscall_latency(20_000)
+        self.assertLess(measured, floor_ns * 20)
+
     def test_latency_suite_shape(self):
         r = sysbench.bench_latency_suite()
         self.assertIn("syscall_ns", r)
@@ -1333,6 +1439,106 @@ class TestDiskDepthAndLatency(unittest.TestCase):
             lat = r["random_read_latency"]
             self.assertLessEqual(lat["p50_us"], lat["p99_us"])
             self.assertLessEqual(lat["p99_us"], lat["max_us"])
+
+
+class TestRandomReadsBypassTheCache(unittest.TestCase):
+    """The random-read phase must not measure RAM.
+
+    Evicting once before the sequential read is not enough: that read pulls
+    the whole file back in, and the file is far smaller than RAM, so every
+    random read after it is a cache hit. The symptom is a sub-microsecond
+    median and queue depth 1 beating queue depth 32.
+    """
+
+    def test_a_claimed_bypass_implies_plausible_device_latency(self):
+        # The invariant that matters, and the one that used to be violated:
+        # cache_bypassed and an impossible latency cannot both be true.
+        with tempfile.TemporaryDirectory() as d:
+            r = workloads.bench_disk(0.3, 1, file_mb=64, out_dir=d)
+            if r.get("skipped"):
+                self.skipTest("disk test skipped")
+            if r["cache_bypassed"]:
+                self.assertGreaterEqual(r["random_read_latency"]["p50_us"],
+                                        workloads.IMPLAUSIBLE_DEVICE_US)
+
+    def test_result_names_the_mechanism_and_both_phases(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = workloads.bench_disk(0.3, 1, file_mb=64, out_dir=d)
+            if r.get("skipped"):
+                self.skipTest("disk test skipped")
+            self.assertIn(r["direct_method"],
+                          ("o_direct", "f_nocache", "no_buffering",
+                           "buffered"))
+            self.assertIn("sequential_cache_bypassed", r)
+            self.assertTrue(r["note"])
+
+    def test_impossible_latency_overrides_the_flag(self):
+        # btrfs with compression and most network filesystems accept O_DIRECT
+        # and serve from cache anyway, which is otherwise indistinguishable
+        # from a very fast drive.
+        ok, note = workloads.direct_read_note("o_direct", {"p50_us": 0.9})
+        self.assertFalse(ok)
+        self.assertIn("memory", note)
+        ok, note = workloads.direct_read_note("o_direct", {"p50_us": 57.0})
+        self.assertTrue(ok)
+
+    def test_buffered_is_never_reported_as_bypassed(self):
+        ok, note = workloads.direct_read_note("buffered", {"p50_us": 900.0})
+        self.assertFalse(ok)
+        self.assertIn("upper bound", note)
+
+    def test_direct_reader_reads_the_right_bytes(self):
+        # Whichever mechanism is chosen, it must return the file's contents:
+        # O_DIRECT and NO_BUFFERING both fail loudly on misalignment.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "probe.bin")
+            block = workloads.DIRECT_BLOCK
+            with open(path, "wb") as f:
+                f.write(b"\xa5" * block * 8)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                with workloads.DirectReader(path, fd) as reader:
+                    self.assertEqual(reader.read(0), block)
+                    self.assertEqual(reader.read(block * 4), block)
+            finally:
+                os.close(fd)
+
+    def test_a_ram_filesystem_is_never_reported_as_storage(self):
+        # /tmp is tmpfs on most current Linux distributions, so a run that
+        # fell back to the system temp directory reported memory bandwidth as
+        # storage throughput -- and it looked plausible enough to believe.
+        ok, note = workloads.direct_read_note("o_direct", {"p50_us": 0.9},
+                                              "tmpfs")
+        self.assertFalse(ok)
+        self.assertIn("RAM", note)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux mounts")
+    def test_memory_filesystem_identifies_tmpfs(self):
+        if not os.path.isdir("/dev/shm"):
+            self.skipTest("no /dev/shm")
+        self.assertIn(workloads.memory_filesystem("/dev/shm"),
+                      workloads.MEMORY_FILESYSTEMS)
+
+    def test_memory_filesystem_is_none_for_ordinary_storage(self):
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__)))) as d:
+            self.assertIsNone(workloads.memory_filesystem(d))
+
+    def test_direct_reader_falls_back_rather_than_raising(self):
+        # A path the platform cannot open unbuffered must degrade to buffered
+        # reads, not take the disk test down with it.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "probe.bin")
+            with open(path, "wb") as f:
+                f.write(b"\x11" * workloads.DIRECT_BLOCK * 4)
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                reader = workloads.DirectReader("", fd)
+                self.assertEqual(reader.method, "buffered")
+                self.assertEqual(reader.read(0), workloads.DIRECT_BLOCK)
+                reader.close()
+            finally:
+                os.close(fd)
 
 
 class TestMemoryScaling(unittest.TestCase):
@@ -1443,6 +1649,25 @@ class TestOptionalBenchmarksDegrade(unittest.TestCase):
         if not r["available"]:
             self.assertIn("note", r)
         self.assertIsInstance(gpucompute.devices(), list)
+
+    def test_every_opencl_failure_still_tries_the_matmul(self):
+        # OpenCL and PyTorch fail independently: a discrete card with a
+        # working CUDA build and no registered ICD is an ordinary machine, and
+        # two of the three failure paths used to return before the matmul and
+        # the NVIDIA telemetry were collected at all.
+        r = gpucompute.run(0.05)
+        if r.get("available"):
+            self.skipTest("OpenCL works here; testing the failure paths")
+        self.assertIn("matmul", r)
+        self.assertIn("nvidia", r)
+
+    def test_missing_icd_is_explained_not_just_reported(self):
+        note = gpucompute._enumeration_note(
+            RuntimeError("clGetPlatformIDs failed: PLATFORM_NOT_FOUND_KHR"))
+        self.assertIn("no OpenCL platform", note)
+        # The matmul is unaffected by the ICD, and the note has to say so or
+        # the reader concludes the GPU went unmeasured.
+        self.assertIn("PyTorch", note)
 
     def test_extract_rates_safe_on_unavailable(self):
         for mod in (numeric, cryptobench, gpucompute):
@@ -1615,6 +1840,28 @@ class TestDiagnose(unittest.TestCase):
         r = diagnose.analyse({"subscores": {"cpu_int": 400, "memory": 100,
                                             "disk_write": 400}})
         self.assertIsInstance(diagnose.render(r), str)
+
+    def test_weak_category_names_the_member_that_caused_it(self):
+        # A category is a geometric mean, so one bad member drags it down
+        # while the rest are fine. Reporting "compilation is slow" about a
+        # machine compiling at 4x the baseline described the wrong problem.
+        r = diagnose.analyse({"subscores": {
+            "compile": 400, "syscall": 18,
+            "cpu_int": 300, "cpu_float": 300, "memory": 300,
+            "disk_write": 300, "disk_read": 300}})
+        impact = next(b["impact"] for b in r["bottlenecks"]
+                      if b["category"] == "system")
+        self.assertIn("system calls", impact)
+        self.assertNotIn("compilation is slow", impact)
+        self.assertIn("compile scores 400", impact)
+
+    def test_uniformly_weak_category_keeps_its_own_advice(self):
+        r = diagnose.analyse({"subscores": {
+            "disk_write": 20, "disk_read": 25, "disk_iops": 22,
+            "cpu_int": 300, "cpu_float": 300, "memory": 300}})
+        impact = next(b["impact"] for b in r["bottlenecks"]
+                      if b["category"] == "disk")
+        self.assertIn("storage is the limit", impact)
 
     def test_spec_sheet_contains_key_facts(self):
         payload = {

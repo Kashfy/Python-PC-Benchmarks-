@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json as _json
 import math
+import mmap
 import multiprocessing as mp
 import os
 import platform
@@ -453,9 +454,21 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
                          f"MB free, has {free / MB:.0f} MB"}
 
     _clean_stale_files(out_dir)
-    buf = b"\xc3" * block
+    # Incompressible, and a different block each time. A file of one repeated
+    # byte is free to store on anything that compresses -- btrfs with
+    # ``compress=``, ZFS, NTFS compression, and the inline compression in many
+    # SSD controllers -- so the write never reaches the medium at the rate
+    # being reported. It also breaks the read path: btrfs serves O_DIRECT
+    # reads of a compressed extent through the page cache, which is what made
+    # the random-read figures on this machine impossible. Rotating a
+    # memoryview over one random pool costs nothing per write and additionally
+    # defeats block-level deduplication.
+    pool = os.urandom(block + 4 * KB)
+    view = memoryview(pool)
+    offsets = [i * 512 for i in range(8)]
     writes, reads, iops = [], [], []
-    bypassed = False
+    seq_bypassed = False
+    direct_method = "buffered"
     latency: dict | None = None
     qd_sweep: dict | None = None
 
@@ -468,14 +481,15 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
 
             # ---- sequential write (timed through fsync) ----
             start = clock()
-            for _ in range(n_blocks):
-                os.write(fd, buf)
+            for i in range(n_blocks):
+                off = offsets[i % len(offsets)]
+                os.write(fd, view[off:off + block])
             os.fsync(fd)
             writes.append(total / (clock() - start) / MB)
 
             # ---- sequential read ----
             # On Linux nothing can be excluded up front, so evict instead.
-            bypassed = nocache or _drop_cache(fd)
+            seq_bypassed = nocache or _drop_cache(fd)
             os.lseek(fd, 0, os.SEEK_SET)
             start = clock()
             got = 0
@@ -487,12 +501,19 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
             reads.append(got / (clock() - start) / MB)
 
             # ---- 4 KiB random reads ----
-            iops.append(_random_read_iops(fd, total, min(seconds, 2.0)))
-            if latency is None:
-                latency = _random_read_latency(fd, total)
+            # The sequential read above pulled the whole file back into the
+            # page cache, and the file is far smaller than RAM, so these must
+            # go through a descriptor that bypasses the cache or they measure
+            # memory. See :class:`DirectReader`.
+            with DirectReader(path, fd) as handle:
+                direct_method = handle.method
+                iops.append(_random_read_iops(handle, total,
+                                              min(seconds, 2.0)))
+                if latency is None:
+                    latency = _random_read_latency(handle, total)
             if qd_sweep is None:
-                qd_sweep = _queue_depth_sweep(fd, total,
-                                              min(seconds, 1.0))
+                qd_sweep = _queue_depth_sweep(fd, total, min(seconds, 1.0),
+                                              path)
         except OSError as e:
             return {"skipped": True, "error": f"disk I/O failed: {e}"}
         finally:
@@ -503,6 +524,8 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
                 pass
 
     w, r, io = summarize(writes), summarize(reads), summarize(iops)
+    ramfs = memory_filesystem(out_dir)
+    bypassed, cache_note = direct_read_note(direct_method, latency, ramfs)
     result = {
         "unit": "MB/s",
         "file_mb": file_mb,
@@ -514,14 +537,17 @@ def bench_disk(seconds: float, repeats: int, file_mb: int,
         "random_read_latency": latency,
         "queue_depth_sweep": qd_sweep,
         "peak_iops": (qd_sweep or {}).get("peak_iops", 0.0),
+        # Reported separately because they are bypassed by different means and
+        # can disagree: the sequential read is evicted before it runs, the
+        # random reads are issued unbuffered.
         "cache_bypassed": bypassed,
+        "sequential_cache_bypassed": seq_bypassed and not ramfs,
+        "direct_method": direct_method,
+        "memory_filesystem": ramfs,
         "write": w,
         "read": r,
         "random": io,
-        "note": ("reads bypassed the page cache"
-                 if bypassed else
-                 "page cache NOT bypassed on this platform; read numbers are "
-                 "an optimistic upper bound"),
+        "note": cache_note,
     }
     if notice:
         result["safety_notice"] = notice
@@ -604,9 +630,279 @@ def open_reader(path: str, shared_fd: int) -> tuple[int, bool]:
         return shared_fd, False
 
 
-def _random_read_iops(fd: int, size: int, budget: float) -> float:
+
+# --------------------------------------------------------------------------- #
+# Unbuffered reads
+# --------------------------------------------------------------------------- #
+# Dropping the cache once before the sequential read is not enough for the
+# random-read phase that follows: the sequential read pulls the whole file
+# straight back in, and a test file small enough to be safe for flash wear is
+# far smaller than RAM, so every random read after it is served from memory.
+# The symptom is unmistakable once you know it -- sub-microsecond p50 latency
+# and queue depth 1 beating queue depth 32, which no real device does -- and
+# the numbers it produces are memory bandwidth wearing a storage label.
+#
+# The only reliable cure is to stop the reads entering the cache at all, which
+# every platform spells differently:
+#
+# * **Linux** -- ``O_DIRECT`` at open time. Requires the buffer, the offset and
+#   the length to be aligned to the logical block size; 4 KiB satisfies every
+#   device this tool targets. Some filesystems (tmpfs, a few network mounts)
+#   reject the flag outright, and a few accept it and quietly fall back to
+#   buffered I/O, which is why the result is plausibility-checked afterwards.
+# * **macOS** -- ``F_NOCACHE`` on the descriptor. No alignment requirement.
+# * **Windows** -- ``FILE_FLAG_NO_BUFFERING``, which ``os.open`` does not
+#   expose, so the handle comes from ``CreateFileW`` through ctypes. Same
+#   alignment rules as Linux.
+#
+# Where none of them works the reader says so instead of pretending, and the
+# caller discloses it in the result.
+
+#: Alignment unit for unbuffered I/O. Every device this tool targets reports a
+#: logical block size of 512 or 4096 bytes, so 4 KiB is aligned for all of them
+#: and is also the block size the random-read test uses.
+DIRECT_BLOCK = 4 * KB
+
+#: Latency below which a "device" read cannot be genuine. PCIe round trip plus
+#: NAND access is tens of microseconds on a good NVMe drive and about 6 us on
+#: the fastest Optane part ever sold, so anything under this came from RAM.
+IMPLAUSIBLE_DEVICE_US = 3.0
+
+# CreateFileW constants (winnt.h), used only on Windows.
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ_WRITE = 0x00000003
+_OPEN_EXISTING = 3
+_FILE_FLAG_NO_BUFFERING = 0x20000000
+
+
+class DirectReader:
+    """One thread's reader, bypassing the page cache where the OS allows it.
+
+    ``method`` records how it got there -- ``o_direct``, ``f_nocache``,
+    ``no_buffering`` or ``buffered`` when the platform or the filesystem
+    refused. A reader is owned by exactly one thread: the Windows and
+    fallback paths carry a file position, so sharing one would race.
+    """
+
+    def __init__(self, path: str, shared_fd: int,
+                 block: int = DIRECT_BLOCK, direct: bool = True) -> None:
+        self.block = block
+        self.method = "buffered"
+        self._fd = shared_fd
+        self._owned = False
+        self._handle = None          # Windows HANDLE, when NO_BUFFERING works
+        self._buf = None             # aligned destination for direct reads
+        self._win = None             # (kernel32, address) once bound
+
+        if path and direct:
+            if os.name == "nt":
+                self._open_no_buffering(path)
+            elif hasattr(os, "O_DIRECT") and hasattr(os, "preadv"):
+                self._open_o_direct(path)
+            elif platform.system() == "Darwin":
+                self._open_nocache(path)
+        if self.method == "buffered" and not HAS_PREAD:
+            # No positional read, so seek-then-read is the only option and a
+            # shared descriptor would race on the file pointer between
+            # threads — silently reading the wrong offset rather than failing.
+            self._fd, self._owned = open_reader(path, shared_fd)
+
+    # -- platform openers ---------------------------------------------------
+    def _open_o_direct(self, path: str) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except OSError:
+            return                                  # filesystem refused it
+        buf = mmap.mmap(-1, self.block)             # page-aligned by mmap
+        try:
+            os.preadv(fd, [buf], 0)                 # probe before committing
+        except OSError:
+            os.close(fd)
+            buf.close()
+            return
+        self._fd, self._owned, self._buf = fd, True, buf
+        self.method = "o_direct"
+
+    def _open_nocache(self, path: str) -> None:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        if not _set_nocache(fd):
+            os.close(fd)
+            return
+        self._fd, self._owned = fd, True
+        self.method = "f_nocache"
+
+    def _open_no_buffering(self, path: str) -> None:
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            kernel32.CreateFileW.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                wintypes.HANDLE]
+            kernel32.ReadFile.restype = wintypes.BOOL
+            kernel32.ReadFile.argtypes = [
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+            kernel32.SetFilePointerEx.restype = wintypes.BOOL
+            kernel32.SetFilePointerEx.argtypes = [
+                wintypes.HANDLE, ctypes.c_longlong,
+                ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            handle = kernel32.CreateFileW(
+                path, _GENERIC_READ, _FILE_SHARE_READ_WRITE, None,
+                _OPEN_EXISTING, _FILE_FLAG_NO_BUFFERING, None)
+            # CreateFileW returns INVALID_HANDLE_VALUE, which through a
+            # HANDLE restype arrives as the unsigned form of -1 rather than
+            # as -1 itself.
+            if not handle or handle == ctypes.c_void_p(-1).value:
+                return
+            # A ctypes buffer rather than an mmap: taking the address of an
+            # mmap through `from_buffer` exports a pointer into it, and
+            # `mmap.close()` then raises BufferError. Over-allocate and round
+            # up instead, since NO_BUFFERING requires sector alignment.
+            align = DIRECT_BLOCK
+            raw = ctypes.create_string_buffer(self.block + align)
+            address = (ctypes.addressof(raw) + align - 1) & ~(align - 1)
+            self._handle, self._buf = handle, raw
+            self._win = (kernel32, address)
+            if self._read_windows(0) <= 0:          # probe before committing
+                self.close()
+                self.method = "buffered"
+                return
+            self.method = "no_buffering"
+        except Exception:
+            # ctypes binding failures must never take the disk test with them.
+            self.close()
+            self.method = "buffered"
+
+    # -- reading ------------------------------------------------------------
+    def _read_windows(self, offset: int) -> int:
+        import ctypes
+        from ctypes import wintypes
+        kernel32, address = self._win
+        moved = ctypes.c_longlong(0)
+        if not kernel32.SetFilePointerEx(self._handle,
+                                         ctypes.c_longlong(offset),
+                                         ctypes.byref(moved), 0):
+            return 0
+        got = wintypes.DWORD(0)
+        if not kernel32.ReadFile(self._handle, ctypes.c_void_p(address),
+                                 wintypes.DWORD(self.block),
+                                 ctypes.byref(got), None):
+            return 0
+        return got.value
+
+    def read(self, offset: int) -> int:
+        """Read one aligned block at ``offset``; returns the bytes read."""
+        if self._handle is not None:
+            return self._read_windows(offset)
+        if self._buf is not None:
+            return os.preadv(self._fd, [self._buf], offset)
+        return len(pread(self._fd, self.block, offset))
+
+    def close(self) -> None:
+        if self._handle is not None:
+            try:
+                self._win[0].CloseHandle(self._handle)
+            except Exception:
+                pass
+            self._handle = None
+            self._win = None
+        if self._buf is not None:
+            # An mmap on the O_DIRECT path, a ctypes buffer on the Windows
+            # one; only the former needs closing.
+            try:
+                self._buf.close()
+            except (AttributeError, BufferError):
+                pass
+            self._buf = None
+        if self._owned:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._owned = False
+
+    def __enter__(self) -> "DirectReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+#: Filesystems that live in RAM. A "disk" test on one of these measures memory
+#: with extra steps, and it is easy to hit by accident: /tmp is tmpfs on most
+#: current Linux distributions, so any run that fell back to the system temp
+#: directory reported memory bandwidth as storage throughput.
+MEMORY_FILESYSTEMS = {"tmpfs", "ramfs", "devtmpfs", "rootfs"}
+
+
+def memory_filesystem(path: str) -> str | None:
+    """Name the RAM-backed filesystem ``path`` sits on, or None.
+
+    Linux only, because it is the only platform where the default temp
+    directory is commonly a RAM filesystem — macOS puts /tmp on the boot
+    volume and Windows puts %TEMP% in the user profile.
+    """
+    try:
+        target = os.path.realpath(path)
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as f:
+            entries = [line.split()[:3] for line in f if len(line.split()) >= 3]
+    except (OSError, IndexError):
+        return None
+    best, best_type = "", None
+    for _device, point, fstype in entries:
+        point = point.replace("\\040", " ")
+        if (target == point or target.startswith(point.rstrip("/") + "/")) \
+                and len(point) >= len(best):
+            best, best_type = point, fstype
+    return best_type if best_type in MEMORY_FILESYSTEMS else None
+
+
+def direct_read_note(method: str, latency: dict | None,
+                     ramfs: str | None = None) -> tuple[bool, str]:
+    """Judge whether the random-read figures really came from the device.
+
+    Returns ``(bypassed, note)``. Three ways they might not have: the platform
+    had no bypass mechanism; the filesystem accepted one and served from cache
+    anyway (btrfs with compression and most network filesystems do exactly
+    this, which is otherwise indistinguishable from a very fast drive, so the
+    latency is checked against physics as well as the flag); or there is no
+    device involved at all because the directory is a RAM filesystem.
+    """
+    if ramfs:
+        return False, (f"the test directory is on {ramfs}, which is RAM — "
+                       f"these are memory figures, not storage ones. Point "
+                       f"the run at a directory on real storage "
+                       f"(--output-dir, or --disk-path for the I/O suite)")
+    if method == "buffered":
+        return False, ("the page cache could not be bypassed on this "
+                       "platform, so the random-read figures include cache "
+                       "hits and are an optimistic upper bound")
+    p50 = (latency or {}).get("p50_us")
+    if p50 is not None and p50 < IMPLAUSIBLE_DEVICE_US:
+        return False, (f"reads were issued with the cache bypassed "
+                       f"({method}), but a {p50:.2f} us median is faster than "
+                       f"any storage device, so the filesystem served them "
+                       f"from memory anyway — treat the random-read figures "
+                       f"as an upper bound, not as device performance")
+    return True, f"random reads bypassed the page cache ({method})"
+
+
+def _random_read_iops(reader: "DirectReader", size: int,
+                      budget: float) -> float:
     """4 KiB reads at random offsets, one at a time (queue depth 1)."""
-    page = 4 * KB
+    page = reader.block
     max_off = max(0, size - page)
     rnd = random.Random(4242)
     start = clock()
@@ -614,26 +910,26 @@ def _random_read_iops(fd: int, size: int, budget: float) -> float:
     while clock() - start < budget:
         # Batch to keep clock() overhead off the measured path.
         for _ in range(64):
-            pread(fd, page, rnd.randrange(0, max_off + 1, page)
-                  if max_off else 0)
+            reader.read(rnd.randrange(0, max_off + 1, page) if max_off else 0)
         ops += 64
     return ops / (clock() - start)
 
 
-def _random_read_latency(fd: int, size: int, samples: int = 3000) -> dict:
+def _random_read_latency(reader: "DirectReader", size: int,
+                         samples: int = 3000) -> dict:
     """Per-operation latency for 4 KiB random reads, in microseconds.
 
     Tail latency is what users feel: a drive with a good median but a poor p99
     produces visible stalls. Throughput alone cannot show this.
     """
-    page = 4 * KB
+    page = reader.block
     max_off = max(0, size - page)
     rnd = random.Random(99)
     times = []
     for _ in range(samples):
         offset = rnd.randrange(0, max_off + 1, page) if max_off else 0
         t0 = clock()
-        pread(fd, page, offset)
+        reader.read(offset)
         times.append((clock() - t0) * 1e6)
     times.sort()
     n = len(times)
@@ -658,12 +954,13 @@ def _random_read_iops_qd(fd: int, size: int, budget: float,
     Threads are used rather than async I/O because the read syscall releases
     the GIL for its duration, so they genuinely overlap.
 
-    ``path`` lets each thread open its own descriptor on platforms without
-    `os.pread`, where sharing one would race on the file pointer.
+    ``path`` gives each thread its own :class:`DirectReader`, which is what
+    keeps the reads off the page cache and, on platforms without `os.pread`,
+    what stops the threads racing on a shared file pointer.
     """
     import threading
 
-    page = 4 * KB
+    page = DIRECT_BLOCK
     max_off = max(0, size - page)
     stop = threading.Event()
     counts = [0] * queue_depth
@@ -671,21 +968,17 @@ def _random_read_iops_qd(fd: int, size: int, budget: float,
     def reader(slot: int) -> None:
         rnd = random.Random(1000 + slot)
         local = 0
-        my_fd, owned = open_reader(path, fd)
+        handle = DirectReader(path, fd, page)
         try:
             while not stop.is_set():
                 for _ in range(16):
-                    pread(my_fd, page,
-                          rnd.randrange(0, max_off + 1, page) if max_off else 0)
+                    handle.read(
+                        rnd.randrange(0, max_off + 1, page) if max_off else 0)
                 local += 16
         except OSError:
             pass
         finally:
-            if owned:
-                try:
-                    os.close(my_fd)
-                except OSError:
-                    pass
+            handle.close()
         counts[slot] = local
 
     threads = [threading.Thread(target=reader, args=(i,), daemon=True)
@@ -713,12 +1006,15 @@ def _queue_depth_sweep(fd: int, size: int, budget: float,
     """Random-read IOPS across increasing queue depths."""
     points = []
     for qd in QUEUE_DEPTHS:
-        iops = (_random_read_iops(fd, size, budget) if qd == 1
-                else _random_read_iops_qd(fd, size, budget, qd))
+        if qd == 1:
+            with DirectReader(path, fd) as handle:
+                iops = _random_read_iops(handle, size, budget)
+        else:
+            iops = _random_read_iops_qd(fd, size, budget, qd, path)
         points.append({"queue_depth": qd, "iops": round(iops, 1),
                        "mb_per_s": round(iops * 4 / 1024, 1)})
     best = max(points, key=lambda p: p["iops"])
-    return {
+    result = {
         "points": points,
         "peak_iops": best["iops"],
         "peak_queue_depth": best["queue_depth"],
@@ -726,3 +1022,12 @@ def _queue_depth_sweep(fd: int, size: int, budget: float,
         "scaling": (round(best["iops"] / points[0]["iops"], 1)
                     if points[0]["iops"] else None),
     }
+    if best["queue_depth"] == 1:
+        # Every real device goes faster with requests queued. When the peak
+        # lands at depth 1 the reads were not reaching the device at all, or
+        # the thread overhead of deeper queues exceeded the device latency --
+        # which is itself a sign the reads were served from memory.
+        result["note"] = ("queue depth 1 was the fastest point, which no "
+                          "device does — the deeper queues were limited by "
+                          "something other than the drive")
+    return result

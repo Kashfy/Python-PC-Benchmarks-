@@ -454,6 +454,29 @@ def _runners(args, info, disk_dir) -> dict:
     }
 
 
+def _scratch_dir() -> str:
+    """A writable directory for test files, on real storage where possible.
+
+    ``--no-save`` used to send the disk test to the system temp directory,
+    which on most current Linux distributions is a tmpfs — so the "disk"
+    figures were memory bandwidth. The working directory is on real storage
+    far more often, so it is tried first and the temp directory is the
+    fallback. The files are deleted either way.
+    """
+    temp = tempfile.gettempdir()
+    if not wl.memory_filesystem(temp):
+        return temp
+    for candidate in (os.getcwd(), os.path.expanduser("~")):
+        try:
+            if (candidate and os.path.isdir(candidate)
+                    and os.access(candidate, os.W_OK)
+                    and not wl.memory_filesystem(candidate)):
+                return candidate
+        except OSError:
+            continue
+    return temp                      # disclosed in the result, not hidden
+
+
 def _check_output_writable(out_dir: str) -> str | None:
     """Verify results can be saved *before* spending minutes benchmarking.
 
@@ -811,11 +834,11 @@ def main(argv=None) -> int:
             print(f"error: {problem}", file=sys.stderr)
             return 5
 
-    disk_dir = tempfile.gettempdir() if args.no_save else args.output_dir
+    disk_dir = _scratch_dir() if args.no_save else args.output_dir
     try:
         os.makedirs(disk_dir, exist_ok=True)
     except OSError:
-        disk_dir = tempfile.gettempdir()
+        disk_dir = _scratch_dir()
 
     info = inventory()
     state = machine_state(_repo_root())
@@ -903,7 +926,8 @@ def main(argv=None) -> int:
             args.seconds, args.repeats, _repo_root(),
             threads=info["cpu_cores_logical"],
             stream_mb=native_mod.stream_array_mb(
-                cache_bytes, info.get("ram_total_bytes", 0)))
+                cache_bytes, info.get("ram_total_bytes", 0)),
+            disk_dir=disk_dir)
         if isinstance(native, dict):
             native["last_level_cache_bytes"] = cache_bytes
             native["last_level_cache_source"] = cache_source

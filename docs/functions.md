@@ -119,17 +119,41 @@ Returns `points`, `peak_mb_per_s`, `dram_mb_per_s`, `cache_to_dram_ratio`.
 
 #### `bench_disk(seconds, repeats, file_mb, out_dir)` → dict
 Sequential write (through `fsync`), sequential read, and 4 KiB random-read
-IOPS. Returns `write_rate`, `read_rate`, `random_read_iops`, and
-`cache_bypassed`. Skips with a reason when free space is insufficient.
+IOPS. Returns `write_rate`, `read_rate`, `random_read_iops`, `cache_bypassed`
+(the random phase), `sequential_cache_bypassed`, and `direct_method`. Skips
+with a reason when free space is insufficient.
 
 #### `_set_nocache(fd) -> bool` · `_drop_cache(fd) -> bool`
-Page-cache defeat. `_set_nocache` (macOS `F_NOCACHE`) **must** run before the
-file is written — it prevents caching but does not evict. `_drop_cache`
-(Linux `posix_fadvise`) evicts after `fsync`.
+Page-cache defeat for the *sequential* phase. `_set_nocache` (macOS
+`F_NOCACHE`) **must** run before the file is written — it prevents caching but
+does not evict. `_drop_cache` (Linux `posix_fadvise`) evicts after `fsync`.
 
-#### `_random_read_iops(fd, size, budget) -> float`
-4 KiB reads at random offsets, batched so `clock()` overhead stays off the
-measured path.
+#### `DirectReader(path, shared_fd, block=4096)`
+One thread's page-cache-bypassing reader for the *random* phase, where a single
+eviction is useless because the file refills on first pass. `O_DIRECT` +
+`preadv` on Linux, `F_NOCACHE` on macOS, `CreateFileW(FILE_FLAG_NO_BUFFERING)`
+through `ctypes` on Windows, buffered where none is available. `.method`
+records which, `.read(offset)` returns bytes read, and it is a context manager.
+Owned by exactly one thread: the Windows and fallback paths carry a file
+position.
+
+#### `memory_filesystem(path) -> str | None`
+Names the RAM-backed filesystem `path` sits on (`tmpfs`, `ramfs`, `devtmpfs`),
+or None. Linux only — it is the only platform whose default temp directory is
+commonly RAM, which is how `--no-save` used to report memory bandwidth as
+storage throughput.
+
+#### `direct_read_note(method, latency, ramfs=None) -> (bool, str)`
+Decides whether the random-read figures really came from the device. Three ways
+they might not have: `ramfs` is set and there is no device involved at all; the
+`method` is `buffered` because the platform had no mechanism; or a median
+latency under `IMPLAUSIBLE_DEVICE_US` (3 µs) shows the filesystem accepted the
+flag and served from cache anyway, which btrfs-with-compression and network
+filesystems both do.
+
+#### `_random_read_iops(reader, size, budget) -> float`
+4 KiB reads at random offsets through a `DirectReader`, batched so `clock()`
+overhead stays off the measured path.
 
 ---
 
@@ -509,6 +533,12 @@ Times a full C compile at `-O2` of a fixed source. One untimed compile runs
 first so the compiler and headers are cached; otherwise the first result
 measures the filesystem.
 
+#### `_loop_overhead_ns(iterations) -> float`
+Nanoseconds per iteration of an empty Python loop, subtracted from the syscall
+figure so it reports the kernel transition rather than the transition plus a
+bytecode dispatch. The loop cost varies several-fold between interpreters,
+which would otherwise make an identical kernel look slower on the slower one.
+
 #### `bench_syscall_latency(iterations) -> float`
 Nanoseconds per trivial syscall (`os.getpid`, which CPython does not cache).
 
@@ -587,7 +617,21 @@ Enumerates OpenCL devices — name, platform, type, compute units, memory, clock
 #### `run(seconds) -> dict`
 Benchmarks every OpenCL device: FMA throughput in GFLOPS and copy bandwidth in
 MB/s, using kernels mirroring the Metal engine so the numbers are comparable.
-Cross-validated on an M4: Metal 2,369 GFLOPS vs OpenCL 2,281.
+Cross-validated on an M4: Metal 2,369 GFLOPS vs OpenCL 2,281. **Every failure
+path still returns `matmul` and `nvidia`** — the two backends fail
+independently, and a discrete card with a working CUDA build and no registered
+ICD is an ordinary machine, not an edge case.
+
+#### `_enumeration_note(error) -> str`
+Turns an OpenCL enumeration failure into something actionable.
+`PLATFORM_NOT_FOUND_KHR` is by far the most common and reads like a hardware
+fault when it is not one: the loader is present, no vendor has registered a
+driver with it, and the GPU is fine. Names the per-platform fix.
+
+#### `torch_matmul(seconds) -> dict`
+Dense N=4096 GEMM at fp32 and fp16 through CUDA, ROCm, XPU or MPS. This is the
+AI-compute figure, and OpenCL cannot reach the matrix hardware that produces
+it. Returns `{"skipped": True, "reason": ...}` when no torch GPU device exists.
 
 #### `nvidia_telemetry() -> list[dict]`
 NVIDIA temperature, power draw, fan, VRAM, and utilisation via `pynvml`. Each

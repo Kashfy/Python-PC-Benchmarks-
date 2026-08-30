@@ -23,18 +23,47 @@ import re
 import subprocess
 import time
 
-# Rough package power (watts) under load, by chip family. Deliberately
-# approximate — only a fallback when nothing can be measured.
-_TDP_ESTIMATES = {
-    r"apple m1\b": 15, r"apple m1 pro": 30, r"apple m1 max": 40,
-    r"apple m1 ultra": 60,
-    r"apple m2\b": 15, r"apple m2 pro": 30, r"apple m2 max": 45,
-    r"apple m3\b": 15, r"apple m3 pro": 30, r"apple m3 max": 45,
-    r"apple m4\b": 18, r"apple m4 pro": 35, r"apple m4 max": 50,
-    r"core i9": 65, r"core i7": 45, r"core i5": 35, r"core i3": 25,
-    r"ryzen 9": 65, r"ryzen 7": 45, r"ryzen 5": 35,
-    r"xeon": 150, r"epyc": 200, r"threadripper": 280,
-}
+# Rough package power (watts) under sustained load, by chip family.
+# Deliberately approximate — only a fallback when nothing can be measured.
+#
+# **Ordered, and the order is the whole design.** The part number's suffix says
+# far more about power than the family name does: a Ryzen 7 7800X3D draws about
+# 120 W and a Ryzen 7 7840U about 28 W, and matching on "ryzen 7" alone put both
+# at 45 W — wrong by nearly 3x on the desktop part. Desktop and mobile suffixes
+# are matched first, and the bare family name is kept only as a last resort for
+# a model string that carries no suffix at all. Intel's strings also had to
+# stop assuming "core i7": /proc/cpuinfo and the Windows registry both report
+# "Core(TM) i7", which the old patterns never matched, so every Intel machine
+# fell through to no estimate at all.
+_TDP_ESTIMATES = [
+    # Apple silicon: no suffixes, the tier is the whole name.
+    (r"apple m\d+ ultra", 60), (r"apple m\d+ max", 48),
+    (r"apple m\d+ pro", 32), (r"apple m\d+", 16),
+    # Server and workstation.
+    (r"threadripper", 280), (r"epyc", 200), (r"xeon", 150),
+    # AMD desktop. X3D parts are capped below the plain X of the same tier.
+    (r"ryzen 9 \d{4}x3d", 145), (r"ryzen 9 \d{4}x", 170),
+    (r"ryzen 7 \d{4}x3d", 120), (r"ryzen 7 \d{4}x", 105),
+    (r"ryzen 5 \d{4}x", 105), (r"ryzen [3579] \d{4}g", 65),
+    # AMD mobile.
+    (r"ryzen \d \d*\w*hx", 75), (r"ryzen \d \d*\w*hs?\b", 45),
+    (r"ryzen \d \d*\w*u\b", 25), (r"ryzen \d \d*\w*e\b", 15),
+    # Intel desktop. The figure is the sustained draw, which on unlocked parts
+    # sits well above the base power they are marketed with.
+    (r"core.*i9-\d+k", 200), (r"core.*i7-\d+k", 150),
+    (r"core.*i5-\d+k", 110), (r"core.*ultra \d \d+k", 150),
+    # Intel mobile, before the desktop catch-all so the suffixes win. G-series
+    # ("i7-1165G7") is Ice Lake and later mobile, where the digit after the G
+    # is the graphics tier rather than a power class.
+    (r"core.*i[3579]-\d+hx", 80), (r"core.*i[3579]-\d+h", 45),
+    (r"core.*i[3579]-\d+[pu]", 25), (r"core.*i[3579]-\d+g\d", 28),
+    (r"core.*ultra \d \d+h", 45), (r"core.*ultra \d \d+[uv]", 20),
+    (r"core.*i[3579]-\d+", 65),
+    # Last resort: a family name with nothing else to go on.
+    (r"ryzen 9", 105), (r"ryzen 7", 65), (r"ryzen [35]", 45),
+    (r"core.*i9", 95), (r"core.*i7", 65), (r"core.*i5", 45),
+    (r"core.*i3", 25),
+]
 
 
 def _run(cmd: list[str], timeout: int = 6) -> tuple[int, str]:
@@ -48,7 +77,7 @@ def _run(cmd: list[str], timeout: int = 6) -> tuple[int, str]:
 
 def estimate_tdp(cpu_model: str) -> int | None:
     model = (cpu_model or "").lower()
-    for pattern, watts in _TDP_ESTIMATES.items():
+    for pattern, watts in _TDP_ESTIMATES:
         if re.search(pattern, model):
             return watts
     return None
@@ -103,6 +132,37 @@ def _rapl_energy_uj() -> int | None:
     return total if found else None
 
 
+def rapl_status() -> str:
+    """Why RAPL is or is not usable: ``ok``, ``permission`` or ``absent``.
+
+    Worth separating, because the two failures need opposite advice and the
+    interface being *present* is the common case. Since the PLATYPUS side
+    channel, every mainstream distribution ships ``energy_uj`` as mode 0400,
+    so an unprivileged run on a machine with perfectly good RAPL support reads
+    nothing — and telling that user their hardware lacks power metering sends
+    them looking for a problem that is not there. AMD chips register under the
+    same ``intel-rapl`` names, so this covers both vendors.
+    """
+    try:
+        entries = [n for n in os.listdir(_RAPL)
+                   if n.startswith("intel-rapl:") and n.count(":") == 1]
+    except OSError:
+        return "absent"
+    if not entries:
+        return "absent"
+    denied = False
+    for name in entries:
+        try:
+            with open(os.path.join(_RAPL, name, "energy_uj")) as f:
+                f.read()
+            return "ok"
+        except PermissionError:
+            denied = True
+        except OSError:
+            pass
+    return "permission" if denied else "absent"
+
+
 def _measure_linux(window_s: float = 0.5) -> dict | None:
     e0 = _rapl_energy_uj()
     if e0 is None:
@@ -149,7 +209,12 @@ def _hint(sysname: str) -> str:
         return ("run with sudo for a real reading: "
                 "sudo python3 benchmark.py")
     if sysname == "Linux":
-        return "real readings need Intel/AMD RAPL (/sys/class/powercap)"
+        if rapl_status() == "permission":
+            return ("RAPL is present but /sys/class/powercap/intel-rapl:*/"
+                    "energy_uj is root-only on this kernel — run with sudo "
+                    "for a measured reading")
+        return ("real readings need Intel/AMD RAPL, which this kernel does "
+                "not expose under /sys/class/powercap")
     return "on-die power metering is not exposed on this platform"
 
 

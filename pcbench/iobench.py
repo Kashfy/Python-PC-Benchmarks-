@@ -177,6 +177,11 @@ def _open_file(path: str, size: int, direct: bool) -> tuple[int, bool]:
 
     On Linux there is nothing to set up front, so the file is written normally
     and then evicted with ``POSIX_FADV_DONTNEED``.
+
+    This descriptor carries the *writes*. Reads go through a per-thread
+    :class:`~pcbench.workloads.DirectReader` instead, because one eviction
+    cannot hold for the length of a job: the file is smaller than RAM and
+    becomes resident again on the first pass over it.
     """
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
 
@@ -233,14 +238,19 @@ def run_job(job: JobSpec, directory: str) -> dict:
         errors: list[str] = []
         payload = os.urandom(job.block_size)
 
+        read_methods: list[str] = []
+
         def worker(slot: int) -> None:
             rnd = random.Random(1000 + slot)
             position = slot % blocks
-            # Windows has no positional read, so the fallback is seek+read on
-            # the file pointer. Sharing one descriptor between threads would
-            # race on that pointer and read from the wrong offset -- silently
-            # wrong rather than an error -- so each reader gets its own.
-            my_fd, owned = wl.open_reader(path, fd)
+            # Each thread gets its own reader: it bypasses the page cache
+            # where the platform allows, and on a platform without positional
+            # reads it is also what keeps the threads off a shared file
+            # pointer, a race that reads the wrong offset silently rather
+            # than raising.
+            reader = wl.DirectReader(path, fd, job.block_size,
+                                     direct=job.direct)
+            read_methods.append(reader.method)
             try:
                 while not stop.is_set():
                     if job.is_random:
@@ -251,12 +261,11 @@ def run_job(job: JobSpec, directory: str) -> dict:
                     is_read = _choose_read(job, rnd)
                     t0 = clock()
                     if is_read:
-                        data = wl.pread(my_fd, job.block_size, offset)
-                        n = len(data)
+                        n = reader.read(offset)
                         read_ops[slot] += 1
                     else:
-                        # The per-thread descriptor is read-only, so writes go
-                        # through the shared one.
+                        # The reader is read-only, so writes go through the
+                        # shared descriptor.
                         n = wl.pwrite(fd, payload, offset)
                         write_ops[slot] += 1
                     latency = (clock() - t0) * 1e6
@@ -267,11 +276,7 @@ def run_job(job: JobSpec, directory: str) -> dict:
             except OSError as e:
                 errors.append(str(e))
             finally:
-                if owned:
-                    try:
-                        os.close(my_fd)
-                    except OSError:
-                        pass
+                reader.close()
 
         threads = [threading.Thread(target=worker, args=(i,), daemon=True)
                    for i in range(job.queue_depth)]
@@ -305,7 +310,6 @@ def run_job(job: JobSpec, directory: str) -> dict:
             "read_ops": sum(read_ops),
             "write_ops": sum(write_ops),
             "elapsed_s": round(elapsed, 3),
-            "cache_bypassed": cache_bypassed,
             "file_mb": size // MB,
         }
         if notice:
@@ -319,10 +323,26 @@ def run_job(job: JobSpec, directory: str) -> dict:
                 "p999": round(_pct(merged, 99.9), 1),
                 "max": round(merged[-1], 1),
             }
-        if not cache_bypassed and job.direct:
-            result["caution"] = (
-                "the OS cache could not be bypassed, so these figures include "
-                "page-cache hits and overstate the device")
+        # Judge the reads on what they measured, not on which flag was set.
+        # A filesystem can accept the bypass and serve from cache anyway --
+        # btrfs with compression and most network mounts do -- and the only
+        # way to tell is that the latency is faster than storage can be.
+        method = read_methods[0] if read_methods else "buffered"
+        ramfs = wl.memory_filesystem(directory)
+        if not job.direct and not ramfs:
+            reads_bypassed = False
+        elif sum(read_ops) or ramfs:
+            reads_bypassed, caution = wl.direct_read_note(
+                method, {"p50_us": result.get("latency_us", {}).get("p50")},
+                ramfs)
+            if not reads_bypassed:
+                result["caution"] = caution
+        else:
+            reads_bypassed = cache_bypassed        # write-only job
+        result["cache_bypassed"] = reads_bypassed
+        result["direct_method"] = method
+        result["memory_filesystem"] = ramfs
+        result["sequential_cache_bypassed"] = cache_bypassed and not ramfs
         if errors:
             result["errors"] = errors[:3]
         return result

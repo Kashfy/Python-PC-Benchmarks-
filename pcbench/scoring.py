@@ -16,6 +16,15 @@ from __future__ import annotations
 import math
 import statistics
 
+#: Bumped whenever a measurement's *method* changes, as distinct from its
+#: baseline. Recorded in every run so the regression check can tell a genuine
+#: hardware change from the tool having started measuring something else, and
+#: refuse to compare across the boundary. See :mod:`pcbench.regression`.
+#:
+#: 2 — random reads bypass the page cache (v11.23); syscall latency is net of
+#:     interpreter overhead and rebaselined from 50 ns to 333 ns.
+METHOD_VERSION = 2
+
 BASELINES = {
     "cpu_int": 2_000_000.0,        # primes/s, single core
     "cpu_float": 3_000_000.0,      # iters/s, single core
@@ -26,7 +35,13 @@ BASELINES = {
     "memory": 6_000.0,             # MB/s copy
     "disk_write": 500.0,           # MB/s
     "disk_read": 1_000.0,          # MB/s
-    "disk_iops": 20_000.0,         # 4 KiB random read ops/s
+    # Two points on one curve, not one number twice: `disk_iops` is queue
+    # depth 1, which is latency-bound and is what an application feels on a
+    # single blocking read, while `disk_iops_peak` is the best depth in the
+    # sweep, which is the device's ceiling. A drive that is good at one and
+    # poor at the other is common, so both are scored, against baselines an
+    # order of magnitude apart because that is how far apart the figures are.
+    "disk_iops": 20_000.0,         # 4 KiB random read ops/s at queue depth 1
     # Accelerators. Absent hardware is simply omitted from the composite
     # rather than scored as zero, so a machine without a GPU or NPU is not
     # punished for lacking one.
@@ -46,10 +61,17 @@ BASELINES = {
     "kmeans": 1_000_000.0,         # point-centroid distances/s
     "knn": 1_000_000.0,            # neighbour comparisons/s
     # System-level and depth-aware measurements.
-    "disk_iops_peak": 100_000.0,   # peak random-read IOPS across queue depths
+    "disk_iops_peak": 100_000.0,   # best random-read IOPS over the depth sweep
     "mem_scaling": 20_000.0,       # peak multi-process copy bandwidth MB/s
     "compile": 300.0,              # compiles per minute
-    "syscall": 20_000_000.0,       # syscalls/s (i.e. 50 ns each)
+    # 333 ns per syscall. The earlier 50 ns was a native-code figure and no
+    # machine could reach it: `bench_syscall_latency` times a real kernel
+    # entry, and on any current OS with speculative-execution mitigations
+    # enabled that costs 250-400 ns. Scoring against 50 ns pinned every
+    # mitigated machine near 15, dragged the SYSTEM category below every
+    # other one, and made "system is the bottleneck" the standard verdict
+    # regardless of the hardware.
+    "syscall": 3_000_000.0,        # syscalls/s (i.e. 333 ns each)
     # Optional-package tiers. Absent packages are omitted from the composite
     # rather than scored as zero.
     "blas_matmul": 100.0,          # GFLOPS fp64 via BLAS
@@ -101,7 +123,7 @@ _SOURCES = [
     ("memory", "memory", "rate"),
     ("disk_write", "disk", "write_rate"),
     ("disk_read", "disk", "read_rate"),
-    ("disk_iops", "disk", "random_read_iops"),
+    ("disk_iops", "disk", "random_read_iops"),   # queue depth 1
     ("gpu_fp32", "gpu_fp32", "rate"),
     ("gpu_fp16", "gpu_fp16", "rate"),
     ("gpu_bandwidth", "gpu_bandwidth", "rate"),
@@ -114,7 +136,7 @@ _SOURCES = [
     ("nn_training", "nn_training", "rate"),
     ("kmeans", "kmeans", "rate"),
     ("knn", "knn", "rate"),
-    ("disk_iops_peak", "disk", "peak_iops"),
+    ("disk_iops_peak", "disk", "peak_iops"),     # best of the depth sweep
     ("mem_scaling", "mem_scaling", "rate"),
     ("compile", "compile", "rate"),
     ("syscall", "latency", "rate"),
@@ -141,10 +163,40 @@ _SOURCES = [
 ]
 
 
+#: Subscores that are only meaningful when the page cache was actually
+#: bypassed, and the field in the disk result that says whether it was.
+#:
+#: A read served from RAM is not a slow measurement of the drive, it is a
+#: measurement of something else entirely — 800,000 IOPS at 1 µs on a drive
+#: that does 17,000 at 59 µs. Scoring it made storage the strongest subsystem
+#: on every machine whose temp directory happened to be a tmpfs. The tool
+#: already omits absent hardware rather than scoring it zero; a measurement
+#: known to be invalid is omitted on the same principle, and the report says
+#: which and why. `disk_write` is exempt because it is timed through `fsync`
+#: and reaches the device regardless.
+CACHE_GATED = {
+    "disk_read": "sequential_cache_bypassed",
+    "disk_iops": "cache_bypassed",
+    "disk_iops_peak": "cache_bypassed",
+}
+
+
+def cache_gated_out(results: dict) -> list[str]:
+    """Subscores dropped because their reads never reached the device."""
+    disk = results.get("disk")
+    if not isinstance(disk, dict) or disk.get("skipped"):
+        return []
+    return [key for key, field in CACHE_GATED.items()
+            if disk.get(field) is False]
+
+
 def compute_scores(results: dict) -> dict:
     """Return ``{"subscores": {...}, "composite": float}`` for a result set."""
     subscores: dict[str, float] = {}
+    dropped = set(cache_gated_out(results))
     for score_key, result_key, field in _SOURCES:
+        if score_key in dropped:
+            continue
         entry = results.get(result_key)
         if not isinstance(entry, dict) or entry.get("skipped"):
             continue
@@ -157,36 +209,45 @@ def compute_scores(results: dict) -> dict:
     if subscores:
         composite = math.exp(
             statistics.fmean(math.log(v) for v in subscores.values()))
-    return {
+    payload = {
         "subscores": {k: round(v, 1) for k, v in subscores.items()},
         "composite": round(composite, 1),
     }
+    if dropped:
+        payload["omitted"] = sorted(dropped)
+    return payload
+
+
+#: Which subscores roll up into each headline category. Exposed rather than
+#: kept local because :mod:`pcbench.diagnose` has to look inside a category to
+#: say *which* measurement made it weak — a category is a geometric mean, and
+#: one bad member drags it down while the rest are fine.
+CATEGORY_GROUPS = {
+    "cpu": ["cpu_int", "cpu_float", "cpu_multi", "compression",
+            "hashing", "json"],
+    "numeric": ["blas_matmul", "fft", "lapack"],
+    "crypto": ["aes", "zstd", "lz4", "blake3"],
+    "memory": ["memory", "mem_scaling"],
+    "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
+    "system": ["compile", "syscall"],
+    "apps": ["sqlite", "raytrace", "image", "logparse", "video"],
+    "standards": ["stream_triad", "coremark_style", "linpack"],
+    "datascience": ["llm_prefill", "llm_decode", "dataloader",
+                    "dataframe"],
+    "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
+            "gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"],
+    "npu": ["npu", "npu_onnx"],
+    "ml": ["nn_training", "kmeans", "knn"],
+    "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu", "npu_onnx",
+           "ml_train", "ml_infer", "nn_training", "kmeans", "knn",
+           "llm_prefill", "llm_decode"],
+}
 
 
 def category_scores(subscores: dict) -> dict:
     """Roll subscores up into CPU / memory / disk headline numbers."""
-    groups = {
-        "cpu": ["cpu_int", "cpu_float", "cpu_multi", "compression",
-                "hashing", "json"],
-        "numeric": ["blas_matmul", "fft", "lapack"],
-        "crypto": ["aes", "zstd", "lz4", "blake3"],
-        "memory": ["memory", "mem_scaling"],
-        "disk": ["disk_write", "disk_read", "disk_iops", "disk_iops_peak"],
-        "system": ["compile", "syscall"],
-        "apps": ["sqlite", "raytrace", "image", "logparse", "video"],
-        "standards": ["stream_triad", "coremark_style", "linpack"],
-        "datascience": ["llm_prefill", "llm_decode", "dataloader",
-                        "dataframe"],
-        "gpu": ["gpu_fp32", "gpu_fp16", "gpu_bandwidth",
-                "gpu_matmul_fp32", "gpu_matmul_fp16", "gpu_opencl"],
-        "npu": ["npu", "npu_onnx"],
-        "ml": ["nn_training", "kmeans", "knn"],
-        "ai": ["gpu_matmul_fp32", "gpu_matmul_fp16", "npu", "npu_onnx",
-               "ml_train", "ml_infer", "nn_training", "kmeans", "knn",
-               "llm_prefill", "llm_decode"],
-    }
     out = {}
-    for name, keys in groups.items():
+    for name, keys in CATEGORY_GROUPS.items():
         vals = [subscores[k] for k in keys if k in subscores and subscores[k] > 0]
         if vals:
             out[name] = round(

@@ -73,7 +73,7 @@ These appear under "CPU features" and explain *why* certain benchmarks are fast.
 | **NVMe** | **N**on-**V**olatile **M**emory **e**xpress | The fast protocol modern SSDs use over PCIe. |
 | **SLC cache** | **S**ingle-**L**evel **C**ell cache | A fast write buffer on consumer SSDs. Once exhausted by a large write, speed drops — which is why a 256 MB disk test scores lower than a 64 MB one. |
 | **fsync** | **f**ile **sync**hronize | A system call forcing buffered writes out to the physical device. Without it, "write speed" only measures writing to RAM. |
-| **F_NOCACHE / O_DIRECT** | — | macOS and Linux flags requesting that file I/O bypass the page cache, so reads measure the drive rather than memory. |
+| **F_NOCACHE / O_DIRECT / FILE_FLAG_NO_BUFFERING** | — | The macOS, Linux and Windows ways of asking that file I/O bypass the page cache, so reads measure the drive rather than memory. A request, not a guarantee: btrfs with `compress=`, ZFS and most network filesystems accept the flag and serve from cache anyway, which is why the result is checked against what storage can physically do. |
 | **PCI / PCIe** | **P**eripheral **C**omponent **I**nterconnect (**e**xpress) | The bus connecting GPUs, SSDs, and NPUs. Devices are identified by PCI vendor and device IDs. |
 
 ---

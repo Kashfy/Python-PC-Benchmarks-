@@ -151,7 +151,7 @@ through it with the arrow keys and prints the command it built. See
 | **Warm-up pass** | Discards the cold-cache, low-clock first iterations before timing. |
 | **Median of repeats** | Resists one-off outliers; reports a stability rating (`excellent`…`unstable`). |
 | **Result validation** | Every workload verifies its own output. A wrong answer means unstable RAM/overclock/cooling — and exits with code 4. |
-| **Cache-bypassed disk I/O** | Uses `F_NOCACHE`/`posix_fadvise` *before* writing, so reads measure the drive, not RAM. Reports whether it succeeded. |
+| **Cache-bypassed disk I/O** | Random reads go through `O_DIRECT`/`F_NOCACHE`/`FILE_FLAG_NO_BUFFERING`, so they measure the drive, not RAM. Checks the latency against physics in case the filesystem accepted the flag and ignored it, and reports whether it held. |
 | **Fail-soft** | One failing probe never aborts the run. |
 
 ## Example
@@ -168,8 +168,8 @@ System Information
   Thermal       : nominal
 
 Benchmark Results
-  CPU Integer (primes)      :      4,437,140 primes/s  (excellent, ±0.8%)
-  CPU Float (math ops)      :     19,847,875 iters/s   (excellent, ±0.3%)
+  CPU Integer (primes)      :      4,437,140 primes/s  (±0.8% run-to-run, excellent stability)
+  CPU Float (math ops)      :     19,847,875 iters/s   (±0.3% run-to-run, excellent stability)
   Compression (zlib)        :           48.0 MB/s
   Hashing (SHA-256)         :          3,207 MB/s
   JSON parse                :          177.2 MB/s
@@ -828,7 +828,7 @@ accept the summary at the end.
 
 ```
 ====================================================================================
-  pcbench 11.22 > Main menu
+  pcbench 11.23 > Main menu
 ====================================================================================
 
   What would you like to do?

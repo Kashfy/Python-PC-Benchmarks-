@@ -136,8 +136,15 @@ def stream_array_mb(cache_bytes: int | None, ram_bytes: int = 0) -> int:
 
 
 def run(seconds: float, repeats: int, script_dir: str,
-        threads: int | None = None, stream_mb: int | None = None) -> dict | None:
+        threads: int | None = None, stream_mb: int | None = None,
+        disk_dir: str | None = None) -> dict | None:
     """Compile if stale, then run the engine and return its parsed JSON.
+
+    ``disk_dir`` is where the engine's disk test writes. It matters: left to
+    its own devices the engine uses the system temp directory, and on most
+    Linux systems /tmp is tmpfs, so the "disk" figures were memory bandwidth.
+    Passing the directory the rest of the tool writes to puts it on the same
+    storage the Python disk test measures, and the two then agree.
 
     Returns None when the source is absent; an ``{"error": ...}`` dict on any
     build or run failure.
@@ -158,6 +165,8 @@ def run(seconds: float, repeats: int, script_dir: str,
         cmd += ["--threads", str(threads)]
     if stream_mb:
         cmd += ["--stream-mb", str(stream_mb)]
+    if disk_dir and os.path.isdir(disk_dir):
+        cmd += ["--disk-dir", os.path.abspath(disk_dir)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=seconds * repeats * 8 + 60)

@@ -231,23 +231,67 @@ Sequential throughput characterizes bulk transfer; **4 KiB random-read IOPS** is
 what actually determines how responsive a machine feels, since real workloads
 are dominated by small scattered reads.
 
-The hard part is preventing the OS from serving reads out of RAM:
+The hard part is preventing the OS from serving reads out of RAM. The two
+phases need different treatment, because eviction and bypass are not the same
+thing:
 
-| Platform | Mechanism | Effective? |
-|----------|-----------|-----------|
-| macOS | `fcntl(fd, F_NOCACHE, 1)` **before writing** | yes |
-| Linux | `posix_fadvise(DONTNEED)` after `fsync` | yes |
-| Windows | none applied | no — reads are an optimistic upper bound |
+**Sequential read** — evicted once, immediately before it runs:
+
+| Platform | Mechanism |
+|----------|-----------|
+| macOS | `fcntl(fd, F_NOCACHE, 1)` **before writing** |
+| Linux | `posix_fadvise(DONTNEED)` after `fsync` |
 
 The ordering on macOS is essential. `F_NOCACHE` stops *new* I/O from populating
 the cache but does not evict pages already there, so enabling it after the
 write would leave the whole file cached. Setting it at creation is the
 difference between measuring the SSD and measuring RAM — concretely, on an
-Apple M4 this moved random reads from an impossible **1,063,411 IOPS** down to
-a realistic **37,994**, and sequential reads from 13,836 MB/s to 3,763 MB/s.
+Apple M4 this moved sequential reads from 13,836 MB/s to 3,763 MB/s.
 
-The result carries `cache_bypassed`, and the console prints a warning when the
-cache could not be bypassed, so an inflated number is never presented as clean.
+**Random read** — a single eviction is not enough, because the sequential read
+just above pulls the entire file straight back into the cache, and a test file
+small enough to be safe for flash wear is far smaller than RAM. Evicting again
+does not help either: the file becomes resident within the first pass over it
+and every read after that is a cache hit. The random phase therefore opens its
+own descriptor that never populates the cache at all (`DirectReader`):
+
+| Platform | Mechanism | Constraint |
+|----------|-----------|-----------|
+| Linux | `O_DIRECT` + `preadv` into an `mmap` buffer | 4 KiB alignment |
+| macOS | `F_NOCACHE` on the descriptor | none |
+| Windows | `CreateFileW(FILE_FLAG_NO_BUFFERING)` via `ctypes` | 4 KiB alignment |
+| fallback | buffered, and disclosed as such | — |
+
+On a Ryzen 7 7800X3D with a Samsung 980 PRO this moved random reads from an
+impossible **802,194 IOPS at 1.07 µs** down to a realistic **16,623 IOPS at
+57.7 µs**, and turned the queue-depth sweep from nonsense (peaking at QD1) into
+the expected curve (17k → 71k → 239k → 271k across QD 1/4/16/32).
+
+**The flag is not taken on trust.** Several filesystems accept `O_DIRECT` and
+then serve the read from cache anyway — btrfs with compression enabled and
+most network filesystems do exactly this — which is indistinguishable from a
+very fast drive unless you check. So the median latency is tested against
+physics: PCIe round trip plus NAND access is tens of microseconds on a good
+NVMe drive and about 6 µs on the fastest Optane part ever sold, so anything
+under 3 µs came from memory and `cache_bypassed` is set to `false` regardless
+of what the flag said.
+
+**And there may be no device at all.** `/tmp` is a tmpfs on most current Linux
+distributions, so any run that fell back to the system temp directory — which
+`--no-save` did — measured RAM through the whole storage section, plausibly
+enough to believe. The test directory's filesystem is now checked against
+`MEMORY_FILESYSTEMS` (`tmpfs`, `ramfs`, `devtmpfs`), `--no-save` prefers the
+working directory over a RAM temp directory, and the native C engine is passed
+the same directory so its disk figures agree with the Python ones instead of
+being 4x higher.
+
+The result carries `cache_bypassed` (the random phase),
+`sequential_cache_bypassed`, `direct_method` naming which mechanism was used,
+and `memory_filesystem`. The console prints the reason whenever bypass did not
+hold, so an inflated number is never presented as clean — and the affected
+subscores are **omitted from the composite** rather than scored, the same way
+absent hardware is. `disk_write` is exempt: it is timed through `fsync` and
+reaches the device regardless.
 
 Writes are timed through `fsync()`, so they reflect data pushed toward the
 device rather than buffered in RAM.
@@ -506,15 +550,26 @@ that was entirely an artifact — larger files exhaust an SSD's SLC write cache,
 so throughput legitimately falls.
 
 The run settings are therefore recorded in the CSV (`cfg_disk_mb`,
-`cfg_mem_mb`), and metrics that depend on them are compared **only against
-prior runs that used the same value**:
+`cfg_mem_mb`), along with a `method_version` recording how the tool measured,
+and metrics that depend on either are compared **only against prior runs that
+match**:
 
 | Metric | Governed by |
 |--------|-------------|
-| Disk write / read / IOPS | `--disk-mb` |
+| Disk write / read / IOPS | `--disk-mb`, `method_version` |
 | Memory bandwidth | `--mem-mb` |
+| Composite score | `method_version` |
 
-Everything else (CPU, ML, hashing, composite) is setting-independent and always
+`method_version` covers what a settings column cannot: the tool itself changing
+how a number is produced. When the random-read test started bypassing the page
+cache (v11.23) the figure fell by more than an order of magnitude on every
+machine — a correction, not a failing drive, and comparing across it would
+report the most severe regression the tool can detect. Bump it whenever a
+measurement's *method* changes, which is a different thing from changing its
+baseline: a baseline change moves the score, a method change moves the
+underlying rate.
+
+Everything else (CPU, ML, hashing) is setting-independent and always
 compared. When no prior run used the same settings, the affected metrics are
 skipped and the report says how many — rather than reporting a false
 regression.
@@ -900,15 +955,32 @@ without failing the suite.
 |---|---:|---|
 | `disk_write` | 500 | MB/s |
 | `disk_read` | 1,000 | MB/s |
-| `disk_iops` | 20,000 | 4 KiB random read ops/s |
-| `disk_iops_peak` | 100,000 | peak random-read IOPS across queue depths |
+| `disk_iops` | 20,000 | 4 KiB random read ops/s **at queue depth 1** |
+| `disk_iops_peak` | 100,000 | best random-read IOPS over the queue-depth sweep |
+
+These are two points on one curve, not one number counted twice. Queue depth 1
+is latency-bound and is what an application feels on a single blocking read;
+the peak is the device's ceiling with requests queued. On the 980 PRO used to
+validate the cache-bypass fix they differ by 16x (17k against 266k), and a
+drive that is good at one and poor at the other is common enough that both are
+worth scoring — hence baselines an order of magnitude apart.
 
 **System / OS**
 
 | Subscore | Baseline (= 100) | Meaning |
 |---|---:|---|
 | `compile` | 300 | compiles per minute |
-| `syscall` | 20,000,000 | syscalls/s (i.e. 50 ns each) |
+| `syscall` | 3,000,000 | syscalls/s (i.e. 333 ns each) |
+
+The syscall baseline was 50 ns until v11.23, which no machine could reach:
+`bench_syscall_latency` times a real kernel entry from Python, and on any
+current OS with speculative-execution mitigations enabled that costs 250-400 ns.
+Scoring against a native-code figure pinned every mitigated machine near 15,
+dragged the **system** category below every other one, and made "system is the
+bottleneck" the standard verdict regardless of the hardware. The measurement
+now also subtracts the empty-loop cost, so it reports the kernel transition
+rather than the kernel transition plus a bytecode dispatch — which matters
+across interpreters, where the loop cost varies several-fold.
 
 **Application workloads**
 
@@ -1030,7 +1102,11 @@ in the report exist to put it in context:
 
 - **Bottleneck analysis** compares categories against this machine's own median,
   answering "what is weak *for this machine*" — which is what decides whether an
-  upgrade would help.
+  upgrade would help. Because a category is a geometric mean, one weak member
+  drags it down while the rest are fine, so when the members disagree by more
+  than 2x the finding names the *member* rather than the category: a machine
+  compiling at four times the baseline with slow syscalls is told its syscalls
+  are slow, not its compiler.
 - **Performance class** places the composite in a named band and checks it
   against the machine's own single-core anchor, so a single run is interpretable
   with no history to compare against.

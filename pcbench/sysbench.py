@@ -134,17 +134,38 @@ def bench_compile(repeats: int = 3) -> dict:
 # --------------------------------------------------------------------------- #
 # OS latency suite
 # --------------------------------------------------------------------------- #
-def bench_syscall_latency(iterations: int = 200_000) -> float:
-    """Nanoseconds per trivial system call.
+def _loop_overhead_ns(iterations: int) -> float:
+    """Nanoseconds per iteration of an empty loop, for subtraction.
 
-    ``os.getpid`` is not cached by CPython, so each call really does enter the
-    kernel. This is the floor for any I/O operation the machine performs.
+    The syscall below is timed from Python, so every measurement carries the
+    interpreter's per-iteration cost — a bytecode dispatch plus a call. On a
+    fast x86 core that is around 25 ns and on a slow ARM board it can be five
+    times that, which would otherwise make an identical kernel look slower on
+    the slower interpreter. Measuring it separately and subtracting leaves the
+    kernel transition, which is the thing being reported.
+    """
+    start = clock()
+    for _ in range(iterations):
+        pass
+    return (clock() - start) / iterations * 1e9
+
+
+def bench_syscall_latency(iterations: int = 200_000) -> float:
+    """Nanoseconds per trivial system call, net of interpreter overhead.
+
+    ``os.getpid`` is not cached by CPython or by modern glibc, so each call
+    really does enter the kernel. This is the floor for any I/O operation the
+    machine performs, and it is where speculative-execution mitigations show
+    up most clearly: they are paid on every kernel entry and exit.
     """
     getpid = os.getpid
     start = clock()
     for _ in range(iterations):
         getpid()
-    return (clock() - start) / iterations * 1e9
+    total = (clock() - start) / iterations * 1e9
+    # Never report a negative or absurdly small figure if the subtraction goes
+    # wrong under a noisy scheduler; the loop can only ever be the smaller part.
+    return max(total * 0.5, total - _loop_overhead_ns(iterations))
 
 
 def bench_context_switch(iterations: int = 20_000) -> float:

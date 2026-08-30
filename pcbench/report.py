@@ -10,7 +10,7 @@ import re
 
 from .core import stability_note
 from .regression import render as regression_render
-from .scoring import category_scores
+from .scoring import METHOD_VERSION, category_scores
 from .sustained import sparkline
 
 WIDTH = 74
@@ -121,7 +121,13 @@ def _metric(results: dict, key: str, label: str, unit: str,
         return
     suffix = f" {unit}"
     if "cv" in r:
-        suffix += f"  ({stability_note(r['cv'])}, ±{r['cv'] * 100:.1f}%)"
+        # "excellent" here has always meant *repeatable*, not *fast*, but
+        # standing alone next to a rate it reads as a verdict on the hardware
+        # — and it sat directly above the "measured under changing conditions"
+        # warning below, which appeared to contradict it. Naming the axis
+        # removes both readings.
+        suffix += (f"  (±{r['cv'] * 100:.1f}% run-to-run, "
+                   f"{stability_note(r['cv'])} stability)")
     if key == "nn_training" and r.get("samples_per_s"):
         suffix = (f" {unit}  ({r['samples_per_s']:,.0f} samples/s, "
                   f"{r.get('mflops', 0):,.0f} MFLOPS)")
@@ -156,6 +162,13 @@ def print_results(results: dict) -> None:
         _row("Core scaling", f"{c['scaling_factor']}x",
              f" on {c['logical_cores']} cores")
         print(f"      {cls.get('note', '')}")
+        # The bar is the *marginal* gain from that worker and the number is the
+        # cumulative rate, which is the informative pairing — a long bar next
+        # to a big number means the core earned its keep, a stub next to a big
+        # number means it added almost nothing. Unlabelled it just looks
+        # broken, since the last row shows the highest rate and a tiny bar.
+        print("      bar = how much that worker added; "
+              "number = total across all workers")
         peak = max(p["marginal_rate"] for p in c["points"]) or 1
         for pt in c["points"]:
             bar = "█" * max(0, int(max(0, pt["marginal_rate"]) / peak * 24))
@@ -221,7 +234,10 @@ def print_results(results: dict) -> None:
                           f"{pt['iops']:>10,.0f} IOPS")
                 print(f"      peak {qd['peak_iops']:,.0f} IOPS at "
                       f"QD{qd['peak_queue_depth']} — {qd['scaling']}x the "
-                      f"queue-depth-1 figure\n")
+                      f"queue-depth-1 figure")
+                if qd.get("note"):
+                    print(f"      ! {qd['note']}")
+                print()
 
             if r.get("total_written_mb"):
                 # Flash wear should never be invisible to the user.
@@ -230,7 +246,7 @@ def print_results(results: dict) -> None:
             if r.get("safety_notice"):
                 print(f"      safety: {r['safety_notice']}")
             if not r.get("cache_bypassed"):
-                print(f"      note: {r['note']}")
+                print(f"      ! {r['note']}")
 
     print_system_bench(results)
 
@@ -384,19 +400,34 @@ def print_crypto(c: dict | None) -> None:
 
 
 def print_opencl(result: dict | None) -> None:
-    """Cross-vendor GPU compute: OpenCL shader throughput and torch matmul."""
+    """Cross-vendor GPU compute: OpenCL shader throughput and torch matmul.
+
+    The two backends fail independently — a machine can have a working CUDA
+    matmul and no OpenCL ICD, or the reverse — so each is rendered only when
+    it actually produced a figure. An earlier version keyed the whole section
+    off ``matmul["skipped"]`` and printed a row of ``None`` placeholders
+    whenever the matmul had not been attempted at all.
+    """
     if not result:
         return
     matmul = result.get("matmul") or {}
-    if not result.get("available") and matmul.get("skipped"):
-        if result.get("note"):
+    devices = result.get("devices") or []
+    nvidia = result.get("nvidia") or []
+    if not isinstance(nvidia, list):
+        nvidia = [nvidia]
+    has_matmul = bool(matmul.get("matmul_fp32_tflops")
+                      or matmul.get("matmul_fp16_tflops"))
+    status = result.get("note") or result.get("error")
+
+    if not devices and not has_matmul and not nvidia:
+        if status:
             hr("GPU compute — cross-vendor")
-            print(f"  {result['note']}")
+            print(f"  {status}")
         return
 
     hr("GPU compute — NVIDIA / AMD / Intel / Apple")
 
-    for device in result.get("devices", []):
+    for device in devices:
         if device.get("error"):
             _row(device.get("name", "?"), "failed", f"  {device['error'][:50]}")
             continue
@@ -410,8 +441,11 @@ def print_opencl(result: dict | None) -> None:
 
     if result.get("selection_note"):
         print(f"      {result['selection_note']}")
+    if not devices and status:
+        # OpenCL produced nothing; say why rather than leaving a blank section.
+        print(f"  {status}")
 
-    if not matmul.get("skipped"):
+    if has_matmul:
         print()
         _row(f"Matmul FP32 ({matmul.get('name', '?')})",
              fmt(matmul.get("matmul_fp32_tflops")), " TFLOPS")
@@ -426,13 +460,11 @@ def print_opencl(result: dict | None) -> None:
     elif matmul.get("reason"):
         _row("Matmul (AI compute)", "skipped", f"  {matmul['reason'][:60]}")
 
-    nvidia = result.get("nvidia")
-    if nvidia:
-        for entry in (nvidia if isinstance(nvidia, list) else [nvidia]):
-            if isinstance(entry, dict) and entry.get("name"):
-                detail = ", ".join(f"{k}={v}" for k, v in entry.items()
-                                   if k != "name")
-                print(f"  {entry['name']}: {detail}")
+    for entry in nvidia:
+        if isinstance(entry, dict) and entry.get("name"):
+            detail = ", ".join(f"{k}={v}" for k, v in entry.items()
+                               if k != "name")
+            print(f"  {entry['name']}: {detail}")
 
 
 def print_npu_onnx(npu: dict | None) -> None:
@@ -661,6 +693,12 @@ def print_scores(scores: dict) -> None:
           f"mean of all {len(scores['subscores'])} subscores above")
     print(f"      (absent hardware is omitted, not scored as zero — see "
           f"docs/technical.md#scoring)")
+    if scores.get("omitted"):
+        # Omitting is the honest option, but silently omitting is not: two
+        # composites are only comparable across the same set of subscores.
+        print(f"      omitted: {', '.join(scores['omitted'])} — those reads "
+              f"were served from the page cache, so they measure memory "
+              f"rather than the drive")
 
 
 def print_apps(results: dict) -> None:
@@ -919,7 +957,8 @@ def save_json(payload: dict, out_dir: str) -> str:
 
 CSV_FIELDS = [
     "timestamp_utc", "tool_version", "hostname", "os", "arch", "arch_family",
-    "cfg_disk_mb", "cfg_mem_mb", "python_version", "python_impl",
+    "cfg_disk_mb", "cfg_mem_mb", "method_version", "python_version",
+    "python_impl",
     "cpu_model", "cores_physical", "cores_logical", "ram_gb", "on_ac_power",
     "cpu_int_primes_s", "cpu_float_iters_s", "cpu_multi_primes_s",
     "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
@@ -992,6 +1031,7 @@ def flatten_row(payload: dict) -> dict:
         "tool_version": payload["version"],
         "cfg_disk_mb": (payload.get("config") or {}).get("disk_mb", ""),
         "cfg_mem_mb": (payload.get("config") or {}).get("mem_mb", ""),
+        "method_version": METHOD_VERSION,
         "python_version": info.get("python_version", ""),
         "python_impl": info.get("python_implementation", ""),
         "hostname": info["hostname"],

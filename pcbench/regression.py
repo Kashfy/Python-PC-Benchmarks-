@@ -33,11 +33,19 @@ DEFAULT_THRESHOLD = 0.10
 # Metrics whose result depends on a run setting. Comparing a 64 MB disk test
 # against a 256 MB one shows a large "regression" that is purely the settings
 # changing — bigger files exhaust an SSD's SLC cache — so each of these is only
-# compared against baseline runs that used the same value.
+# compared against baseline runs that used the same value. A metric may depend
+# on more than one, in which case every one of them has to match.
 _CONFIG_DEPS = {
-    "disk_write_mb_s": "cfg_disk_mb",
-    "disk_read_mb_s": "cfg_disk_mb",
-    "disk_iops": "cfg_disk_mb",
+    # `method_version` covers the case a settings column cannot: the tool
+    # itself changing how a number is produced. When the random-read test
+    # started bypassing the page cache the figure fell by more than an order
+    # of magnitude on every machine — a correction, not a failing drive, and
+    # without this it would be reported as the most severe regression the tool
+    # can detect.
+    "disk_write_mb_s": ("cfg_disk_mb", "method_version"),
+    "disk_read_mb_s": ("cfg_disk_mb", "method_version"),
+    "disk_iops": ("cfg_disk_mb", "method_version"),
+    "composite_score": "method_version",
     "mem_mb_s": "cfg_mem_mb",
     # Several workloads are pure-Python loops, so their result depends on the
     # interpreter as much as the hardware — CPython releases differ by tens of
@@ -89,8 +97,11 @@ def _baseline(history: list[dict], current: dict) -> dict | None:
         candidates = rows
         dep = _CONFIG_DEPS.get(col)
         if dep:
-            want = str(current.get(dep, ""))
-            candidates = [r for r in rows if str(r.get(dep, "")) == want]
+            deps = (dep,) if isinstance(dep, str) else dep
+            candidates = [
+                r for r in rows
+                if all(str(r.get(d, "")) == str(current.get(d, ""))
+                       for d in deps)]
             if not candidates:
                 base["_skipped"].append(col)
                 continue

@@ -12,7 +12,7 @@ primes per second and 500 MB/s are otherwise not on the same axis.
 
 from __future__ import annotations
 
-from .scoring import category_scores
+from .scoring import CATEGORY_GROUPS, category_scores
 
 # A category this far below the machine's own median is called a bottleneck.
 # The comparison is internal on purpose: it answers "what is weak *for this
@@ -57,6 +57,58 @@ _ADVICE = {
     "system": "process creation and compilation are slow, which dominates "
               "build systems and shell-heavy work",
 }
+
+# A category is the geometric mean of its members, so a single weak measurement
+# drags it down while every other member is fine. Naming the category alone
+# then describes the wrong problem: a machine that compiles at four times the
+# baseline and has slow syscalls was being told its compiler was slow. When one
+# member is clearly the culprit, its own advice is reported instead.
+_SUBSCORE_ADVICE = {
+    "compile": "compilation is slow, which dominates build systems",
+    "syscall": "system calls are expensive, which is felt in I/O-heavy and "
+               "shell-heavy work — speculative-execution mitigations are the "
+               "usual cause and are a security trade-off, not a fault",
+    "disk_write": "sequential writes are slow, which shows up in copying, "
+                  "extracting archives, and container image pulls",
+    "disk_read": "sequential reads are slow, which shows up when loading "
+                 "large files",
+    "disk_iops": "small random reads are slow at queue depth 1, which is what "
+                 "application launches and package managers issue",
+    "disk_iops_peak": "the drive stops scaling with queued requests, which "
+                      "limits databases and anything with concurrent I/O",
+    "memory": "memory copy bandwidth is low for this machine",
+    "mem_scaling": "memory bandwidth does not scale across cores, so "
+                   "multi-process work will contend for it",
+    "cpu_int": "single-core integer throughput is the limit",
+    "cpu_multi": "multi-core throughput is the limit",
+    "blas_matmul": "dense linear algebra is slow — check which BLAS is "
+                   "linked, since the reference build is several times slower "
+                   "than OpenBLAS or MKL",
+    "aes": "bulk encryption is slow, which suggests AES is not being done in "
+           "hardware",
+    "stream_triad": "sustained memory bandwidth is the limit",
+}
+
+#: How much better the best member of a category must be than the worst before
+#: the finding is attributed to that one member rather than to the category.
+_SPLIT_RATIO = 2.0
+
+
+def _weakest_member(category: str, subscores: dict) -> tuple[str, float] | None:
+    """The member measurement responsible for a weak category, if there is one.
+
+    Returns ``None`` when the members agree with each other, because then the
+    category really is uniformly weak and its own advice is the right answer.
+    """
+    members = [(k, subscores[k]) for k in CATEGORY_GROUPS.get(category, ())
+               if isinstance(subscores.get(k), (int, float)) and subscores[k] > 0]
+    if len(members) < 2:
+        return None
+    worst = min(members, key=lambda kv: kv[1])
+    best = max(members, key=lambda kv: kv[1])
+    if best[1] < worst[1] * _SPLIT_RATIO:
+        return None
+    return worst
 
 
 def tracks_cpu(category: str, score: float, subscores: dict) -> bool:
@@ -130,6 +182,20 @@ def _impact(category: str, score: float, subscores: dict) -> str:
                 f"throughput, not a separate weakness. Installing NumPy or "
                 f"PyTorch bypasses the interpreter and changes the picture "
                 f"entirely")
+
+    culprit = _weakest_member(category, subscores)
+    if culprit and culprit[0] in _SUBSCORE_ADVICE:
+        key, value = culprit
+        others = [(k, v) for k, v in
+                  ((k, subscores.get(k)) for k in CATEGORY_GROUPS[category])
+                  if isinstance(v, (int, float)) and v > 0 and k != key]
+        detail = ""
+        if others:
+            best = max(others, key=lambda kv: kv[1])
+            detail = (f" — {key} scores {value:.0f} while {best[0]} scores "
+                      f"{best[1]:.0f}, so the category average understates "
+                      f"everything except {key}")
+        return _SUBSCORE_ADVICE[key] + detail
     return _ADVICE.get(category, "")
 
 

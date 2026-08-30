@@ -303,21 +303,71 @@ def nvidia_telemetry() -> list[dict]:
     return out
 
 
+#: What to install when a platform has no OpenCL ICD registered. The runtime
+#: ships with the vendor driver on Windows and with the OS on macOS, so only
+#: Linux normally needs anything installed by hand.
+_ICD_HINTS = {
+    "Linux": ("install an OpenCL ICD loader and your vendor's runtime — "
+              "ocl-icd plus opencl-nvidia, rocm-opencl-runtime or "
+              "intel-compute-runtime"),
+    "Windows": ("reinstall the GPU vendor's display driver, which registers "
+                "the OpenCL runtime"),
+    "Darwin": ("macOS ships OpenCL with the OS; a failure here usually means "
+               "the process is sandboxed away from the GPU"),
+}
+
+
+def _enumeration_note(error: Exception) -> str:
+    """Turn an OpenCL enumeration failure into something actionable.
+
+    ``PLATFORM_NOT_FOUND_KHR`` is by far the most common and reads like a
+    hardware fault when it is not one: the loader is present, no vendor has
+    registered a driver with it, and the GPU is perfectly healthy.
+    """
+    text = str(error)
+    if "PLATFORM_NOT_FOUND" in text or "no platforms" in text.lower():
+        import platform as _platform
+        hint = _ICD_HINTS.get(_platform.system(),
+                              "no OpenCL driver is registered on this system")
+        return (f"no OpenCL platform is registered, so shader throughput "
+                f"could not be measured — {hint}. Any GPU matmul figure below "
+                f"comes from PyTorch and is unaffected")
+    return (f"OpenCL could not enumerate any device ({text[:80]}), so shader "
+            f"throughput was not measured")
+
+
+def _without_opencl(note: str, seconds: float, error: str = "") -> dict:
+    """Result for a run where OpenCL is unusable.
+
+    Every one of these paths still measures the matmul and still collects
+    NVIDIA telemetry: PyTorch reaches a CUDA, ROCm or XPU device without
+    OpenCL's help, and a machine with a working discrete GPU and no OpenCL ICD
+    is common enough — a stock Windows install, a fresh Linux box, any
+    container — that dropping the AI-compute figure there would leave the
+    report silent about the fastest hardware in the machine.
+    """
+    payload = {"available": False, "note": note,
+               "matmul": torch_matmul(min(seconds, 2.0)),
+               "nvidia": nvidia_telemetry()}
+    if error:
+        payload["error"] = error
+    return payload
+
+
 def run(seconds: float = 1.0) -> dict:
     """Benchmark every OpenCL device and collect NVIDIA telemetry."""
     avail = available()
     if not avail["pyopencl"]:
-        # PyTorch alone can still measure a CUDA/ROCm/XPU device, so the
-        # absence of OpenCL is not the end of GPU benchmarking.
-        return {"available": False,
-                "note": "pyopencl not installed — run 'python3 install.py "
-                        "--tier gpu' for cross-platform GPU benchmarking",
-                "matmul": torch_matmul(min(seconds, 2.0)),
-                "nvidia": nvidia_telemetry()}
+        return _without_opencl(
+            "pyopencl not installed — run 'python3 install.py --tier gpu' "
+            "for cross-platform GPU benchmarking", seconds)
     try:
         import pyopencl as cl
     except Exception as e:
-        return {"available": False, "error": f"pyopencl import failed: {e}"}
+        return _without_opencl(
+            "pyopencl is installed but failed to import, so OpenCL shader "
+            "throughput could not be measured", seconds,
+            error=f"pyopencl import failed: {e}")
 
     results = []
     try:
@@ -331,7 +381,8 @@ def run(seconds: float = 1.0) -> dict:
                     results.append({"name": getattr(dev, "name", "?").strip(),
                                     "error": f"{type(e).__name__}: {e}"})
     except Exception as e:
-        return {"available": False, "error": f"OpenCL enumeration failed: {e}"}
+        return _without_opencl(_enumeration_note(e), seconds,
+                               error=f"OpenCL enumeration failed: {e}")
 
     for entry in results:
         entry["vendor"] = entry.get("vendor") or vendor_of(

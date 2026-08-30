@@ -156,15 +156,34 @@ unstable.
 ## Disk read numbers look impossibly high
 
 Check `cache_bypassed` in the JSON, or the console note. When it is `false`
-the read was served from the OS page cache rather than the drive.
+the read was served from the OS page cache rather than the drive. The note
+says which of the two reasons applies: the platform had no mechanism, or it
+had one and the filesystem ignored it.
 
-| Platform | Status |
-|----------|--------|
-| macOS | Bypassed via `F_NOCACHE` |
-| Linux | Bypassed via `posix_fadvise(DONTNEED)` |
-| Windows | **Not bypassed** — reads are an optimistic upper bound |
+| Platform | Random reads | Sequential read |
+|----------|--------------|-----------------|
+| Linux | `O_DIRECT` | `posix_fadvise(DONTNEED)` |
+| macOS | `F_NOCACHE` | `F_NOCACHE` before writing |
+| Windows | `FILE_FLAG_NO_BUFFERING` | not bypassed — an upper bound |
 
-On Windows, or if bypass fails, trust the **write** figure (timed through
+`direct_method` in the JSON names the mechanism that was actually used, and is
+`buffered` when none of them worked.
+
+Note that a bypass flag can be accepted and then ignored. **btrfs with
+`compress=` enabled, ZFS, and most network filesystems** fall back to buffered
+I/O for `O_DIRECT`, so the reads land in RAM with the flag set. The tool
+catches this by checking the median latency against what storage can physically
+do — under 3 µs is memory, not a drive — and marks `cache_bypassed` false. If
+you hit it, run the test against a directory on a filesystem without
+compression (on btrfs, a `chattr +C` directory works) to measure the device.
+
+A third possibility is that there is no drive in the picture at all: check
+`memory_filesystem` in the JSON. `/tmp` is a tmpfs on most current Linux
+distributions, so a run pointed there measures RAM. `--no-save` prefers the
+working directory for this reason; if you passed `--output-dir` or
+`--disk-path` explicitly, point it at real storage.
+
+If bypass fails, trust the **write** figure (timed through
 `fsync`) and treat reads as a floor. Increasing `--disk-mb` well beyond RAM
 helps:
 

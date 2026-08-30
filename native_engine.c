@@ -580,6 +580,13 @@ static double pointer_chase_ns(size_t bytes, double seconds) {
 }
 
 /* --------------------------- Disk -------------------------------------- */
+/* Where the disk test writes. Empty means "the system temp directory", which
+ * is what this used to do unconditionally -- and on most Linux systems /tmp is
+ * tmpfs, so the whole test wrote to RAM and reported memory bandwidth as
+ * storage throughput. The Python side passes the same directory the rest of
+ * the tool writes to, which is on real storage. */
+static const char *g_disk_dir = "";
+
 static void run_disk(int file_mb, double *out_write, double *out_read) {
     size_t chunk = 4 * (size_t)MB;
     long n_chunks = (long)(((size_t)file_mb * MB) / chunk);
@@ -591,9 +598,10 @@ static void run_disk(int file_mb, double *out_write, double *out_read) {
      * RAM, not storage, and filling it can destabilize the whole system. */
 #if defined(_WIN32)
     char probe[MAX_PATH];
-    GetTempPathA(MAX_PATH, probe);
+    if (g_disk_dir[0]) snprintf(probe, sizeof(probe), "%s", g_disk_dir);
+    else GetTempPathA(MAX_PATH, probe);
 #else
-    const char *probe = "/tmp";
+    const char *probe = g_disk_dir[0] ? g_disk_dir : "/tmp";
 #endif
     unsigned long long freeb = free_disk_bytes(probe);
     if (freeb && (double)total * DISK_HEADROOM > (double)freeb) {
@@ -603,12 +611,24 @@ static void run_disk(int file_mb, double *out_write, double *out_read) {
 
     char *buf = (char *)malloc(chunk);
     if (!buf) { *out_write = *out_read = 0.0; return; }
-    memset(buf, 'X', chunk);
+    /* Incompressible. A buffer of one repeated byte costs nothing to store on
+     * anything that compresses -- btrfs with compress=, ZFS, NTFS compression,
+     * and the inline compression in many SSD controllers -- so the write never
+     * reaches the medium at the rate being reported. A cheap xorshift fill is
+     * enough: it need not be cryptographic, only incompressible. */
+    {
+        unsigned long long x = 0x9E3779B97F4A7C15ULL;
+        for (size_t i = 0; i < chunk; ++i) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            buf[i] = (char)(x & 0xFF);
+        }
+    }
 
     char path[512];
 #if defined(_WIN32)
     char tmpdir[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpdir);
+    if (g_disk_dir[0]) snprintf(tmpdir, sizeof(tmpdir), "%s\\", g_disk_dir);
+    else GetTempPathA(MAX_PATH, tmpdir);
     snprintf(path, sizeof(path), "%snative_bench_%lu.bin",
              tmpdir, (unsigned long)GetCurrentProcessId());
     FILE *f = fopen(path, "wb");
@@ -628,7 +648,8 @@ static void run_disk(int file_mb, double *out_write, double *out_read) {
     *out_read = (double)got / (now_seconds() - t0) / (double)MB;
     remove(path);
 #else
-    strcpy(path, "/tmp/native_bench_XXXXXX");
+    snprintf(path, sizeof(path), "%s/native_bench_XXXXXX",
+             g_disk_dir[0] ? g_disk_dir : "/tmp");
     int fd = mkstemp(path);
     if (fd == -1) { free(buf); *out_write = *out_read = 0.0; return; }
   #if defined(__APPLE__)
@@ -747,7 +768,8 @@ static void print_json(Res *r, int n, double *lat,
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s [--json] [--seconds N] [--repeats M] [--threads T]\n"
-            "          [--mem-mb K] [--disk-mb K] [--stream-mb K]\n"
+            "          [--mem-mb K] [--disk-mb K] [--disk-dir PATH]\n"
+            "          [--stream-mb K]\n"
             "          [--no-standards]\n", prog);
 }
 
@@ -764,6 +786,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--mem-mb")  && i + 1 < argc) mem_mb  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--disk-mb") && i + 1 < argc) disk_mb = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--disk-dir") && i + 1 < argc) g_disk_dir = argv[++i];
         else if (!strcmp(argv[i], "--stream-mb") && i + 1 < argc) stream_mb = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-standards")) no_standards = 1;
         else { usage(argv[0]); return 1; }
