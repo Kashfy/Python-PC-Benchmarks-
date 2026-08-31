@@ -138,9 +138,9 @@ pip install -e .
 pcbench --quick
 ```
 
-Not sure what to ask for? Add `--menu` to either command — it walks you
-through it with the arrow keys and prints the command it built. See
-[choosing what to run](#choosing-what-to-run).
+Not sure what to ask for? Run `pcbench` with no arguments — it opens the
+guided menu, walks you through it with the arrow keys, and prints the command
+it built. See [choosing what to run](#choosing-what-to-run).
 
 ## What makes it reliable
 
@@ -807,14 +807,24 @@ otherwise, so a fleet check can gate on it.
 ## Choosing what to run
 
 Twenty-two tests, thirteen profiles and twelve stats sections is a lot to read
-before a first run, so there is a guided setup that asks instead. Any of these
-starts it — use the first if you have not installed anything:
+before a first run, so there is a guided setup that asks instead. **It is what
+you get by running the tool with no arguments at a terminal** — use the first
+if you have not installed anything:
 
 ```bash
-python3 benchmark.py --menu     # straight from a checkout, no install needed
-python3 -m pcbench --menu       # the same thing, as a module
-pcbench --menu                  # after `pip install -e .`
+python3 benchmark.py            # straight from a checkout, no install needed
+python3 -m pcbench              # the same thing, as a module
+pcbench                         # after `pip install -e .`
 ```
+
+`--menu` still asks for it explicitly, which is what you want when other flags
+are present or when the input is piped. Going the other way, `--no-menu` runs
+the default benchmark without asking, and so does `PCBENCH_NO_MENU=1`.
+
+The menu is only the default when there is someone to answer it: with stdin or
+stdout redirected — a pipe, a cron job, a container build, CI — a bare
+`pcbench` runs the benchmark exactly as it always did, so nothing that scripts
+this tool has to change.
 
 Run it in the terminal directly. Piping or redirecting it (`| less`,
 `> out.txt`) drops the arrow-key interface and falls back to typed answers,
@@ -1403,11 +1413,13 @@ exactly the false precision worth avoiding.
 |------|---------|---------|
 | `--stats [a,b]` | — | Report hardware facts and exit; no benchmark runs. Omit the list for every section |
 | `--list-stats` | — | List the available `--stats` sections, then exit |
-| `--menu` | off | [Guided setup](#choosing-what-to-run) driven by the arrow keys; builds a command line, shows it, then runs it |
+| `--menu` | on when bare + interactive | [Guided setup](#choosing-what-to-run) driven by the arrow keys; builds a command line, shows it, then runs it. Opens by default when `pcbench` is run with no arguments at a terminal |
+| `--no-menu` | off | Run the default benchmark instead of opening that menu |
 
 Sections for `--stats`: `cpu`, `memory`, `storage`, `drives`, `battery`,
 `gpu`, `thermal`, `power`, `os`, `environment`, `numa`, `packages`.
-`PCBENCH_NO_TUI=1` makes `--menu` use typed answers instead of the arrow keys.
+`PCBENCH_NO_TUI=1` makes `--menu` use typed answers instead of the arrow
+keys. `PCBENCH_NO_MENU=1` stops a bare `pcbench` opening it at all.
 
 **Analysis depth**
 

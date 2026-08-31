@@ -2459,6 +2459,57 @@ class TestAcceleratorNoticePointsSomewhereReal(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestMenuIsTheDefault(unittest.TestCase):
+    """A bare `pcbench` at a terminal opens the menu; nothing else does."""
+
+    def _args(self, argv):
+        return cli.build_parser().parse_args(argv)
+
+    def _wants(self, cli_argv, argv=None, tty=True, env=None):
+        import unittest.mock as mock
+        with mock.patch.object(cli.sys, "argv", ["pcbench"] + cli_argv), \
+                mock.patch.object(cli, "_interactive", lambda: tty), \
+                mock.patch.dict(cli.os.environ, env or {}, clear=False):
+            return cli.wants_menu(self._args(cli_argv), argv)
+
+    def test_bare_interactive_run_opens_the_menu(self):
+        self.assertTrue(self._wants([]))
+
+    def test_a_pipe_or_cron_job_still_runs_the_benchmark(self):
+        # A bare `pcbench` in CI must not stop at a prompt nobody can answer.
+        self.assertFalse(self._wants([], tty=False))
+
+    def test_anything_typed_is_taken_at_its_word(self):
+        self.assertFalse(self._wants(["--quick"]))
+
+    def test_no_menu_forces_the_benchmark(self):
+        self.assertFalse(self._wants(["--no-menu"]))
+
+    def test_menu_wins_even_without_a_terminal(self):
+        # Explicitly asking keeps working over a pipe, which is what makes
+        # the menu scriptable: printf '2\n...' | pcbench --menu
+        self.assertTrue(self._wants(["--menu"], tty=False))
+
+    def test_env_var_opts_out(self):
+        self.assertFalse(self._wants([], env={"PCBENCH_NO_MENU": "1"}))
+        self.assertTrue(self._wants([], env={"PCBENCH_NO_MENU": "0"}))
+        self.assertTrue(self._wants([], env={"PCBENCH_NO_MENU": ""}))
+
+    def test_the_wizard_recursion_can_never_reopen_the_menu(self):
+        # wizard.run() hands main() a list, and the "default suite" screen
+        # hands back an empty one. Keying the default on argv-is-None is what
+        # stops that from looping forever.
+        for handed_back in ([], ["--quick"], ["--checkup"]):
+            self.assertFalse(self._wants([], argv=handed_back), handed_back)
+
+    def test_the_default_suite_screen_really_can_return_empty(self):
+        # The loop above is only worth guarding because this is reachable.
+        import inspect
+        source = inspect.getsource(wizard._bench_kind)
+        self.assertIn("select=[]", source)
+
+
+# --------------------------------------------------------------------------- #
 class TestConfigFile(unittest.TestCase):
     def _parse(self, argv):
         parser = cli.build_parser()

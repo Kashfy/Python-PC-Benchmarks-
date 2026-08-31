@@ -289,7 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Guided setup, driven by the arrow keys: choose a "
                         "benchmark, a stats section, a monitor or a "
                         "comparison one screen at a time, then confirm the "
-                        "command it builds")
+                        "command it builds. Opens by default when pcbench is "
+                        "run with no arguments at a terminal")
+    g.add_argument("--no-menu", action="store_true",
+                   help="Run the default benchmark instead of opening the "
+                        "menu (only meaningful on a bare interactive run)")
 
     g = p.add_argument_group("diagnosis")
     g.add_argument("--checkup", action="store_true",
@@ -452,6 +456,37 @@ def _runners(args, info, disk_dir) -> dict:
         "logparse": lambda: apps_mod.bench_logparse(s, r),
         "video": lambda: apps_mod.bench_video(s, disk_dir),
     }
+
+
+def _interactive() -> bool:
+    """Whether there is a person at a terminal to answer the menu."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):    # closed or replaced streams
+        return False
+
+
+def wants_menu(args, argv) -> bool:
+    """Whether this invocation should open the guided menu.
+
+    A bare ``pcbench`` opens it. Someone who typed nothing has not said what
+    they want, and the menu asks in four screens what the flag list documents
+    in several hundred lines. Anything typed is taken at its word.
+
+    Two things must never trigger it. A non-interactive stdin keeps the
+    benchmark, because a bare ``pcbench`` in a cron job, a container build or
+    a pipe must not stop at a prompt nobody is there to answer. And only a
+    real command line counts: ``argv is None`` is what separates one from the
+    wizard's own recursion, which hands back a list -- an empty one for the
+    "default suite" screen, which would otherwise reopen the menu forever.
+    """
+    if args.menu:
+        return True
+    if args.no_menu or argv is not None or sys.argv[1:]:
+        return False
+    if os.environ.get("PCBENCH_NO_MENU", "").strip() not in ("", "0"):
+        return False
+    return _interactive()
 
 
 def accel_enabled(args, device: str) -> bool:
@@ -642,7 +677,7 @@ def main(argv=None) -> int:
             print(hwinfo.render(data, _repo_root()))
         return 0
 
-    if args.menu:
+    if wants_menu(args, argv):
         # The menu assembles a fresh command line, so anything typed beside
         # --menu is discarded. Say so rather than appearing to ignore it.
         typed = [a for a in (argv if argv is not None else sys.argv[1:])
