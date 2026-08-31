@@ -77,6 +77,43 @@ MIN_RUNS_FOR_SPREAD = 3
 SPREAD_MULTIPLIER = 3.0
 
 
+#: CSV columns that carry a benchmark measurement. A test that did not run
+#: leaves its column empty, so the set of populated ones stands in for the
+#: test selection -- which is not recorded as a column of its own.
+_MEASUREMENT_COLUMNS = (
+    "cpu_int_primes_s", "cpu_float_iters_s", "cpu_multi_primes_s",
+    "compression_mb_s", "hashing_mb_s", "json_mb_s", "mem_mb_s",
+    "disk_write_mb_s", "disk_read_mb_s", "disk_iops",
+    "gpu_fp32_gflops", "gpu_fp16_gflops", "gpu_bandwidth_mb_s",
+    "gpu_matmul_fp32_tflops", "gpu_matmul_fp16_tflops",
+    "npu_gflops", "npu_onnx_gflops",
+    "ml_train_samples_s", "ml_infer_samples_s",
+    "nn_train_steps_s", "kmeans_dist_s", "knn_cmp_s",
+    "sqlite_txn_s", "fsync_commits_s", "raytrace_fps", "image_mp_s",
+    "logparse_mb_s", "video_fps",
+    "stream_triad_mb_s", "coremark_style_iter_s", "linpack_gflops",
+    "llm_prefill_tok_s", "llm_decode_tok_s", "dataloader_samples_s",
+    "dataframe_ops_s", "net_loopback_mb_s",
+)
+
+#: Metrics whose comparability depends on *which other tests ran*, rather than
+#: on any recorded setting. The composite is a geometric mean over whatever
+#: subscores a run produced, so `--only cpu_multi,memory` and a full run yield
+#: two numbers that share a name and do not measure the same thing: comparing
+#: them reports a large regression that is purely the selection changing.
+_SELECTION_DEPS = frozenset({"composite_score"})
+
+
+def _selection(row: dict) -> frozenset:
+    """Which measurements a run actually produced.
+
+    Deliberately strict: any difference in the populated set skips the
+    comparison. That errs toward making no claim rather than a wrong one,
+    which is the right direction for a number a regression gate can act on.
+    """
+    return frozenset(c for c in _MEASUREMENT_COLUMNS if _to_float(row.get(c)))
+
+
 def _baseline(history: list[dict], current: dict) -> dict | None:
     """Median of each metric across this host's comparable prior runs.
 
@@ -102,6 +139,12 @@ def _baseline(history: list[dict], current: dict) -> dict | None:
                 r for r in rows
                 if all(str(r.get(d, "")) == str(current.get(d, ""))
                        for d in deps)]
+            if not candidates:
+                base["_skipped"].append(col)
+                continue
+        if col in _SELECTION_DEPS:
+            want = _selection(current)
+            candidates = [r for r in candidates if _selection(r) == want]
             if not candidates:
                 base["_skipped"].append(col)
                 continue
@@ -222,8 +265,12 @@ def render(result: dict) -> str:
         mark = "▼" if f["direction"] == "slower" else "▲"
         note = ""
         if f.get("confidence") == "within normal variation":
-            note = (f"   (within this metric's normal ±"
-                    f"{f.get('typical_spread_pct', 0):.0f}% spread)")
+            # Printing the spread alone read as a contradiction: "-25.5%
+            # (within this metric's normal ±10% spread)". The gate is
+            # SPREAD_MULTIPLIER times the spread, so name that too.
+            spread = f.get("typical_spread_pct", 0)
+            note = (f"   (typical spread ±{spread:.0f}%; flagged past "
+                    f"±{spread * SPREAD_MULTIPLIER:.0f}%)")
         elif f.get("confidence") == "provisional":
             note = f"   (provisional — only {f.get('prior_runs', 0)} prior run)"
         lines.append(f"    {mark} {f['metric']:<20} {f['change_pct']:+.1f}%  "

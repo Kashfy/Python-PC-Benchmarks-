@@ -2578,6 +2578,72 @@ class TestDataScienceTokenFlagsAreWired(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestCompositeIsOnlyComparedLikeForLike(unittest.TestCase):
+    """The composite is a geometric mean over whatever subscores ran.
+
+    A --only run and a full run produce two numbers that share a name and
+    measure different things; comparing them reported a large regression that
+    was purely the selection changing.
+    """
+
+    def _row(self, ts, composite, **metrics):
+        row = {"hostname": "h", "timestamp_utc": ts, "method_version": "1",
+               "python_version": "3.14", "composite_score": composite}
+        row.update(metrics)
+        return row
+
+    FULL = dict(cpu_int_primes_s=100, cpu_multi_primes_s=100, mem_mb_s=100,
+                disk_read_mb_s=100)
+    SUBSET = dict(cpu_multi_primes_s=100, mem_mb_s=100)
+
+    def test_a_subset_run_does_not_compare_against_full_runs(self):
+        hist = [self._row(f"t{i}", 322, **self.FULL) for i in range(4)]
+        cur = self._row("now", 240, **self.SUBSET)
+        res = regression.analyze(cur, hist, 0.10)
+        self.assertIn("composite_score", res["skipped_metrics"])
+        self.assertNotIn("Composite",
+                         [f["metric"] for f in res["findings"]])
+
+    def test_matching_selections_still_compare(self):
+        hist = [self._row(f"t{i}", 322, **self.FULL) for i in range(4)]
+        cur = self._row("now", 240, **self.FULL)
+        res = regression.analyze(cur, hist, 0.10)
+        self.assertNotIn("composite_score", res["skipped_metrics"])
+        self.assertIn("Composite score",
+                      [f["metric"] for f in res["findings"]])
+
+    def test_selection_ignores_settings_and_inventory_columns(self):
+        a = self._row("a", 1, **self.FULL)
+        b = dict(self._row("b", 1, **self.FULL), cpu_model="something else",
+                 ram_gb=999, on_ac_power="no")
+        self.assertEqual(regression._selection(a), regression._selection(b))
+
+    def test_an_empty_column_is_not_part_of_the_selection(self):
+        a = self._row("a", 1, cpu_multi_primes_s=100, disk_read_mb_s="")
+        b = self._row("b", 1, cpu_multi_primes_s=100)
+        self.assertEqual(regression._selection(a), regression._selection(b))
+
+
+# --------------------------------------------------------------------------- #
+class TestSpreadNoteNamesTheGate(unittest.TestCase):
+    """"-25.5% (within this metric's normal +/-10% spread)" read as a
+    contradiction: the gate is SPREAD_MULTIPLIER times the spread, and the
+    text named only the spread."""
+
+    def test_the_note_gives_both_the_spread_and_the_threshold(self):
+        hist = [{"hostname": "h", "timestamp_utc": f"t{i}",
+                 "method_version": "1", "python_version": "3.14",
+                 "cpu_multi_primes_s": v}
+                for i, v in enumerate([100, 118, 84, 112, 90])]
+        cur = {"hostname": "h", "timestamp_utc": "now", "method_version": "1",
+               "python_version": "3.14", "cpu_multi_primes_s": 88}
+        text = regression.render(regression.analyze(cur, hist, 0.05))
+        self.assertIn("typical spread", text)
+        self.assertIn("flagged past", text)
+        self.assertNotIn("within this metric's normal", text)
+
+
+# --------------------------------------------------------------------------- #
 class TestConfigFile(unittest.TestCase):
     def _parse(self, argv):
         parser = cli.build_parser()
