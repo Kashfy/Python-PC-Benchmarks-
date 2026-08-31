@@ -2397,6 +2397,68 @@ class TestGates(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestAcceleratorGating(unittest.TestCase):
+    """``--no-accel`` is the blanket opt-out and must gate every device.
+
+    The OpenCL block once tested ``--no-gpu`` alone, so ``--no-accel`` skipped
+    the NPU and the Apple engine while still running GPU compute -- a run that
+    reported GPU numbers the flag promised not to collect.
+    """
+
+    def _args(self, argv):
+        return cli.build_parser().parse_args(argv)
+
+    def test_no_accel_disables_every_device(self):
+        args = self._args(["--no-accel"])
+        for device in ("gpu", "npu"):
+            self.assertFalse(cli.accel_enabled(args, device), device)
+
+    def test_a_bare_run_enables_every_device(self):
+        args = self._args([])
+        for device in ("gpu", "npu"):
+            self.assertTrue(cli.accel_enabled(args, device), device)
+
+    def test_per_device_flags_do_not_affect_each_other(self):
+        args = self._args(["--no-gpu"])
+        self.assertFalse(cli.accel_enabled(args, "gpu"))
+        self.assertTrue(cli.accel_enabled(args, "npu"))
+
+        args = self._args(["--no-npu"])
+        self.assertTrue(cli.accel_enabled(args, "gpu"))
+        self.assertFalse(cli.accel_enabled(args, "npu"))
+
+    def test_no_accel_wins_over_an_enabled_device(self):
+        # --no-accel and no per-device flag is the combination the run used.
+        args = self._args(["--no-accel"])
+        self.assertFalse(args.no_gpu)          # the narrow flag is untouched
+        self.assertFalse(cli.accel_enabled(args, "gpu"))
+
+
+# --------------------------------------------------------------------------- #
+class TestAcceleratorNoticePointsSomewhereReal(unittest.TestCase):
+    """The non-Apple notice must not cite a section the run skipped."""
+
+    INV = {"gpus": [{"name": "NVIDIA GeForce RTX 5070 Ti"}],
+           "npus": [], "benchmark_supported": False}
+
+    def _render(self, **kw):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report.print_accelerators(self.INV, None, **kw)
+        return buf.getvalue()
+
+    def test_points_at_the_section_when_it_runs(self):
+        self.assertIn("GPU compute section below", self._render())
+
+    def test_says_skipped_when_there_is_no_section(self):
+        text = self._render(gpu_section=False)
+        self.assertNotIn("section below", text)
+        self.assertIn("skipped", text)
+
+
+# --------------------------------------------------------------------------- #
 class TestConfigFile(unittest.TestCase):
     def _parse(self, argv):
         parser = cli.build_parser()

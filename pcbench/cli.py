@@ -454,6 +454,18 @@ def _runners(args, info, disk_dir) -> dict:
     }
 
 
+def accel_enabled(args, device: str) -> bool:
+    """Whether the ``device`` accelerator benchmark should run.
+
+    ``--no-accel`` is the blanket opt-out, so it has to gate *every*
+    accelerator section; the per-device flags only narrow it further. The
+    OpenCL block tested ``--no-gpu`` alone, which left ``--no-accel`` skipping
+    the NPU and the Apple engine while still running GPU compute -- the
+    opposite of what its help text promises.
+    """
+    return not args.no_accel and not getattr(args, f"no_{device}")
+
+
 def _scratch_dir() -> str:
     """A writable directory for test files, on real storage where possible.
 
@@ -1020,7 +1032,7 @@ def main(argv=None) -> int:
             for key, value in cryptobench.extract_rates(crypto_result).items():
                 results[key] = {"rate": value}
 
-        if not args.no_gpu and gpucompute.available()["pyopencl"]:
+        if accel_enabled(args, "gpu") and gpucompute.available()["pyopencl"]:
             if not quiet:
                 print("  running OpenCL GPU compute ...", flush=True)
             opencl_result = gpucompute.run(min(args.seconds, 1.5))
@@ -1029,7 +1041,7 @@ def main(argv=None) -> int:
 
     # Cross-vendor NPU via ONNX Runtime (Intel / AMD / Qualcomm / DirectML).
     npu_result = None
-    if not args.no_accel and not args.no_npu:
+    if accel_enabled(args, "npu"):
         if npu_mod.detect().get("available"):
             if not quiet:
                 print("  running ONNX Runtime NPU benchmark ...", flush=True)

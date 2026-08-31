@@ -293,7 +293,8 @@ def print_native(native: dict | None) -> None:
             print(f"    {p['label']:>7}  {p['ns']:>8.2f} ns")
 
 
-def print_accelerators(inv: dict | None, accel: dict | None) -> None:
+def print_accelerators(inv: dict | None, accel: dict | None,
+                       gpu_section: bool = True) -> None:
     """Render GPU/NPU inventory and, where available, their benchmarks."""
     if not inv and not accel:
         return
@@ -333,9 +334,15 @@ def print_accelerators(inv: dict | None, accel: dict | None) -> None:
             # This used to claim compute benchmarking was "Apple-only", which
             # was printed directly above an OpenCL section that had just
             # benchmarked two GPUs. Metal is Apple-only; GPU compute is not.
+            # Only point at the GPU compute section when there is one:
+            # --no-accel prints this inventory and then skips that section,
+            # so the pointer sent the reader looking for output that the
+            # flag had deliberately suppressed.
+            tail = ("— see the GPU compute section below." if gpu_section
+                    else "— skipped in this run.")
             print("\n  Apple's Metal / Core ML engine is not available here; "
                   "NVIDIA, AMD and Intel GPUs are benchmarked through OpenCL "
-                  "and PyTorch — see the GPU compute section below.")
+                  f"and PyTorch {tail}")
         return
 
     print()
@@ -901,7 +908,8 @@ def print_report(payload: dict) -> None:
     print_results(payload["results"])
     print_apps(payload["results"])
     print_native(payload.get("native"))
-    print_accelerators(payload.get("accelerators"), payload.get("accel"))
+    print_accelerators(payload.get("accelerators"), payload.get("accel"),
+                       gpu_section=bool(payload.get("opencl")))
     print_numeric(payload.get("numeric"))
     print_crypto(payload.get("crypto"))
     print_opencl(payload.get("opencl"))
