@@ -458,6 +458,46 @@ def _runners(args, info, disk_dir) -> dict:
     }
 
 
+#: Flags that only do something inside a particular mode, as
+#: ``(mode flag, mode dest, scoped dests)``. Passing one outside its mode is
+#: not fatal -- a config file or a shell alias can carry it harmlessly -- but
+#: it must not look like it was honoured.
+_MODE_ONLY = (
+    ("--monitor", "monitor",
+     ("monitor_interval", "monitor_power", "monitor_trace")),
+    ("--soak", "soak", ("soak_workers",)),
+    ("--sustained", "sustained", ("sustained_window", "sustained_workers")),
+    ("--checkup", "checkup", ("no_measure",)),
+    ("--compare-runs", "compare_runs", ("alpha",)),
+    ("--internet", "internet",
+     ("internet_seconds", "internet_max_mb", "internet_server")),
+)
+
+
+def ignored_flags(parser, args) -> list[tuple[str, str]]:
+    """Mode-scoped flags that were set but cannot take effect here.
+
+    A flag that quietly does nothing is worse than one that errors: the run
+    finishes, the output looks right, and the value simply did not apply.
+    --monitor-trace is the clearest case -- it names a file that a benchmark
+    run never writes, because only monitor mode reads it, and monitor mode
+    replaces the benchmark rather than instrumenting it.
+
+    Returns ``(flag, mode)`` pairs so the caller can say which flag needed
+    which mode, in the same shape as the note --menu already prints for the
+    arguments it discards.
+    """
+    defaults = {a.dest: a.default for a in parser._actions}
+    out = []
+    for mode_flag, mode_dest, scoped in _MODE_ONLY:
+        if getattr(args, mode_dest, None):
+            continue
+        for dest in scoped:
+            if getattr(args, dest, None) != defaults.get(dest):
+                out.append((f"--{dest.replace('_', '-')}", mode_flag))
+    return out
+
+
 def _interactive() -> bool:
     """Whether there is a person at a terminal to answer the menu."""
     try:
@@ -654,6 +694,13 @@ def main(argv=None) -> int:
         except config_mod.ConfigError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
+
+    # A flag that cannot take effect has to say so. On stderr and before
+    # anything runs, so it survives --json-stdout and appears above the
+    # output rather than buried under a screen of results.
+    for flag, mode in ignored_flags(parser, args):
+        print(f"  note: {flag} only applies with {mode}, so it will not be "
+              f"used.", file=sys.stderr)
 
     if args.list_stats:
         print("Hardware stats sections (--stats a,b,c; omit for all):\n")
@@ -1129,7 +1176,9 @@ def main(argv=None) -> int:
             memory_bytes=(confinement.get("effective_ram_bytes")
                           or info.get("ram_total_bytes", 0)),
             seconds=args.seconds,
-            skip_dataframes=args.no_dataframes)
+            skip_dataframes=args.no_dataframes,
+            prefill_tokens=args.ds_prefill_tokens,
+            decode_tokens=args.ds_decode_tokens)
         for key, value in ds_mod.extract_rates(datascience_result).items():
             results[key] = {"rate": value}
 

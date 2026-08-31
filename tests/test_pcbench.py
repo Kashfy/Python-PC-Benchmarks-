@@ -2510,6 +2510,74 @@ class TestMenuIsTheDefault(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+class TestFlagsThatCannotTakeEffectSaySo(unittest.TestCase):
+    """A flag that quietly does nothing is worse than one that errors."""
+
+    def _ignored(self, argv):
+        parser = cli.build_parser()
+        return dict(cli.ignored_flags(parser, parser.parse_args(argv)))
+
+    def test_monitor_flags_outside_monitor_mode_are_reported(self):
+        # The case that started this: --monitor-trace names a file a
+        # benchmark run never writes, because only monitor mode reads it.
+        got = self._ignored(["--monitor-power", "--monitor-trace", "t.json"])
+        self.assertEqual(got, {"--monitor-power": "--monitor",
+                               "--monitor-trace": "--monitor"})
+
+    def test_the_same_flags_inside_monitor_mode_are_silent(self):
+        self.assertEqual(
+            self._ignored(["--monitor", "5", "--monitor-power"]), {})
+
+    def test_defaults_are_never_reported(self):
+        # Only a value the user actually changed is worth a note.
+        self.assertEqual(self._ignored([]), {})
+        self.assertEqual(self._ignored(["--quick"]), {})
+
+    def test_every_scoped_mode_is_covered(self):
+        cases = {
+            "--soak-workers": (["--soak-workers", "4"], "--soak"),
+            "--sustained-window": (["--sustained-window", "9"],
+                                   "--sustained"),   # 5.0 is the default
+            "--no-measure": (["--no-measure"], "--checkup"),
+            "--alpha": (["--alpha", "0.01"], "--compare-runs"),
+            "--internet-seconds": (["--internet-seconds", "3"],
+                                   "--internet"),
+        }
+        for flag, (argv, mode) in cases.items():
+            self.assertEqual(self._ignored(argv).get(flag), mode, flag)
+
+    def test_the_table_only_names_real_flags(self):
+        dests = {a.dest for a in cli.build_parser()._actions}
+        for mode_flag, mode_dest, scoped in cli._MODE_ONLY:
+            self.assertIn(mode_dest, dests, mode_flag)
+            for dest in scoped:
+                self.assertIn(dest, dests, dest)
+
+
+# --------------------------------------------------------------------------- #
+class TestDataScienceTokenFlagsAreWired(unittest.TestCase):
+    """--ds-prefill-tokens reached nothing at all, and its default matched
+    the one it failed to override, so a changed value silently measured the
+    old number rather than erroring."""
+
+    def test_run_forwards_the_token_counts_to_the_measurement(self):
+        import unittest.mock as mock
+        with mock.patch.object(datascience, "llm", return_value={}) as m:
+            datascience.run(memory_bytes=1, seconds=0.1,
+                            skip_dataframes=True,
+                            prefill_tokens=1024, decode_tokens=64)
+        self.assertEqual(m.call_args.args[1:], (1024, 64))
+
+    def test_the_cli_passes_what_the_flags_parsed(self):
+        # The break was between the flag and the call, so assert the call
+        # site names them rather than trusting the signature alone.
+        import inspect
+        source = inspect.getsource(cli.main)
+        self.assertIn("prefill_tokens=args.ds_prefill_tokens", source)
+        self.assertIn("decode_tokens=args.ds_decode_tokens", source)
+
+
+# --------------------------------------------------------------------------- #
 class TestConfigFile(unittest.TestCase):
     def _parse(self, argv):
         parser = cli.build_parser()

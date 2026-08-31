@@ -1494,6 +1494,15 @@ keys. `PCBENCH_NO_MENU=1` stops a bare `pcbench` opening it at all.
 | `--monitor-power` | off | Also sample power draw while monitoring |
 | `--monitor-trace P` | — | Write raw monitor samples to a CSV |
 
+The last three apply only with `--monitor`, which replaces the benchmark
+rather than instrumenting it — `--monitor-trace` on a benchmark run writes
+nothing. The same is true of `--soak-workers`, `--sustained-window`,
+`--sustained-workers`, `--no-measure`, `--alpha` and the `--internet-*` flags
+outside their own modes. Setting one where it cannot apply is not an error,
+because a config file or an alias can carry it harmlessly, but pcbench prints
+a note on stderr naming the flag and the mode it needed, rather than letting
+it look honoured.
+
 **Integration / CI**
 
 | Flag | Default | Meaning |

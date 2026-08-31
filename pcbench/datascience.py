@@ -814,11 +814,12 @@ def _arrow_or_dict(data: dict, np):
 # Aggregate
 # --------------------------------------------------------------------------- #
 def run(memory_bytes: int = 0, seconds: float = 2.0,
-        skip_llm: bool = False, skip_dataframes: bool = False) -> dict:
+        skip_llm: bool = False, skip_dataframes: bool = False,
+        prefill_tokens: int = 256, decode_tokens: int = 32) -> dict:
     """The whole data-science tier."""
     out: dict = {"available": available()}
     if not skip_llm:
-        out["llm"] = llm(memory_bytes)
+        out["llm"] = llm(memory_bytes, prefill_tokens, decode_tokens)
         out["batch_scaling"] = batch_scaling(memory_bytes)
     out["accelerator_memory"] = accelerator_memory(memory_bytes)
     out["dataloader"] = dataloader(min(seconds, 2.0))
