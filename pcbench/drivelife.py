@@ -143,9 +143,34 @@ def _linux() -> dict:
 
     return {"available": False,
             "reason": "no drive lifetime data could be read",
-            "hint": ("install nvme-cli or smartmontools "
-                     "(apt install nvme-cli smartmontools); reading the SMART "
-                     "log usually needs root")}
+            "hint": _linux_hint()}
+
+
+def _linux_hint() -> str:
+    """What to do about it, in this distribution's own package-manager terms.
+
+    A hint that names apt on an Arch box is worse than a vague one, so the
+    command comes from the installer's registry, which probes for the package
+    manager actually in use. When either tool is already installed the problem
+    is not the packaging but the privilege: the SMART log sits behind an ioctl
+    that wants CAP_SYS_ADMIN.
+    """
+    try:
+        from . import optional
+        have = [t.command for t in optional.system_tools()
+                if optional.have_tool(t.command)]
+        command = optional.system_install_command()
+    except Exception:
+        have, command = [], None
+
+    if have and not command:
+        return (f"{', '.join(have)} is installed but read nothing — the SMART "
+                f"log is behind a privileged ioctl, so run this with sudo")
+    if command:
+        return (f"install nvme-cli or smartmontools ({command}); reading the "
+                f"SMART log usually needs root")
+    return ("install nvme-cli or smartmontools with this system's package "
+            "manager; reading the SMART log usually needs root")
 
 
 def _linux_sysfs() -> list[dict]:

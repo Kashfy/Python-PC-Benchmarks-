@@ -121,9 +121,32 @@ python3 install.py --list          # what exists and what is installed
 python3 install.py                 # all tiers, into ./.venv, after confirming
 python3 install.py --tier compute  # one tier only
 python3 install.py --here          # current interpreter instead of a venv
+python3 install.py --system-only   # only the system packages below
+python3 install.py --no-system     # pip packages only
 ```
 
 Or with pip extras: `pip install -e ".[compute]"` … `".[all]"`.
+
+### System packages, which pip cannot supply
+
+Two of the report's sections need tools that are not Python packages at all,
+so they install outside the virtual environment and need root:
+
+| Tool | Package | Without it |
+|------|---------|-----------|
+| `nvme` | `nvme-cli` | The NVMe SMART log — wear percentage, TBW, power-on hours |
+| `smartctl` | `smartmontools` | The SATA/NVMe fallback, and the only source for SATA SSDs |
+
+`install.py` detects the package manager (pacman, apt, dnf, zypper, Homebrew),
+prints the exact command, and asks separately before running it — the pip
+confirmation does not cover installing outside the venv. Only Linux needs
+these: macOS reads the same log through its own IOKit helper and Windows
+through PowerShell.
+
+Having the tool is only half of it. The counters sit behind an ioctl that
+wants `CAP_SYS_ADMIN`, so an unprivileged run can have `nvme-cli` installed
+and still report nothing. `install.py` checks after installing and says which
+of the two problems you have.
 
 | Tier | Packages | Unlocks |
 |------|----------|---------|

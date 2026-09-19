@@ -10,11 +10,18 @@ By default everything goes into a project-local virtual environment
 into a system interpreter risks permission problems and leaves packages behind
 that are hard to remove. Nothing is installed until you confirm.
 
+A handful of things pip cannot supply at all — the SMART tools the drive
+lifetime section reads, and the OpenCL driver the GPU section talks to — come
+from the system package manager instead. Those are offered separately, with
+their own confirmation, because they install outside the virtual environment.
+
     python3 install.py                 # interactive, all tiers, into .venv
     python3 install.py --tier compute  # just one tier
     python3 install.py --list          # show what is available and installed
     python3 install.py --here          # use the current interpreter, no venv
     python3 install.py --yes           # skip the confirmation prompt
+    python3 install.py --no-system     # skip the system packages
+    python3 install.py --system-only   # only the system packages
 
 Afterwards, run the benchmark with the environment's interpreter:
 
@@ -62,6 +69,15 @@ def show_status(venv_dir: str = VENV_DIR) -> None:
             print(f"        {tick} {label:<16}{ver}")
             print(f"          {pkg.purpose}")
 
+    print("\n  System packages (not pip — installed by "
+          f"{(optional.package_manager() or _NO_MANAGER).name}):")
+    for tool in optional.system_tools():
+        tick = "\u2713" if optional.have_tool(tool.command) else "\u00b7"
+        print(f"        {tick} {tool.command:<16}{_system_label(tool)}")
+        print(f"          {tool.purpose}")
+    if not optional.system_tools():
+        print("        (none needed on this platform)")
+
     print("\n  Large, hardware-specific — install manually if wanted:")
     for pkg in optional.HEAVY:
         tick = "✓" if st["heavy"][pkg.pip_name] else "·"
@@ -74,6 +90,17 @@ def show_status(venv_dir: str = VENV_DIR) -> None:
     print()
     runner = venv_python(venv_dir)
     report_opencl(runner if os.path.isfile(runner) else sys.executable)
+
+
+class _NO_MANAGER:                       # noqa: N801 — a stand-in, not a class
+    name = "no recognised package manager"
+
+
+def _system_label(tool) -> str:
+    """The package that provides ``tool`` here, for the status listing."""
+    manager = optional.package_manager()
+    package = tool.packages.get(manager.name) if manager else None
+    return f" ({package})" if package else " (no package known here)"
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +221,96 @@ def report_opencl(python: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# System packages, which pip cannot install either
+# --------------------------------------------------------------------------- #
+def system_install(tools: list, yes: bool = False) -> bool:
+    """Install the missing SMART tools with the OS package manager.
+
+    Kept separate from the pip work, and confirmed separately, because it
+    installs outside the virtual environment and needs root to do it. Returns
+    True when everything asked for is present afterwards.
+
+    The subprocess deliberately inherits this terminal rather than capturing
+    it: sudo prompts for a password on the tty, and a captured prompt is a
+    hang with no output.
+    """
+    manager = optional.package_manager()
+    packages = optional.system_packages(tools)
+    if not manager or not packages:
+        print("\n  These are missing, and this script cannot install them "
+              "here:\n")
+        for tool in tools:
+            print(f"    {tool.command:<12} {tool.purpose}")
+        print("\n  No package manager was recognised — install them with "
+              "whatever\n  this system uses. The names are usually "
+              "'nvme-cli' and 'smartmontools'.")
+        return False
+
+    print(f"\n  These come from {manager.name}, not pip, and install outside "
+          f"the\n  virtual environment:\n")
+    for tool in tools:
+        package = tool.packages.get(manager.name) or "?"
+        print(f"    {package:<16} ({tool.command})  {tool.purpose}")
+    argv = list(manager.argv) + ([manager.yes_flag] if yes and manager.yes_flag
+                                 else []) + packages
+    print(f"\n  Command        : {' '.join(argv)}")
+    if manager.needs_root:
+        print("  This needs root, so sudo will ask for your password.")
+
+    if not yes:
+        try:
+            reply = input("\n  Install these too? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("  Skipped — the drive lifetime section will stay "
+                  "unavailable.")
+            return False
+
+    print()
+    try:
+        proc = subprocess.run(argv)
+    except OSError as exc:
+        print(f"  ! could not run {manager.name}: {exc}", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        print(f"\n  ! {manager.name} exited {proc.returncode} — nothing was "
+              f"installed, or only some of it.")
+
+    still = [tool.command for tool in tools if not optional.have_tool(tool.command)]
+    if still:
+        print(f"  ! still missing: {', '.join(still)}")
+        return False
+    print(f"\n  ✓ installed: {', '.join(packages)}")
+    return True
+
+
+def report_drive_access() -> None:
+    """Say whether the drive lifetime section can actually read the SMART log.
+
+    Having the tool is half of it. The counters live behind an ioctl that
+    wants CAP_SYS_ADMIN, so an unprivileged run can have nvme-cli installed
+    and still report nothing — which looks identical to not having installed
+    it, and is the more confusing of the two failures.
+    """
+    try:
+        from pcbench import drivelife
+        result = drivelife.run(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        return
+    if result.get("available"):
+        count = len(result.get("drives") or [])
+        print(f"  Drive lifetime: readable — {count} drive(s) reporting wear "
+              f"data via {result.get('source')}.")
+        return
+    print(f"  Drive lifetime: still unavailable — {result.get('reason')}.")
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() != 0:
+        print("                  The SMART log is behind a privileged ioctl; "
+              "run the\n                  benchmark with sudo to read it.")
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main(argv=None) -> int:
@@ -210,11 +327,29 @@ def main(argv=None) -> int:
                    help="Where to create the virtual environment")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Do not prompt for confirmation")
+    p.add_argument("--no-system", action="store_true",
+                   help="Skip the system packages (nvme-cli, smartmontools) "
+                        "that the drive lifetime section needs")
+    p.add_argument("--system-only", action="store_true",
+                   help="Install only those system packages, no pip work")
     args = p.parse_args(argv)
 
     if args.list:
         show_status(args.venv_dir)
         return 0
+
+    want_system = not args.no_system
+    if args.system_only:
+        hr("pcbench system packages")
+        tools = optional.missing_system_tools()
+        if not tools:
+            print("\n  The system tools are already installed.\n")
+            report_drive_access()
+            return 0
+        done = system_install(tools, args.yes)
+        print()
+        report_drive_access()
+        return 0 if done else 4
 
     tiers = ([t.strip() for t in args.tier.split(",") if t.strip()]
              if args.tier else list(optional.TIERS))
@@ -225,7 +360,8 @@ def main(argv=None) -> int:
         return 2
 
     missing = optional.missing(tiers)
-    if not missing:
+    tools = optional.missing_system_tools() if want_system else []
+    if not missing and not tools:
         print("Everything for the selected tier(s) is already installed.")
         # Still worth saying, and this is the case where it matters most: the
         # gpu tier can be complete and the GPU section still measure nothing,
@@ -236,6 +372,17 @@ def main(argv=None) -> int:
             report_opencl(runner if os.path.isfile(runner) and not args.here
                           else sys.executable)
         return 0
+
+    if not missing:
+        # Nothing for pip, but a system tool is absent — worth doing on its
+        # own, since it is the whole drive lifetime section.
+        hr("pcbench system packages")
+        print("\n  Every pip package for the selected tier(s) is already "
+              "installed.")
+        done = system_install(tools, args.yes)
+        print()
+        report_drive_access()
+        return 0 if done else 4
 
     hr("pcbench optional package installer")
     total_mb = sum(pkg.approx_mb for pkg in missing)
@@ -252,6 +399,15 @@ def main(argv=None) -> int:
     print(f"\n  Destination    : {target}")
     if args.here:
         print("  Note: --here modifies the interpreter you are running now.")
+    if tools:
+        names = optional.system_packages(tools) or [t.command for t in tools]
+        print(f"\n  Also missing   : {', '.join(names)} — system packages, "
+              f"not pip.\n"
+              f"                   Without them the drive lifetime section "
+              f"reports nothing.\n"
+              f"                   You will be asked about these separately, "
+              f"after the\n                   pip packages.")
+
     print("\n  pcbench works without any of these; they only add extra "
           "benchmarks.")
 
@@ -282,9 +438,17 @@ def main(argv=None) -> int:
         print("  A common cause is a package with no prebuilt wheel for this "
               "platform\n  (pyopencl often needs system OpenCL headers).")
 
+    if tools:
+        hr("System packages")
+        system_install(tools, args.yes)
+
     if "gpu" in tiers or "ai" in tiers:
         print()
         report_opencl(python)
+
+    if optional.system_tools():
+        print()
+        report_drive_access()
 
     if not args.here:
         runner = venv_python(args.venv_dir)

@@ -982,8 +982,10 @@ The reason is always stated. Common cases:
 
 - **macOS** — the helper needs a compiler: `xcode-select --install`. It needs
   no privileges once built.
-- **Linux** — install `nvme-cli` or `smartmontools`. Reading the SMART log
-  usually needs root, so try `sudo`.
+- **Linux** — install `nvme-cli` or `smartmontools`. `python3 install.py
+  --system-only` does it with this distribution's package manager, and the
+  report's own hint names the command. Reading the SMART log usually needs
+  root even once they are installed, so try `sudo`.
 - **Windows** — many consumer drives and almost all USB enclosures do not
   expose reliability counters at all.
 - **Any platform, external drive** — USB-SATA bridges rarely pass SMART

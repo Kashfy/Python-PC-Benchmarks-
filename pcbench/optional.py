@@ -313,10 +313,42 @@ _ICD_PACKAGES = {
                "intel": "intel-opencl", None: "ocl-icd-devel"},
 }
 
-_PACKAGE_MANAGERS = (("pacman", "/usr/bin/pacman", "sudo pacman -S"),
-                     ("apt", "/usr/bin/apt", "sudo apt install"),
-                     ("dnf", "/usr/bin/dnf", "sudo dnf install"),
-                     ("zypper", "/usr/bin/zypper", "sudo zypper install"))
+class PackageManager(NamedTuple):
+    """A system package manager, and the argv that installs with it."""
+    name: str
+    probe: str              # a path that exists when it is the one in use
+    argv: tuple             # install command prefix, package names appended
+    yes_flag: str = ""      # what makes it install without asking again
+    needs_root: bool = True
+
+    @property
+    def command(self) -> str:
+        return " ".join(self.argv)
+
+
+#: Ordered by specificity: pacman before apt, because a machine with both is
+#: an Arch box with an apt emulation layer rather than the reverse.
+_PACKAGE_MANAGERS = (
+    PackageManager("pacman", "/usr/bin/pacman",
+                   ("sudo", "pacman", "-S", "--needed"), "--noconfirm"),
+    PackageManager("apt", "/usr/bin/apt", ("sudo", "apt", "install"), "-y"),
+    PackageManager("dnf", "/usr/bin/dnf", ("sudo", "dnf", "install"), "-y"),
+    PackageManager("zypper", "/usr/bin/zypper",
+                   ("sudo", "zypper", "install"), "-y"),
+    # macOS: Homebrew installs into a prefix the user owns, so no sudo.
+    PackageManager("brew", "/opt/homebrew/bin/brew", ("brew", "install"),
+                   needs_root=False),
+    PackageManager("brew", "/usr/local/bin/brew", ("brew", "install"),
+                   needs_root=False),
+)
+
+
+def package_manager() -> PackageManager | None:
+    """The system package manager in use here, or None if unrecognised."""
+    for manager in _PACKAGE_MANAGERS:
+        if os.path.exists(manager.probe):
+            return manager
+    return None
 
 
 def opencl_icd_hint() -> str | None:
@@ -329,17 +361,89 @@ def opencl_icd_hint() -> str | None:
     import platform as _platform
     if _platform.system() != "Linux":
         return None
-    for name, probe, command in _PACKAGE_MANAGERS:
-        if not os.path.exists(probe):
-            continue
-        table = _ICD_PACKAGES[name]
-        vendors = _gpu_vendors()
-        wanted = [table[key] for key in ("nvidia", "amd", "intel")
-                  if key in vendors and table.get(key)]
-        if not wanted:
-            wanted = [table[None]]
-        return f"{command} {' '.join(dict.fromkeys(wanted))}"
-    return None
+    manager = package_manager()
+    if not manager or manager.name not in _ICD_PACKAGES:
+        return None
+    table = _ICD_PACKAGES[manager.name]
+    vendors = _gpu_vendors()
+    wanted = [table[key] for key in ("nvidia", "amd", "intel")
+              if key in vendors and table.get(key)]
+    if not wanted:
+        wanted = [table[None]]
+    return f"{manager.command} {' '.join(dict.fromkeys(wanted))}"
+
+
+# --------------------------------------------------------------------------- #
+# System tools, which pip cannot install either
+# --------------------------------------------------------------------------- #
+# The drive lifetime section reads the SMART log the controller keeps, and on
+# Linux nothing in the standard library can: the kernel exposes the counters
+# only through an ioctl, so it takes `nvme` (nvme-cli) or `smartctl`
+# (smartmontools). Both are ordinary distribution packages, neither is on a
+# default install, and without them the whole section reports "unavailable"
+# on a perfectly healthy drive. macOS reads the same log through its own IOKit
+# helper and Windows through PowerShell, so this is a Linux-only gap.
+class SystemTool(NamedTuple):
+    """A command-line tool the report needs, installed by the OS, not pip."""
+    command: str            # what `shutil.which` looks for
+    purpose: str            # what stops working without it
+    packages: dict          # package-manager name -> package name
+    platforms: tuple = ("Linux",)
+
+
+SYSTEM_TOOLS = (
+    SystemTool("nvme",
+               "NVMe SMART log: wear percentage, TBW, power-on hours",
+               {"pacman": "nvme-cli", "apt": "nvme-cli", "dnf": "nvme-cli",
+                "zypper": "nvme-cli"}),
+    SystemTool("smartctl",
+               "SATA and NVMe SMART attributes — the fallback, and the only "
+               "source for SATA SSDs",
+               {"pacman": "smartmontools", "apt": "smartmontools",
+                "dnf": "smartmontools", "zypper": "smartmontools",
+                "brew": "smartmontools"}),
+)
+
+
+def system_tools() -> list:
+    """The system tools that apply to this platform at all."""
+    import platform as _platform
+    system = _platform.system()
+    return [tool for tool in SYSTEM_TOOLS if system in tool.platforms]
+
+
+def have_tool(command: str) -> bool:
+    """True when the command is on PATH."""
+    import shutil
+    return shutil.which(command) is not None
+
+
+def missing_system_tools() -> list:
+    """Applicable system tools that are not installed here."""
+    return [tool for tool in system_tools() if not have_tool(tool.command)]
+
+
+def system_packages(tools: list | None = None) -> list[str]:
+    """Package names to install for ``tools`` under this package manager.
+
+    Empty when no package manager is recognised, or when none of the tools
+    has a package name for it — a wrong command is worse than no command.
+    """
+    manager = package_manager()
+    if not manager:
+        return []
+    names = [tool.packages.get(manager.name)
+             for tool in (missing_system_tools() if tools is None else tools)]
+    return list(dict.fromkeys(n for n in names if n))
+
+
+def system_install_command(tools: list | None = None) -> str | None:
+    """The command that installs the missing system tools, or None."""
+    manager = package_manager()
+    packages = system_packages(tools)
+    if not manager or not packages:
+        return None
+    return f"{manager.command} {' '.join(packages)}"
 
 
 def _importable(module: str) -> bool:

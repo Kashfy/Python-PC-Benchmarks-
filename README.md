@@ -115,6 +115,12 @@ python3 install.py            # interactive; --list to preview, --tier to pick
 virtual environment puts its interpreter in `bin/` on macOS and Linux and in
 `Scripts\` on Windows, so the two are not interchangeable.
 
+It also offers the two things pip cannot supply: on Linux, `nvme-cli` and
+`smartmontools`, without which the drive lifetime section reports nothing on
+a perfectly healthy SSD. Those install outside the venv and need root, so they
+are confirmed separately — `--system-only` to do just them, `--no-system` to
+skip them.
+
 | Tier | Unlocks | Why the stdlib can't |
 |------|---------|----------------------|
 | `compute` | BLAS matmul, FFT, LAPACK (numpy, scipy, numba) | Pure Python measures **CPython, not your CPU** — 113 MFLOPS vs **450 GFLOPS** on the same M4 |
