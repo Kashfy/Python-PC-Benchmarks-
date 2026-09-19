@@ -4068,6 +4068,33 @@ class TestDriveLifetime(unittest.TestCase):
         self.assertEqual(entry["protocol"], "NVMe")
         self.assertEqual(entry["percentage_used"], 5)
 
+    def test_nvme_permission_denied_is_not_a_reading(self):
+        # nvme-cli writes its refusal to stdout as valid JSON and exits 1, so
+        # the parse succeeds and every counter is simply absent. Treated as a
+        # reading, that became a drive reporting no wear at all.
+        import unittest.mock as mock
+        denied = '{"error": "/dev/nvme0: Permission denied"}'
+        with mock.patch.object(drivelife.shutil, "which", return_value="/n"), \
+             mock.patch.object(drivelife, "_run", return_value=denied):
+            self.assertEqual(drivelife._nvme_smart_log("/dev/nvme0"), {})
+
+    def test_nvme_log_without_a_single_counter_is_not_a_reading(self):
+        import unittest.mock as mock
+        with mock.patch.object(drivelife.shutil, "which", return_value="/n"), \
+             mock.patch.object(drivelife, "_run", return_value='{"nsid": 1}'):
+            self.assertEqual(drivelife._nvme_smart_log("/dev/nvme0"), {})
+
+    def test_nvme_log_with_counters_is_kept(self):
+        import unittest.mock as mock
+        raw = ('{"percent_used": 3, "power_on_hours": 900, '
+               '"data_units_written": 2000, "temperature": 313}')
+        with mock.patch.object(drivelife.shutil, "which", return_value="/n"), \
+             mock.patch.object(drivelife, "_run", return_value=raw):
+            log = drivelife._nvme_smart_log("/dev/nvme0")
+        self.assertEqual(log["percentage_used"], 3)
+        self.assertEqual(log["power_on_hours"], 900)
+        self.assertEqual(log["temperature_c"], 40)
+
     def test_run_never_raises_and_always_reports_why(self):
         result = drivelife.run(".")
         self.assertIn("available", result)

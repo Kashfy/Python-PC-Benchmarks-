@@ -164,8 +164,10 @@ def _linux_hint() -> str:
         have, command = [], None
 
     if have and not command:
-        return (f"{', '.join(have)} is installed but read nothing — the SMART "
-                f"log is behind a privileged ioctl, so run this with sudo")
+        verb = "is" if len(have) == 1 else "are"
+        return (f"{', '.join(have)} {verb} installed but read nothing — the "
+                f"SMART log is behind a privileged ioctl, so run this with "
+                f"sudo")
     if command:
         return (f"install nvme-cli or smartmontools ({command}); reading the "
                 f"SMART log usually needs root")
@@ -206,10 +208,15 @@ def _nvme_smart_log(device: str) -> dict:
         data = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
         return {}
-    if not data:
+    # A refusal parses just as cleanly as a reading: denied the ioctl,
+    # nvme-cli writes {"error": "/dev/nvme0: Permission denied"} to stdout and
+    # exits 1, and _run hands back stdout whatever the status. Left alone that
+    # becomes a drive with every counter absent, which reads downstream as a
+    # drive that was measured and simply had nothing to say.
+    if not data or data.get("error"):
         return {}
     kelvin = data.get("temperature")
-    return {
+    log = {
         "critical_warning": data.get("critical_warning"),
         # nvme-cli reports temperature in Kelvin.
         "temperature_c": (round(kelvin - 273) if isinstance(kelvin, (int, float))
@@ -225,6 +232,8 @@ def _nvme_smart_log(device: str) -> dict:
         "media_errors": data.get("media_errors"),
         "error_log_entries": data.get("num_err_log_entries"),
     }
+    # Belt and braces for any other shape that parses but measures nothing.
+    return log if any(v is not None for v in log.values()) else {}
 
 
 #: SATA SSDs report the same facts under vendor-specific attribute names.

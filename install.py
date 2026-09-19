@@ -299,12 +299,19 @@ def report_drive_access() -> None:
         result = drivelife.run(os.path.dirname(os.path.abspath(__file__)))
     except Exception:
         return
-    if result.get("available"):
-        count = len(result.get("drives") or [])
-        print(f"  Drive lifetime: readable — {count} drive(s) reporting wear "
-              f"data via {result.get('source')}.")
+    # "Available" only means a drive was identified. Claiming wear data on
+    # that alone is how this check came to congratulate itself over two NVMe
+    # drives that had reported nothing but their model name.
+    wear = ("health_pct", "percentage_used", "power_on_hours", "written_tb")
+    reporting = [d for d in (result.get("drives") or [])
+                 if any(k in d for k in wear)]
+    if result.get("available") and reporting:
+        print(f"  Drive lifetime: readable — {len(reporting)} drive(s) "
+              f"reporting wear data via {result.get('source')}.")
         return
-    print(f"  Drive lifetime: still unavailable — {result.get('reason')}.")
+    reason = (result.get("reason")
+              or "the drives were identified but reported no wear counters")
+    print(f"  Drive lifetime: still unavailable — {reason}.")
     if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() != 0:
         print("                  The SMART log is behind a privileged ioctl; "
               "run the\n                  benchmark with sudo to read it.")
